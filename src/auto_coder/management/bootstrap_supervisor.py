@@ -1,0 +1,1317 @@
+"""Immutable PID-1-style owner for one replaceable management service child."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import signal
+import sqlite3
+import stat
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from contextlib import AbstractContextManager, closing, contextmanager, nullcontext
+from dataclasses import asdict, dataclass, replace
+from enum import Enum
+from pathlib import Path
+from typing import IO, TYPE_CHECKING, Callable, Iterator
+
+from loguru import logger
+
+from .archived_exclusions import ArchivedExclusion, acquire_exclusion_fences, parse_exclusions, unique_pairs
+from .bootstrap_store import BootstrapStore, ChildPhase, ChildRecord, EffectRecord
+from .fresh_runtime_binding import FreshRuntimeBinding, fresh_management_path, parse_fresh_runtime_binding, verify_installed_fresh_binding
+
+if TYPE_CHECKING:
+    from auto_coder.tested_source_refs import TestedSourcePublisher
+
+    from .fresh_readiness import FreshReadinessObserver
+    from .oauth_config import ManagementSettings
+    from .retained_journal import RetainedJournal
+
+
+class ExclusionEvidenceUnavailable(ValueError):
+    """A physical launch lacks complete ancestry or continuous owner fences."""
+
+
+class _ForwardAuthorityRefused(ValueError):
+    """Candidate authority changed after the last retained-evidence scan."""
+
+
+class Action(str, Enum):
+    SUPERVISE = "SUPERVISE"
+    INSPECT = "INSPECT"
+    REQUEST_GRACEFUL_STOP = "REQUEST_GRACEFUL_STOP"
+    START_SELECTED = "START_SELECTED"
+    RECONCILE = "RECONCILE"
+    RESTORE_PREVIOUS = "RESTORE_PREVIOUS"
+
+
+class ResultStatus(str, Enum):
+    OBSERVED_RUNNING = "observed_running"
+    STOPPED = "stopped"
+    DRAINING = "draining"
+    UNKNOWN = "unknown"
+    CONFLICT = "conflict"
+    PROCESS_RESTORED = "process_restored"
+    NEEDS_ATTENTION = "needs_attention"
+
+
+def _verify_fresh_console_entrypoint(runtime: RuntimeSpec) -> None:
+    """Accept only the known installed console wrapper, with no code hooks."""
+    import ast
+
+    source = runtime.executable.read_text(encoding="utf-8")
+    if not source.startswith("#!/opt/auto-coder/.venv/bin/python\n"):
+        raise ValueError("fresh launcher interpreter differs")
+    expected = """import sys
+from auto_coder.cli import main
+if __name__ == "__main__":
+    if sys.argv[0].endswith("-script.pyw"):
+        sys.argv[0] = sys.argv[0][:-11]
+    elif sys.argv[0].endswith(".exe"):
+        sys.argv[0] = sys.argv[0][:-4]
+    sys.exit(main())
+"""
+    if ast.dump(ast.parse(source), include_attributes=False) != ast.dump(ast.parse(expected), include_attributes=False):
+        raise ValueError("fresh launcher entrypoint differs")
+    safe_python = {"PYTHONDONTWRITEBYTECODE": "1", "PYTHONNOUSERSITE": "1"}
+    if any((key.startswith("PYTHON") and safe_python.get(key) != value) or key.startswith("LD_") for key, value in runtime.environment):
+        raise ValueError("fresh launcher environment contains code hooks")
+
+
+@dataclass(frozen=True)
+class RuntimeSpec:
+    reference: str
+    receipt: str
+    executable: Path
+    arguments: tuple[str, ...]
+    environment: tuple[tuple[str, str], ...] = ()
+    drain_ack: Path | None = None
+    source_root: Path | None = None
+    source_receipt: str = ""
+    ready_receipt: Path | None = None
+    execution_kind: str = "source-script"
+
+    def verify(self, *, initial: bool = False) -> bool:
+        if self.execution_kind == "management-installed":
+            from .self_update_handoff import verify_installed_runtime
+
+            return verify_installed_runtime(self)
+        if not self.executable.is_absolute() or not self.executable.is_file() or self.executable.is_symlink():
+            return False
+        digest = hashlib.sha256(self.executable.read_bytes()).hexdigest()
+        if self.receipt != f"sha256:{digest}":
+            return False
+        if initial:
+            return True
+        if self.source_root is None or self.ready_receipt is None or not self.source_root.is_absolute() or not self.source_root.is_dir() or self.source_root.is_symlink() or not self.ready_receipt.is_file() or self.ready_receipt.is_symlink():
+            return False
+        actual = self._source_digest(self.source_root)
+        try:
+            ready = json.loads(self.ready_receipt.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        return self.source_receipt == actual and ready == {"ready": True, "reference": self.reference, "source_receipt": actual} and self._execution_is_source_closed()
+
+    def _execution_is_source_closed(self) -> bool:
+        """Reject configured Python inputs outside the READY source closure."""
+        assert self.source_root is not None
+        try:
+            source_root = self.source_root.resolve(strict=True)
+        except OSError:
+            return False
+
+        environment = dict(self.environment)
+        for name in ("PYTHONPATH", "PYTHONHOME"):
+            value = environment.get(name)
+            if value is None:
+                continue
+            for entry in value.split(os.pathsep):
+                if not entry or not self._inside_source(Path(entry), source_root):
+                    return False
+
+        # The execution contract is explicit, not inferred from the executable
+        # basename: a Python interpreter can be copied under an arbitrary name.
+        if self.execution_kind == "source-script":
+            try:
+                with self.executable.open("rb") as stream:
+                    has_shebang = stream.read(2) == b"#!"
+            except OSError:
+                return False
+            return has_shebang and self._inside_source(self.executable, source_root)
+        if self.execution_kind == "python-file":
+            # Only a direct absolute script entrypoint is supported here.  -c,
+            # -m, and opaque binary profiles need a separately verified mapping
+            # from their invocation to the actual executed source closure.
+            return bool(self.arguments) and self._inside_source(Path(self.arguments[0]), source_root)
+        return False
+
+    @staticmethod
+    def _inside_source(path: Path, source_root: Path) -> bool:
+        if not path.is_absolute():
+            return False
+        try:
+            path.resolve(strict=True).relative_to(source_root)
+        except (OSError, ValueError):
+            return False
+        return True
+
+    @staticmethod
+    def _source_digest(root: Path) -> str:
+        digest = hashlib.sha256()
+        try:
+            members = list(root.rglob("*"))
+            # Source closures containing links are unsupported: neither the
+            # link target nor its containment is immutable under this receipt.
+            if any(path.is_symlink() for path in members):
+                return ""
+            paths = sorted((path for path in members if path.is_file()), key=lambda path: path.relative_to(root).as_posix())
+            for path in paths:
+                relative = path.relative_to(root).as_posix().encode()
+                digest.update(len(relative).to_bytes(4, "big"))
+                digest.update(relative)
+                digest.update(hashlib.sha256(path.read_bytes()).digest())
+        except OSError:
+            return ""
+        return f"sha256:{digest.hexdigest()}"
+
+
+@dataclass(frozen=True)
+class BootstrapConfig:
+    instance_id: str
+    state_root: Path
+    oauth_root: Path
+    journal_root: Path
+    listener_url: str
+    initial_runtime: str
+    runtimes: tuple[RuntimeSpec, ...]
+    graceful_timeout: float = 30.0
+    crash_budget: int = 1
+    management_version_root: Path | None = None
+    management_config: Path | None = None
+    verification_timeout: float = 120.0
+    fresh_guard_path: Path | None = None
+    fresh_prior_lock_path: Path | None = None
+    restart_after_clean_shutdown: bool = False
+    archived_exclusions: tuple[ArchivedExclusion, ...] = ()
+    fresh_runtime_binding: FreshRuntimeBinding | None = None
+
+    @classmethod
+    def read(cls, path: Path) -> "BootstrapConfig":
+        if not path.is_absolute() or path.is_symlink():
+            raise ValueError("bootstrap configuration must be an absolute regular file")
+        raw = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_pairs)
+        allowed = {
+            "instance_id",
+            "state_root",
+            "oauth_root",
+            "journal_root",
+            "listener_url",
+            "initial_runtime",
+            "runtimes",
+            "graceful_timeout",
+            "crash_budget",
+            "management_version_root",
+            "management_config",
+            "verification_timeout",
+            "fresh_guard_path",
+            "fresh_prior_lock_path",
+            "restart_after_clean_shutdown",
+            "archived_exclusions",
+            "fresh_runtime_binding",
+        }
+        if set(raw) - allowed:
+            raise ValueError("unknown bootstrap configuration field")
+        runtimes = tuple(
+            RuntimeSpec(
+                reference=item["reference"],
+                receipt=item["receipt"],
+                executable=Path(item["executable"]),
+                arguments=tuple(item.get("arguments", ())),
+                environment=tuple(sorted(item.get("environment", {}).items())),
+                drain_ack=Path(item["drain_ack"]) if item.get("drain_ack") else None,
+                source_root=Path(item["source_root"]) if item.get("source_root") else None,
+                source_receipt=item.get("source_receipt", ""),
+                ready_receipt=Path(item["ready_receipt"]) if item.get("ready_receipt") else None,
+                execution_kind=item.get("execution_kind", "source-script"),
+            )
+            for item in raw["runtimes"]
+        )
+        if type(raw.get("restart_after_clean_shutdown", False)) is not bool:
+            raise ValueError("restart-after-clean-shutdown must be a boolean")
+        config = cls(
+            raw["instance_id"],
+            Path(raw["state_root"]),
+            Path(raw["oauth_root"]),
+            Path(raw["journal_root"]),
+            raw["listener_url"],
+            raw["initial_runtime"],
+            runtimes,
+            float(raw.get("graceful_timeout", 30)),
+            int(raw.get("crash_budget", 1)),
+            Path(raw["management_version_root"]) if raw.get("management_version_root") else None,
+            Path(raw["management_config"]) if raw.get("management_config") else None,
+            float(raw.get("verification_timeout", 120)),
+            Path(raw["fresh_guard_path"]) if raw.get("fresh_guard_path") else None,
+            Path(raw["fresh_prior_lock_path"]) if raw.get("fresh_prior_lock_path") else None,
+            raw.get("restart_after_clean_shutdown", False),
+            parse_exclusions(raw.get("archived_exclusions", [])),
+            parse_fresh_runtime_binding(raw.get("fresh_runtime_binding")),
+        )
+        config.validate()
+        return config
+
+    def validate(self) -> None:
+        if not self.instance_id or len(self.instance_id) > 128 or not self.listener_url.startswith(("http://127.0.0.1:", "http://[::1]:")):
+            raise ValueError("invalid fixed management identity or loopback listener")
+        if not all(path.is_absolute() for path in (self.state_root, self.oauth_root, self.journal_root)) or len({self.state_root, self.oauth_root, self.journal_root}) != 3:
+            raise ValueError("state, OAuth, and journal roots must be distinct absolute paths")
+        refs = {runtime.reference for runtime in self.runtimes}
+        if len(refs) != len(self.runtimes) or self.initial_runtime not in refs or self.crash_budget < 0 or not 0 < self.graceful_timeout <= 3600:
+            raise ValueError("invalid runtime profile")
+        if type(self.restart_after_clean_shutdown) is not bool:
+            raise ValueError("restart-after-clean-shutdown must be a boolean")
+        if self.restart_after_clean_shutdown:
+            initial = next(item for item in self.runtimes if item.reference == self.initial_runtime)
+            if initial.drain_ack is None or not initial.drain_ack.is_absolute():
+                raise ValueError("clean restart requires a fixed drain receipt path")
+        if (self.management_version_root is None) != (self.management_config is None) or not 0 < self.verification_timeout <= 3600:
+            raise ValueError("invalid management self-update bootstrap profile")
+        if (self.fresh_guard_path is None) != (self.fresh_prior_lock_path is None) or any(path is not None and not path.is_absolute() for path in (self.fresh_guard_path, self.fresh_prior_lock_path)):
+            raise ValueError("fresh initialization paths must be paired and absolute")
+        if self.fresh_runtime_binding is not None:
+            self.fresh_runtime_binding.validate()
+            initial = next(item for item in self.runtimes if item.reference == self.initial_runtime)
+            if (
+                self.fresh_prior_lock_path is None
+                or self.management_version_root is None
+                or self.management_config is None
+                or initial.execution_kind != "management-installed"
+                or initial.ready_receipt != Path(self.fresh_runtime_binding.initial_ready_path)
+                or initial.source_receipt != self.fresh_runtime_binding.initial_ready_identity
+            ):
+                raise ValueError("installed fresh runtime binding is incomplete")
+            fresh_management_path(initial)
+        if self.archived_exclusions:
+            if self.fresh_prior_lock_path is None or self.instance_id in {item.instance_id for item in self.archived_exclusions}:
+                raise ValueError("excluded ancestors require a distinct fresh instance")
+            for item in self.archived_exclusions:
+                item.validate()
+                for root in (self.state_root, self.oauth_root, self.journal_root):
+                    if Path(item.journal_root) == root or root in Path(item.journal_root).parents or Path(item.journal_root) in root.parents:
+                        raise ValueError("excluded journal overlaps active roots")
+        if self.management_version_root is not None:
+            assert self.management_config is not None
+            if not self.management_version_root.is_absolute() or not self.management_config.is_absolute():
+                raise ValueError("management self-update paths must be absolute")
+            root = self.management_version_root.resolve()
+            if any(root == path.resolve() or root in path.resolve().parents or path.resolve() in root.parents for path in (self.state_root, self.oauth_root, self.journal_root)):
+                raise ValueError("management runtime root overlaps retained bootstrap or operator state")
+        for runtime in self.runtimes:
+            if not runtime.reference or len(runtime.reference) > 128 or len(runtime.arguments) > 64 or any(len(arg) > 4096 or "\x00" in arg for arg in runtime.arguments):
+                raise ValueError("unbounded runtime profile")
+            if any(not key or "=" in key or len(key) > 128 or len(value) > 4096 for key, value in runtime.environment):
+                raise ValueError("invalid runtime environment")
+            if runtime.reference != self.initial_runtime and (runtime.source_root is None or runtime.ready_receipt is None or not runtime.source_receipt):
+                raise ValueError("non-bootstrap runtimes require READY-bound source identity")
+            if runtime.reference != self.initial_runtime and runtime.execution_kind not in {"source-script", "python-file", "management-installed"}:
+                raise ValueError("unsupported non-bootstrap execution profile")
+            if runtime.execution_kind == "management-installed":
+                if self.management_config is None or self.management_version_root is None or runtime.source_root is None:
+                    raise ValueError("management installed runtime requires the fixed bootstrap profile")
+                runtime.source_root.resolve().relative_to(self.management_version_root.resolve())
+                if runtime.arguments != ("-I", "-B", "-m", "auto_coder.cli", "management", "serve", "--config", str(self.management_config)):
+                    raise ValueError("management installed runtime must use the fixed serving entrypoint")
+
+
+@dataclass(frozen=True)
+class Observation:
+    status: ResultStatus
+    record: ChildRecord
+    operation_id: str = ""
+    process_ready: bool = False
+    application_ready: bool = False
+    detail: str = ""
+
+
+class ManagementBootstrapSupervisor:
+    """Own one child; all executable data comes from immutable local config."""
+
+    def __init__(self, config: BootstrapConfig, incarnation: str | None = None, bootstrap_config_path: Path | None = None, *, fresh_initialization: bool = False, source_authority: TestedSourcePublisher | None = None) -> None:
+        config.validate()
+        from .worker_network_client import configured_worker_bridge_environment
+
+        # Validate the complete trusted bootstrap environment before recording
+        # an effect or launching a management child.
+        self._worker_bridge_environment = configured_worker_bridge_environment()
+        self.config = config
+        self.bootstrap_config_path = bootstrap_config_path
+        self.fresh_initialization = fresh_initialization
+        self.source_authority = source_authority
+        self._container_shutdown_requested = False
+        self._archived_owner_fences: tuple[int, ...] = ()
+        self._prior_owner_fence: int | None = None
+        self._fresh_observer: FreshReadinessObserver | None = None
+        self._fresh_launch_may_exist = False
+        self._owned_launch_unresolved = False
+        self._child_dispatch_in_progress = False
+        self.store = BootstrapStore(config.state_root, config.instance_id)
+        self.incarnation = incarnation or str(uuid.uuid4())
+        self._lock = threading.RLock()
+        self._children: dict[int, subprocess.Popen[bytes]] = {}
+
+    @contextmanager
+    def _owner_file(self) -> Iterator[IO[bytes]]:
+        """Protect the original-lineage owner inode even under a permissive umask.
+
+        An existing unprotected owner record is refused, not rewritten. Other
+        unenrolled Supervisor profiles keep their existing opening behavior.
+        """
+        path = self.config.state_root / ".supervisor-owner.lock"
+        if self.fresh_initialization and (self.config.state_root / "fresh-initialization.json").is_file():
+            from .fresh_initialization import load_fresh_initialization
+
+            intent, _ = load_fresh_initialization(self.config.state_root)
+            if intent.original_history:
+                descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+                with os.fdopen(descriptor, "a+b") as owner:
+                    info = os.fstat(owner.fileno())
+                    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1:
+                        raise PermissionError("original-lineage Supervisor owner lock must be protected")
+                    yield owner
+                return
+        with path.open("a+b") as owner:
+            yield owner
+
+    def _release_prior_fences(self) -> None:
+        for descriptor in self._archived_owner_fences:
+            os.close(descriptor)
+        self._archived_owner_fences = ()
+        if self._prior_owner_fence is not None:
+            os.close(self._prior_owner_fence)
+            self._prior_owner_fence = None
+
+    def _acquire_prior_fences(self, intent) -> None:
+        from .fresh_initialization import acquire_prior_owner_fence
+
+        if self.config.fresh_prior_lock_path is None:
+            raise ValueError("direct prior fence is not configured")
+        archives = acquire_exclusion_fences(self.config.archived_exclusions)
+        try:
+            direct = acquire_prior_owner_fence(self.config.fresh_prior_lock_path, expected_device=intent.owner_lock_device, expected_inode=intent.owner_lock_inode)
+        except BaseException:
+            for descriptor in archives:
+                os.close(descriptor)
+            raise
+        self._archived_owner_fences = archives
+        self._prior_owner_fence = direct
+
+    def _spawn_owned_child(self, runtime: RuntimeSpec, environment: dict[str, str]) -> subprocess.Popen:
+        # Signal delivery can occur inside Popen after exec but before its
+        # handle is returned. Defer owner shutdown across that entire interval.
+        self._child_dispatch_in_progress = True
+        try:
+            child = subprocess.Popen([str(runtime.executable), *runtime.arguments], env=environment, start_new_session=False)
+            self._owned_launch_unresolved = True
+            self._children[child.pid] = child
+            return child
+        finally:
+            self._child_dispatch_in_progress = False
+
+    def _exclusion_settings(self) -> ManagementSettings:
+        from .exclusion_host import check_exclusion_peer
+        from .fresh_host_observation import _assert_pid_flock
+        from .fresh_initialization import load_fresh_initialization
+        from .oauth_config import load_management_settings
+
+        if self.bootstrap_config_path is None:
+            raise ValueError("owning bootstrap configuration unavailable")
+        intent, _ = load_fresh_initialization(self.config.state_root)
+        runtime = self._runtime(intent.runtime_reference)
+        if runtime is None or runtime.reference != self.config.initial_runtime:
+            raise ValueError("sealed initial runtime unavailable")
+        management_path = fresh_management_path(runtime)
+        settings = load_management_settings(management_path)
+        if settings.bootstrap_config_path != self.bootstrap_config_path or settings.state_root != self.config.oauth_root or settings.operation_state_root != self.config.journal_root:
+            raise ValueError("owning management configuration differs")
+        if self.config.management_config is not None and self.config.management_config != management_path:
+            raise ValueError("selected management configuration differs")
+        # Check the continuously held descriptors BEFORE opening a temporary
+        # reader: a new SH lock must never conceal a lost persistent fence.
+        check_exclusion_peer(self.config.archived_exclusions, self._archived_owner_fences, os.getpid())
+        direct = self._prior_owner_fence
+        if direct is None:
+            raise ValueError("direct prior fence unavailable")
+        info = os.fstat(direct)
+        if (info.st_dev, info.st_ino) != (intent.owner_lock_device, intent.owner_lock_inode):
+            raise ValueError("direct prior fence differs")
+        _assert_pid_flock(os.getpid(), direct, "READ")
+        descriptor = os.open(self.config.state_root / ".supervisor-owner.lock", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            _assert_pid_flock(os.getpid(), descriptor, "WRITE")
+        finally:
+            os.close(descriptor)
+        return settings
+
+    def _exclusion_evidence(self) -> AbstractContextManager[RetainedJournal | None]:
+        """Reopen sealed evidence for any physical start, including safety return.
+
+        Forward policy/grants do not authorize a safety return. Exclusion
+        evidence and continuously held fences remain prerequisites for both.
+        Legacy deployments without archived generations retain their contract.
+        """
+        from .retained_startup import retained_from_fresh_intent
+
+        if not self.config.archived_exclusions:
+            return nullcontext()
+        reader = None
+        try:
+            reader = retained_from_fresh_intent(self._exclusion_settings(), source_authority=self.source_authority, serving_process=False)
+            if reader is None:
+                raise ValueError("complete retained evidence unavailable")
+            reader.read()
+            return reader
+        except (OSError, ValueError, TypeError, KeyError, sqlite3.Error, AssertionError) as exc:
+            try:
+                if reader is not None:
+                    reader.close()
+            finally:
+                # A cleanup error must not be mistaken for Popen failure and
+                # enter the automatic previous-runtime launch path.
+                raise ExclusionEvidenceUnavailable("ancestry evidence or continuous owner fencing unavailable") from exc
+
+    def inspect(self) -> Observation:
+        with self._lock:
+            try:
+                record = self.store.load()
+            except sqlite3.DatabaseError as exc:
+                return Observation(ResultStatus.UNKNOWN, ChildRecord(self.config.instance_id, ChildPhase.UNKNOWN), detail=str(exc))
+            if record.pid == 0 and record.phase in {ChildPhase.STARTING, ChildPhase.DRAINING, ChildPhase.UNKNOWN, ChildPhase.NEEDS_ATTENTION}:
+                return Observation(ResultStatus.UNKNOWN, record, detail="unresolved process effect has no authoritative OS lifetime")
+            if record.pid == 0:
+                return Observation(ResultStatus.STOPPED, record)
+            owned = self._children.get(record.pid)
+            if owned is not None and owned.poll() is not None:
+                return self._observe_owned_exit(record, owned)
+            token = self._start_token(record.pid)
+            if token != record.start_token:
+                # The owned process can exit between poll() and /proc reading.
+                # Reap it before classifying its known lifetime as a stale PID.
+                if owned is not None and owned.poll() is not None:
+                    return self._observe_owned_exit(record, owned)
+                uncertain = replace(record, phase=ChildPhase.UNKNOWN, readiness="not_observed")
+                if not self.store.reserve(record, uncertain):
+                    return Observation(ResultStatus.UNKNOWN, self.store.load(), detail="child owner changed during OS observation")
+                return Observation(ResultStatus.UNKNOWN, uncertain, detail="recorded OS lifetime is absent or stale")
+            return Observation(ResultStatus.DRAINING if record.phase is ChildPhase.DRAINING else ResultStatus.OBSERVED_RUNNING, record, process_ready=True, application_ready=record.readiness == "application_ready")
+
+    def _observe_owned_exit(self, record: ChildRecord, owned: subprocess.Popen[bytes]) -> Observation:
+        if record.intended_stop:
+            exited = replace(record, phase=ChildPhase.UNKNOWN, exit_cause="intended_exit_observed")
+            if not self.store.reserve(record, exited):
+                return Observation(ResultStatus.UNKNOWN, self.store.load(), detail="child owner changed during exit observation")
+            return Observation(ResultStatus.UNKNOWN, exited, detail="intended child exit awaits drain evidence")
+        failed = replace(record, phase=ChildPhase.NEEDS_ATTENTION, pid=0, start_token="", exit_cause=f"startup_exit_{owned.returncode}")
+        if not self.store.reserve(record, failed):
+            return Observation(ResultStatus.UNKNOWN, self.store.load(), detail="child owner changed during exit observation")
+        if failed.previous_runtime and not failed.recovery_used and record.readiness != "application_ready":
+            return self._restore_once(failed.effect_operation_id, failed)
+        return Observation(ResultStatus.NEEDS_ATTENTION, failed, detail="owned child exited before application readiness")
+
+    def start_selected(self, operation_id: str, attempt_id: str, runtime_ref: str, expected_identity: str = "", *, allow_safety_return: bool = True, forward_authority: Callable[[RetainedJournal | None], bool] | None = None) -> Observation:
+        with self._lock:
+            effect = self.store.begin_effect(operation_id, attempt_id, Action.START_SELECTED.value, runtime_ref, expected_identity)
+            replay = self._replay(effect)
+            if replay is not None:
+                return replay
+            current = self.inspect()
+            if current.record.effect_operation_id == operation_id and current.record.effect_attempt_id == attempt_id:
+                # The same action may be in flight in another Supervisor.
+                # A current PID does not make its unfinished effect receipt
+                # safe to complete on that participant's behalf.
+                return Observation(ResultStatus.UNKNOWN, current.record, operation_id, detail="operation effect is still owned and unresolved")
+            if current.status in {ResultStatus.OBSERVED_RUNNING, ResultStatus.DRAINING} or (expected_identity and expected_identity != self._identity(current.record)):
+                return self._finish(operation_id, ResultStatus.CONFLICT, current.record, "a child lifetime or expectation conflicts", persist_state=False)
+            if current.status is ResultStatus.UNKNOWN:
+                return self._finish(operation_id, ResultStatus.UNKNOWN, current.record, current.detail, persist_state=False)
+            runtime = self._runtime(runtime_ref)
+            if runtime is None or not runtime.verify(initial=runtime_ref == self.config.initial_runtime):
+                rejected = replace(current.record, phase=ChildPhase.NEEDS_ATTENTION)
+                returning = allow_safety_return and current.record.phase is ChildPhase.STOPPED and bool(current.record.selected_runtime) and current.record.intended_stop
+                if returning:
+                    rejected = replace(
+                        rejected,
+                        selected_runtime=runtime_ref,
+                        previous_runtime=current.record.selected_runtime,
+                        child_generation=current.record.child_generation + 1,
+                        supervisor_incarnation=self.incarnation,
+                        intended_stop=False,
+                        readiness="not_observed",
+                        recovery_used=False,
+                        exit_cause="candidate_verification_failed",
+                        effect_operation_id=operation_id,
+                        effect_attempt_id=attempt_id,
+                        runtime_receipt=runtime.receipt if runtime is not None else "",
+                        source_receipt=runtime.source_receipt if runtime is not None else "",
+                    )
+                if not self.store.reserve(current.record, rejected):
+                    winner = self.inspect()
+                    return self._finish(operation_id, ResultStatus.UNKNOWN if winner.status is ResultStatus.UNKNOWN else ResultStatus.CONFLICT, winner.record, "another Supervisor changed the child while the runtime was verified")
+                if returning:
+                    return self._restore_once(operation_id, rejected)
+                return self._finish(operation_id, ResultStatus.NEEDS_ATTENTION, rejected, "runtime receipt is not verified")
+            prepared = replace(
+                current.record,
+                phase=ChildPhase.STARTING,
+                previous_runtime=current.record.selected_runtime if allow_safety_return else "",
+                selected_runtime=runtime_ref,
+                child_generation=current.record.child_generation + 1,
+                supervisor_incarnation=self.incarnation,
+                intended_stop=False,
+                readiness="not_observed",
+                exit_cause="",
+                effect_operation_id=operation_id,
+                effect_attempt_id=attempt_id,
+                drain_nonce=str(uuid.uuid4()),
+                runtime_receipt=runtime.receipt,
+                source_receipt=runtime.source_receipt,
+                recovery_used=False,
+            )
+            if not self.store.reserve(current.record, prepared):
+                winner = self.inspect()
+                if winner.record.effect_operation_id == operation_id and winner.record.effect_attempt_id == attempt_id:
+                    return Observation(ResultStatus.UNKNOWN, winner.record, operation_id, detail="operation effect is owned by another Supervisor")
+                return self._finish(operation_id, ResultStatus.CONFLICT if winner.status is not ResultStatus.UNKNOWN else ResultStatus.UNKNOWN, winner.record, "another Supervisor reserved the child generation", persist_state=False)
+            child = None
+            try:
+                environment = dict(runtime.environment)
+                # Fixed bootstrap machine-transport endpoints survive child
+                # replacement; arbitrary inherited environment does not.
+                environment.update(self._worker_bridge_environment)
+                environment.update({"AUTO_CODER_CHILD_GENERATION": str(prepared.child_generation), "AUTO_CODER_DRAIN_NONCE": prepared.drain_nonce})
+                if runtime.execution_kind == "management-installed":
+                    environment.update({"AUTO_CODER_MANAGEMENT_RUNTIME_ID": runtime.reference, "AUTO_CODER_MANAGEMENT_RECEIPT_ID": runtime.source_receipt})
+                    if operation_id.endswith(":start"):
+                        environment["AUTO_CODER_SELF_UPDATE_OPERATION_ID"] = operation_id.removesuffix(":start")
+                if runtime.drain_ack is not None:
+                    environment["AUTO_CODER_DRAIN_RECEIPT"] = str(runtime.drain_ack)
+                with self._exclusion_evidence() as retained:
+                    # Authority must be checked after the last ancestor scan,
+                    # not before a potentially slow source/DB verification.
+                    if forward_authority is not None and not forward_authority(retained):
+                        raise _ForwardAuthorityRefused
+                    child = self._spawn_owned_child(runtime, environment)
+            except _ForwardAuthorityRefused:
+                failed = replace(prepared, phase=ChildPhase.NEEDS_ATTENTION, exit_cause="forward_authority_refused_before_launch")
+                self.store.save(failed)
+                return self._restore_once(operation_id, failed)
+            except ExclusionEvidenceUnavailable:
+                return self._finish(operation_id, ResultStatus.NEEDS_ATTENTION, replace(prepared, phase=ChildPhase.NEEDS_ATTENTION), "ancestry evidence unavailable; no child was launched")
+            except OSError:
+                if child is not None:
+                    return self._finish(operation_id, ResultStatus.UNKNOWN, prepared, "launched child evidence cleanup is unresolved")
+                failed = replace(prepared, phase=ChildPhase.NEEDS_ATTENTION, exit_cause="launch_failed")
+                self.store.save(failed)
+                return self._restore_once(operation_id, failed)
+            token = self._start_token(child.pid)
+            if not token:
+                if child.poll() is not None:
+                    failed = replace(prepared, phase=ChildPhase.NEEDS_ATTENTION, pid=0, start_token="", exit_cause=f"startup_exit_{child.returncode}")
+                    if not self.store.reserve(prepared, failed):
+                        return Observation(ResultStatus.UNKNOWN, self.store.load(), operation_id, detail="child owner changed during startup exit")
+                    return self._restore_once(operation_id, failed)
+                failed = replace(prepared, phase=ChildPhase.NEEDS_ATTENTION, exit_cause="unobservable_launch")
+                self.store.save(failed)
+                return self._finish(operation_id, ResultStatus.UNKNOWN, failed, "new child OS lifetime could not be observed")
+            running = replace(prepared, phase=ChildPhase.RUNNING, pid=child.pid, start_token=token)
+            self.store.save(running)
+            self._owned_launch_unresolved = False
+            # A process which exits during the bounded startup observation is a
+            # confirmed failed start, not stale external PID evidence.
+            deadline = time.monotonic() + 0.1
+            while time.monotonic() < deadline and child.poll() is None:
+                time.sleep(0.01)
+            durable = self.store.load()
+            if durable != running:
+                status = ResultStatus.DRAINING if durable.phase is ChildPhase.DRAINING else ResultStatus.UNKNOWN
+                return self._finish(
+                    operation_id,
+                    status,
+                    durable,
+                    "another Supervisor changed the launched child transition",
+                    persist_state=False,
+                )
+            if child.poll() is not None:
+                failed = replace(running, phase=ChildPhase.NEEDS_ATTENTION, pid=0, start_token="", exit_cause=f"startup_exit_{child.returncode}")
+                if not self.store.reserve(running, failed):
+                    return Observation(ResultStatus.UNKNOWN, self.store.load(), operation_id, detail="child owner changed during startup exit")
+                return self._restore_once(operation_id, failed)
+            return self._finish(operation_id, ResultStatus.OBSERVED_RUNNING, running, persist_state=False)
+
+    def request_graceful_stop(self, operation_id: str, attempt_id: str, expected_identity: str) -> Observation:
+        with self._lock:
+            effect = self.store.begin_effect(operation_id, attempt_id, Action.REQUEST_GRACEFUL_STOP.value, "", expected_identity)
+            replay = self._replay(effect)
+            if replay is not None:
+                return replay
+            observed = self.inspect()
+            if observed.status is ResultStatus.STOPPED:
+                return self._finish(operation_id, ResultStatus.STOPPED, observed.record)
+            if observed.record.effect_operation_id == operation_id and observed.record.effect_attempt_id == attempt_id:
+                return Observation(ResultStatus.UNKNOWN, observed.record, operation_id, detail="graceful-stop effect is still owned and unresolved")
+            if observed.status is not ResultStatus.OBSERVED_RUNNING or expected_identity != self._identity(observed.record):
+                # This is only an observation.  Another Supervisor may have
+                # claimed DRAINING after our read, so persisting this earlier
+                # snapshot could roll the durable stop owner back to RUNNING.
+                return self._finish(
+                    operation_id,
+                    ResultStatus.CONFLICT if observed.status is not ResultStatus.UNKNOWN else ResultStatus.UNKNOWN,
+                    observed.record,
+                    "child identity changed",
+                    persist_state=False,
+                )
+            pidfd_open = getattr(os, "pidfd_open", None)
+            pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
+            if pidfd_open is None or pidfd_send_signal is None:
+                return self._finish(operation_id, ResultStatus.UNKNOWN, observed.record, "lifetime-bound process signalling is unavailable", persist_state=False)
+            try:
+                pidfd = pidfd_open(observed.record.pid, 0)
+            except OSError:
+                return self._finish(operation_id, ResultStatus.UNKNOWN, observed.record, "child lifetime disappeared before signalling", persist_state=False)
+            if self._start_token(observed.record.pid) != observed.record.start_token:
+                os.close(pidfd)
+                return self._finish(operation_id, ResultStatus.UNKNOWN, observed.record, "child lifetime changed before signalling", persist_state=False)
+            draining = replace(
+                observed.record,
+                phase=ChildPhase.DRAINING,
+                intended_stop=True,
+                effect_operation_id=operation_id,
+                effect_attempt_id=attempt_id,
+            )
+            # The state transition is the durable signal claim.  An object lock
+            # cannot fence another Supervisor process, while an unconditional
+            # save would allow both participants to send the cooperative signal.
+            if not self.store.reserve(observed.record, draining):
+                os.close(pidfd)
+                winner = self.inspect()
+                if winner.record.phase is ChildPhase.DRAINING and winner.record.effect_operation_id == operation_id and winner.record.effect_attempt_id == attempt_id:
+                    # A prepared effect plus the matching draining owner means
+                    # the other participant may have signalled and lost its
+                    # response.  Never signal again or terminalize that ambiguity.
+                    return Observation(
+                        ResultStatus.DRAINING if winner.status is ResultStatus.DRAINING else ResultStatus.UNKNOWN,
+                        winner.record,
+                        operation_id,
+                        winner.process_ready,
+                        winner.application_ready,
+                        "graceful-stop effect is already owned by another Supervisor",
+                    )
+                return self._finish(
+                    operation_id,
+                    ResultStatus.UNKNOWN if winner.status is ResultStatus.UNKNOWN else ResultStatus.CONFLICT,
+                    winner.record,
+                    "another Supervisor reserved a child transition",
+                    persist_state=False,
+                )
+            try:
+                try:
+                    pidfd_send_signal(pidfd, signal.SIGTERM, None, 0)
+                except OSError:
+                    return self._finish(operation_id, ResultStatus.UNKNOWN, draining, "child lifetime disappeared during signalling", persist_state=False)
+            finally:
+                os.close(pidfd)
+        deadline = time.monotonic() + self.config.graceful_timeout
+        while time.monotonic() < deadline:
+            if self._start_token(draining.pid) != draining.start_token:
+                runtime = self._runtime(draining.selected_runtime)
+                acknowledged = runtime is not None and self._drain_acknowledged(runtime, draining)
+                if not acknowledged:
+                    unknown = replace(draining, phase=ChildPhase.UNKNOWN, exit_cause="exit_without_drain_ack")
+                    if not self.store.reserve(draining, unknown):
+                        return self._finish(operation_id, ResultStatus.UNKNOWN, self.store.load(), "another Supervisor observed the exit")
+                    return self._finish(operation_id, ResultStatus.UNKNOWN, unknown, "child exited without a drain acknowledgement")
+                stopped = replace(draining, phase=ChildPhase.STOPPED, pid=0, start_token="", exit_cause="intended_stop")
+                if not self.store.reserve(draining, stopped):
+                    return self._finish(operation_id, ResultStatus.UNKNOWN, self.store.load(), "another Supervisor observed the exit")
+                return self._finish(operation_id, ResultStatus.STOPPED, stopped)
+            time.sleep(0.02)
+        return self._finish(operation_id, ResultStatus.DRAINING, draining, "observation deadline expired; no force signal was sent")
+
+    def reconcile(self) -> Observation:
+        observed = self.inspect()
+        record = observed.record
+        if observed.status is ResultStatus.UNKNOWN and record.phase is ChildPhase.UNKNOWN and record.intended_stop:
+            runtime = self._runtime(record.selected_runtime)
+            if runtime is not None and self._drain_acknowledged(runtime, record) and self._start_token(record.pid) != record.start_token:
+                stopped = replace(record, phase=ChildPhase.STOPPED, pid=0, start_token="", exit_cause="intended_stop")
+                if self.store.reserve(record, stopped):
+                    return Observation(ResultStatus.STOPPED, stopped)
+                return Observation(ResultStatus.UNKNOWN, self.store.load(), detail="child owner changed during reconciliation")
+        return observed
+
+    def _pristine_initial_state(self) -> bool:
+        """Never infer a first boot from an empty record over retained history."""
+        try:
+            with closing(sqlite3.connect(self.store.path.as_uri() + "?mode=ro", uri=True, timeout=2)) as connection:
+                metadata = dict(connection.execute("SELECT key,value FROM metadata"))
+                rows = connection.execute("SELECT instance_id,record_json FROM child_state").fetchall()
+                if metadata != {"schema_version": "1"} or connection.execute("PRAGMA quick_check").fetchone()[0] != "ok" or connection.execute("SELECT COUNT(*) FROM effects").fetchone()[0]:
+                    return False
+                if len(rows) > 1 or (rows and (rows[0][0] != self.config.instance_id or rows[0][1] != self.store._record_json(ChildRecord(self.config.instance_id)))):
+                    return False
+            recovery = self.config.state_root / "management-recovery.sqlite3"
+            oauth = self.config.oauth_root / "oauth.sqlite3"
+            if any(path.exists() or path.is_symlink() for path in (recovery, oauth)):
+                return False
+            stores = (
+                (self.config.state_root / "management-self-update.sqlite3", {"schema_version": "1", "instance_id": self.config.instance_id}, ("handoffs", "runtimes")),
+                (self.config.journal_root / "management-operations.sqlite3", {"schema_version": "2"}, ("operations", "operation_history")),
+            )
+            for path, expected_metadata, tables in stores:
+                if path.is_symlink():
+                    return False
+                if path.exists():
+                    with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=2)) as connection:
+                        if dict(connection.execute("SELECT key,value FROM metadata")) != expected_metadata or connection.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                            return False
+                        if any(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in tables):
+                            return False
+            return True
+        except (OSError, ValueError, sqlite3.Error):
+            return False
+
+    def run(self) -> int:
+        """Remain alive as PID 1 and reap only the configured child."""
+        if self.fresh_initialization and (not self.config.state_root.is_dir() or self.config.state_root.is_symlink()):
+            logger.error("Fresh initialization state root is unavailable")
+            return 1
+        self.config.state_root.mkdir(parents=True, exist_ok=True)
+        if self.fresh_initialization and (self.config.state_root / ".supervisor-owner.lock").is_symlink():
+            logger.error("Fresh initialization owner lock is invalid")
+            return 1
+        previous_handler = None
+        if self.config.restart_after_clean_shutdown and threading.current_thread() is threading.main_thread():
+            previous_handler = signal.getsignal(signal.SIGTERM)
+            signal.signal(signal.SIGTERM, lambda _signum, _frame: setattr(self, "_container_shutdown_requested", True))
+        launch_handlers = {signum: signal.getsignal(signum) for signum in (signal.SIGTERM, signal.SIGINT)} if threading.current_thread() is threading.main_thread() else {}
+
+        def launch_shutdown(signum, frame):
+            if self._child_dispatch_in_progress or self._fresh_launch_may_exist or self._owned_launch_unresolved:
+                self._container_shutdown_requested = True
+                return
+            prior = launch_handlers[signal.Signals(signum)]
+            if callable(prior):
+                prior(signum, frame)
+            elif prior == signal.SIG_DFL:
+                signal.signal(signum, signal.SIG_DFL)
+                signal.raise_signal(signum)
+
+        for signum in launch_handlers:
+            signal.signal(signum, launch_shutdown)
+        try:
+            with self._owner_file() as ownership:
+                fcntl.flock(ownership.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                try:
+                    return self._run_owned()
+                finally:
+                    if self._fresh_launch_may_exist or self._owned_launch_unresolved:
+                        self._preserve_unresolved_launch()
+        finally:
+            for signum, handler in launch_handlers.items():
+                signal.signal(signum, handler)
+            if previous_handler is not None:
+                signal.signal(signal.SIGTERM, previous_handler)
+
+    def _preserve_unresolved_launch(self) -> None:
+        """Keep the owner and all inherited fences until owned exits are proven."""
+        try:
+            logger.error("Management launch remains unresolved; preserving owner fences without effects or retry")
+        except Exception:
+            pass
+        while True:
+            try:
+                children = tuple(self._children.values())
+                if children and all(child.poll() is not None for child in children):
+                    self._release_prior_fences()
+                    self._fresh_launch_may_exist = False
+                    self._owned_launch_unresolved = False
+                    return
+            except (OSError, ValueError, ChildProcessError):
+                # Neither an empty handle set nor unavailable observation is
+                # evidence that a partially dispatched child never existed.
+                pass
+            time.sleep(0.2)
+
+    def _run_owned(self) -> int:
+        from .self_update_handoff import SelfUpdateHandoffConsumer
+
+        owner_start_token = self._await_owner_start_token()
+        if self.fresh_initialization:
+            # The explicit one-shot command is safe to reconstruct only after
+            # its own authenticated initial outcome was durably confirmed.
+            if (self.config.state_root / "fresh-initialization.json").exists():
+                from .fresh_initialization import read_fresh_status
+
+                try:
+                    completed = read_fresh_status(self.config.state_root)["status"] == "succeeded"
+                except (OSError, ValueError, TypeError, KeyError):
+                    completed = False
+            else:
+                completed = False
+            if not completed and not self._start_fresh_initialization():
+                return 1
+            self.fresh_initialization = False
+        if self._fresh_observer is None and any((self.config.state_root / name).exists() or (self.config.state_root / name).is_symlink() for name in ("fresh-initialization.json", "fresh-launch-claimed.json", "fresh-launched.json", "fresh-outcome.json")):
+            from .fresh_initialization import read_fresh_status
+
+            try:
+                if read_fresh_status(self.config.state_root)["status"] != "succeeded":
+                    raise ValueError("fresh initialization has not succeeded")
+                if self.config.restart_after_clean_shutdown or self.config.archived_exclusions or self.config.fresh_runtime_binding is not None:
+                    # The retained prior owner must remain fenced across every
+                    # successor lifetime, not just the one-shot first launch.
+                    import auto_coder
+
+                    from .fresh_initialization import load_fresh_initialization, verify_initialization_inputs
+
+                    intent, _ = load_fresh_initialization(self.config.state_root)
+                    if self.config.fresh_prior_lock_path != Path("/management-prior-owner.lock") or intent.new_instance != self.config.instance_id:
+                        raise ValueError("fresh prior owner fence differs")
+                    for path, device, inode in ((self.config.journal_root, intent.journal_device, intent.journal_inode), (self.config.oauth_root, intent.oauth_device, intent.oauth_inode)):
+                        info = path.stat()
+                        if path.is_symlink() or not path.is_dir() or (info.st_dev, info.st_ino) != (device, inode):
+                            raise ValueError("fresh retained roots differ")
+                    runtime = next((item for item in self.config.runtimes if item.reference == intent.runtime_reference), None)
+                    if self.bootstrap_config_path is None or auto_coder.__file__ is None or runtime is None:
+                        raise ValueError("fresh reconstruction runtime differs")
+                    if self.config.fresh_runtime_binding is not None:
+                        from .oauth_config import load_management_settings
+
+                        verify_installed_fresh_binding(self.config, self.bootstrap_config_path, intent, load_management_settings(fresh_management_path(runtime)), source_authority=self.source_authority, bootstrap_application=Path(auto_coder.__file__).resolve(strict=True).parent)
+                    else:
+                        if len(runtime.arguments) != 4 or runtime.arguments[:3] != ("management", "serve", "--config"):
+                            raise ValueError("fresh reconstruction runtime differs")
+                        verify_initialization_inputs(intent, bootstrap_config=self.bootstrap_config_path, management_config=Path(runtime.arguments[3]), executable=runtime.executable, application_root=Path(auto_coder.__file__).resolve(strict=True).parent)
+                    self._acquire_prior_fences(intent)
+                    if self.config.archived_exclusions:
+                        from .oauth_config import load_management_settings
+                        from .retained_startup import retained_from_fresh_intent
+
+                        exclusion_evidence = retained_from_fresh_intent(load_management_settings(fresh_management_path(runtime)), source_authority=self.source_authority, serving_process=False)
+                        if exclusion_evidence is None:
+                            raise ValueError("fresh reconstruction exclusion evidence unavailable")
+                        with exclusion_evidence:
+                            exclusion_evidence.read()
+            except (OSError, ValueError, TypeError, KeyError, sqlite3.Error):
+                self._release_prior_fences()
+                logger.error("Fresh initialization is unresolved; refusing supervisor reconstruction")
+                return 1
+        recovery_path = self.config.state_root / "management-recovery.sqlite3"
+        if self.store.path.is_symlink():
+            logger.error("Management child ledger cannot be a symlink")
+            return 1
+        ledger_exists = self.store.path.is_file()
+        retained = (
+            recovery_path,
+            self.config.state_root / "management-self-update.sqlite3",
+            self.config.journal_root / "management-operations.sqlite3",
+            self.config.oauth_root / "oauth.sqlite3",
+        )
+        if not ledger_exists and any(path.exists() or path.is_symlink() for path in retained):
+            logger.error("Management child ledger is missing; refusing bootstrap reconstruction")
+            return 1
+        self.store.require_existing = ledger_exists
+        self.store.publish_supervisor(self.incarnation, os.getpid(), owner_start_token)
+        self.store.require_existing = True
+        consumer = SelfUpdateHandoffConsumer(self) if self.config.management_config is not None else None
+        record = self.store.load()
+        initial_state_pristine = self._pristine_initial_state() if record.child_generation == 0 else False
+        if consumer is not None and record.child_generation == 0 and not consumer.store.path.exists() and not consumer.store.path.is_symlink():
+            try:
+                consumer.store.active()
+            except (OSError, ValueError, sqlite3.Error):
+                logger.warning("Management handoff mailbox unavailable")
+        recovery_consumer = None
+        recovery_mailbox_unavailable = False
+        if self.bootstrap_config_path is not None:
+            try:
+                from .recovery_supervisor import RecoveryConsumer
+
+                recovery_consumer = RecoveryConsumer(self, self.bootstrap_config_path)
+            except (OSError, ValueError, sqlite3.Error):
+                from .recovery_mailbox import RecoveryMailbox
+
+                try:
+                    mailbox = RecoveryMailbox(self.config.state_root, self.config.instance_id)
+                    recovery_mailbox_unavailable = mailbox._child_marker() is not None or mailbox.path.exists() or mailbox.path.is_symlink()
+                except (OSError, ValueError, sqlite3.Error):
+                    recovery_mailbox_unavailable = True
+                logger.warning("Management local recovery mailbox unavailable")
+        if record.pid == 0 and record.phase is ChildPhase.STOPPED and not record.intended_stop and record.child_generation == 0 and self.config.crash_budget > 0:
+            if not initial_state_pristine or self.store.has_unresolved_effects():
+                self.store.reserve(record, replace(record, phase=ChildPhase.UNKNOWN, exit_cause="unresolved_effect"))
+            else:
+                self.start_selected(f"bootstrap-{uuid.uuid4()}", str(uuid.uuid4()), self.config.initial_runtime)
+        if self.config.restart_after_clean_shutdown and record.child_generation > 0 and not self._container_shutdown_requested:
+            from .clean_restart import restart_verified_stop
+
+            outcome = restart_verified_stop(self)
+            logger.info("Management clean-restart admission: {}", outcome.value)
+        while True:
+            if self._container_shutdown_requested:
+                current = self.inspect()
+                if current.status is ResultStatus.STOPPED:
+                    return 0
+                if current.status is not ResultStatus.OBSERVED_RUNNING:
+                    logger.error("Management shutdown is not safely observable")
+                    return 1
+                operation = "container-stop-" + self.incarnation
+                stopped = self.request_graceful_stop(operation, operation, self._identity(current.record))
+                if stopped.status is ResultStatus.STOPPED:
+                    return 0
+                # Never end PID 1 while the exact child is still draining.
+                # A timed-out durable effect stays unresolved; no retry or
+                # invented terminal receipt is issued.
+                while self._start_token(current.record.pid) == current.record.start_token:
+                    time.sleep(0.2)
+                return 1
+            if not self.store.path.is_file() or self.store.path.is_symlink():
+                logger.error("Management child ledger is unavailable; preserving process state")
+                time.sleep(0.2)
+                continue
+            try:
+                self.store.publish_supervisor(self.incarnation, os.getpid(), self._await_owner_start_token())
+            except (OSError, sqlite3.Error):
+                logger.error("Management child ledger is unavailable; preserving process state")
+                time.sleep(0.2)
+                continue
+            # inspect() owns exit classification and the one-time safety return.
+            # A second poll/save here can lose an exit between observations and
+            # bypass that durable recovery transition.
+            self.inspect()
+            if self._fresh_observer is not None:
+                self._fresh_observer.tick()
+            if consumer is not None and not recovery_mailbox_unavailable and (recovery_consumer is None or not recovery_consumer.blocks_self_update()) and (self._fresh_observer is None or self._fresh_observer.succeeded):
+                consumer.tick()
+            if recovery_consumer is not None:
+                recovery_consumer.tick(allow_admission=self._fresh_observer is None or self._fresh_observer.succeeded)
+            time.sleep(0.2)
+
+    def _start_fresh_initialization(self) -> bool:
+        """One explicit fresh first launch; any partial transition is refused."""
+        from urllib.parse import urlsplit
+
+        import auto_coder
+
+        from .fresh_host_observation import assert_host_listener_absent
+        from .fresh_initialization import load_fresh_initialization, record_fresh_launch, request_and_claim_first_launch, verify_initialization_inputs
+        from .fresh_oauth import validate_retained_oauth
+        from .fresh_readiness import FreshReadinessObserver
+        from .oauth_config import load_management_settings
+        from .operation_store import ManagementOperationStore
+        from .recovery_mailbox import RecoveryMailbox
+        from .self_update_handoff import HandoffStore
+
+        launch_may_exist = False
+        try:
+            intent, _ = load_fresh_initialization(self.config.state_root)
+            if self.bootstrap_config_path is None or self.config.fresh_guard_path is None or self.config.fresh_prior_lock_path is None:
+                raise ValueError("fresh initialization configuration is incomplete")
+            if self.config.fresh_guard_path != Path("/management-initialization/fresh-guard.sock") or self.config.fresh_prior_lock_path != Path("/management-prior-owner.lock"):
+                raise ValueError("fresh initialization paths are not fixed")
+            guard_info = self.config.fresh_guard_path.parent.stat()
+            if self.config.fresh_guard_path.parent.is_symlink() or guard_info.st_uid != os.geteuid() or (guard_info.st_mode & 0o777) != 0o700 or (guard_info.st_dev, guard_info.st_ino) != (intent.guard_device, intent.guard_inode):
+                raise ValueError("fresh guard directory differs")
+            if (intent.new_instance, intent.state_root, intent.journal_root, intent.oauth_root, intent.runtime_reference) != (self.config.instance_id, str(self.config.state_root), str(self.config.journal_root), str(self.config.oauth_root), self.config.initial_runtime):
+                raise ValueError("fresh initialization config identity differs")
+            for path, device, inode in ((self.config.journal_root, intent.journal_device, intent.journal_inode), (self.config.oauth_root, intent.oauth_device, intent.oauth_inode)):
+                info = path.stat()
+                if path.is_symlink() or not path.is_dir() or (info.st_dev, info.st_ino) != (device, inode):
+                    raise ValueError("fresh mounted state root differs")
+            runtime = next((item for item in self.config.runtimes if item.reference == intent.runtime_reference), None)
+            if runtime is None or runtime.receipt != "sha256:" + intent.executable_sha256 or not runtime.verify(initial=True):
+                raise ValueError("fresh initialization runtime differs")
+            if self.config.fresh_runtime_binding is None:
+                if runtime.execution_kind != "source-script" or runtime.executable != Path("/opt/auto-coder/.venv/bin/auto-coder") or len(runtime.arguments) != 4 or runtime.arguments[:3] != ("management", "serve", "--config"):
+                    raise ValueError("fresh management configuration is not fixed")
+                _verify_fresh_console_entrypoint(runtime)
+            management_config = fresh_management_path(runtime)
+            settings = load_management_settings(management_config)
+            if settings.bootstrap_config_path != self.bootstrap_config_path or settings.state_root != self.config.oauth_root or settings.operation_state_root != self.config.journal_root:
+                raise ValueError("fresh management configuration differs")
+            if self.config.management_config is not None and self.config.management_config != management_config:
+                raise ValueError("fresh management configuration is not selected")
+            validate_retained_oauth(settings.oauth)
+            endpoint = urlsplit(self.config.listener_url)
+            if endpoint.hostname != settings.bind_host or endpoint.port != settings.port or endpoint.path != "/mcp" or endpoint.query or endpoint.fragment:
+                raise ValueError("fresh management endpoint differs")
+            application_root = Path(auto_coder.__file__).resolve(strict=True).parent
+            if self.config.fresh_runtime_binding is not None:
+                verify_installed_fresh_binding(self.config, self.bootstrap_config_path, intent, settings, source_authority=self.source_authority, bootstrap_application=application_root)
+            else:
+                verify_initialization_inputs(intent, bootstrap_config=self.bootstrap_config_path, management_config=management_config, executable=runtime.executable, application_root=application_root)
+            allowed = {"fresh-initialization.json", ".supervisor-owner.lock", "logs"}
+            if any(item.name not in allowed or item.is_symlink() for item in self.config.state_root.iterdir()) or any(self.config.journal_root.iterdir()):
+                raise ValueError("fresh initialization state is not empty")
+            self._acquire_prior_fences(intent)
+            # The original-lineage producer requires protected owner-only
+            # SQLite identities. The native initializers honor the process
+            # umask; never make their protection depend on an operator shell.
+            previous_umask = os.umask(0o077) if intent.original_history else None
+            try:
+                self.store.publish_supervisor(self.incarnation, os.getpid(), self._await_owner_start_token())
+                self.store.require_existing = True
+                request_and_claim_first_launch(self.config.state_root, self.config.fresh_guard_path, owner_incarnation=self.incarnation)
+                with closing(ManagementOperationStore(self.config.journal_root)._connect()):
+                    pass
+                with closing(HandoffStore(self.config.state_root, self.config.instance_id)._connect()):
+                    pass
+                RecoveryMailbox(self.config.state_root, self.config.instance_id).initialize()
+                from .original_attempts import record_original_stores
+
+                record_original_stores(self.config.state_root, intent)
+            finally:
+                if previous_umask is not None:
+                    os.umask(previous_umask)
+            if self.config.fresh_runtime_binding is not None:
+                verify_installed_fresh_binding(self.config, self.bootstrap_config_path, intent, settings, source_authority=self.source_authority, bootstrap_application=application_root)
+            else:
+                verify_initialization_inputs(intent, bootstrap_config=self.bootstrap_config_path, management_config=management_config, executable=runtime.executable, application_root=application_root)
+            validate_retained_oauth(settings.oauth)
+            if not runtime.verify(initial=True) or endpoint.port is None:
+                raise ValueError("fresh runtime verification failed")
+            assert_host_listener_absent(endpoint.port)
+            if intent.host_prior_journal_root or self.config.archived_exclusions:
+                from .retained_startup import retained_from_fresh_intent
+
+                # A grant and held fences cannot prove that retained journal
+                # evidence remains available after the host delivered it.
+                evidence = retained_from_fresh_intent(settings, source_authority=self.source_authority, serving_process=False)
+                if evidence is None:
+                    raise ValueError("fresh first-launch retained evidence unavailable")
+                with evidence:
+                    evidence.read()
+            if self._container_shutdown_requested:
+                raise ValueError("fresh launch was cancelled before dispatch")
+            launch_may_exist = True
+            self._fresh_launch_may_exist = True
+            result = self.start_selected("fresh-" + intent.request_id, str(uuid.uuid4()), intent.runtime_reference)
+            if result.status is not ResultStatus.OBSERVED_RUNNING:
+                raise ValueError("fresh first launch is not confirmed")
+            observation = record_fresh_launch(self.config.state_root, intent, incarnation=self.incarnation, child_identity=self._identity(result.record), verification_timeout=self.config.verification_timeout)
+            self._fresh_observer = FreshReadinessObserver(self, intent, observation, settings.oauth.canonical_issuer, application_root)
+            logger.info("Fresh management child launched request={} identity={}", intent.request_id, self._identity(result.record))
+            self._fresh_launch_may_exist = False
+            return True
+        except (OSError, ValueError, TypeError, KeyError, sqlite3.Error):
+            if not launch_may_exist:
+                self._release_prior_fences()
+            logger.error("Fresh initialization unavailable or unresolved; no retry is permitted")
+            return False
+
+    def restore_previous(self, operation_id: str, attempt_id: str, expected_identity: str, previous_runtime: str) -> Observation:
+        """Make the single pre-authorized safety return after proven child exit."""
+        with self._lock:
+            effect = self.store.begin_effect(operation_id, attempt_id, Action.RESTORE_PREVIOUS.value, previous_runtime, expected_identity)
+            replay = self._replay(effect)
+            if replay is not None:
+                return replay
+            observed = self.reconcile()
+            if observed.status is not ResultStatus.STOPPED or self._identity(observed.record) != expected_identity or observed.record.previous_runtime != previous_runtime:
+                return self._finish(operation_id, ResultStatus.UNKNOWN, observed.record, "previous-runtime restore requires the exact stopped candidate lifetime")
+            return self._restore_once(operation_id, observed.record)
+
+    def restore_stopped_original(self, operation_id: str, attempt_id: str, expected_identity: str, previous_runtime: str) -> Observation:
+        """Return the drained original when forward authority is no longer live."""
+        with self._lock:
+            effect = self.store.begin_effect(operation_id, attempt_id, Action.RESTORE_PREVIOUS.value, previous_runtime, expected_identity)
+            replay = self._replay(effect)
+            if replay is not None:
+                return replay
+            observed = self.reconcile()
+            if observed.status is not ResultStatus.STOPPED or self._identity(observed.record) != expected_identity or observed.record.selected_runtime != previous_runtime or not observed.record.intended_stop:
+                return self._finish(operation_id, ResultStatus.UNKNOWN, observed.record, "original-runtime return requires the exact drained original lifetime")
+            refused = replace(
+                observed.record,
+                phase=ChildPhase.NEEDS_ATTENTION,
+                previous_runtime=previous_runtime,
+                child_generation=observed.record.child_generation + 1,
+                recovery_used=False,
+                intended_stop=False,
+                exit_cause="forward_authority_refused_after_drain",
+                effect_operation_id=operation_id,
+                effect_attempt_id=attempt_id,
+            )
+            if not self.store.reserve(observed.record, refused):
+                return Observation(ResultStatus.UNKNOWN, self.store.load(), operation_id, detail="original-runtime return owner changed")
+            return self._restore_once(operation_id, refused)
+
+    def _restore_once(self, operation_id: str, failed: ChildRecord) -> Observation:
+        if failed.recovery_used or not failed.previous_runtime:
+            return self._finish(operation_id, ResultStatus.NEEDS_ATTENTION, failed, "no verified previous runtime is available")
+        runtime = self._runtime(failed.previous_runtime)
+        recovery = replace(failed, recovery_used=True)
+        # This durable claim precedes launch and fences another participant.
+        if not self.store.reserve(failed, recovery):
+            return Observation(ResultStatus.UNKNOWN, self.store.load(), operation_id, detail="another Supervisor owns the safety return")
+        if runtime is None or not runtime.verify(initial=runtime.reference == self.config.initial_runtime):
+            return self._finish(operation_id, ResultStatus.NEEDS_ATTENTION, recovery, "previous runtime receipt is not verified")
+        child = None
+        try:
+            environment = dict(runtime.environment)
+            environment.update(self._worker_bridge_environment)
+            recovery_nonce = str(uuid.uuid4())
+            environment.update({"AUTO_CODER_CHILD_GENERATION": str(recovery.child_generation + 1), "AUTO_CODER_DRAIN_NONCE": recovery_nonce})
+            if runtime.execution_kind == "management-installed":
+                environment.update({"AUTO_CODER_MANAGEMENT_RUNTIME_ID": runtime.reference, "AUTO_CODER_MANAGEMENT_RECEIPT_ID": runtime.source_receipt})
+            if runtime.drain_ack is not None:
+                environment["AUTO_CODER_DRAIN_RECEIPT"] = str(runtime.drain_ack)
+            with self._exclusion_evidence():
+                child = self._spawn_owned_child(runtime, environment)
+        except ExclusionEvidenceUnavailable:
+            return self._finish(operation_id, ResultStatus.NEEDS_ATTENTION, recovery, "ancestry evidence unavailable; previous runtime was not started")
+        except OSError:
+            if child is not None:
+                return self._finish(operation_id, ResultStatus.UNKNOWN, recovery, "previous runtime launch evidence is unresolved")
+            return self._finish(operation_id, ResultStatus.NEEDS_ATTENTION, recovery, "previous runtime launch failed")
+        token = self._start_token(child.pid)
+        if not token:
+            if child.poll() is not None:
+                failed_restore = replace(recovery, phase=ChildPhase.NEEDS_ATTENTION, pid=0, start_token="", exit_cause="previous_runtime_start_failed")
+                if self.store.reserve(recovery, failed_restore):
+                    return self._finish(operation_id, ResultStatus.NEEDS_ATTENTION, failed_restore, "the one previous-runtime process exited during startup")
+                return self._finish(operation_id, ResultStatus.UNKNOWN, self.store.load(), "restore lifetime changed during startup observation")
+            return self._finish(operation_id, ResultStatus.UNKNOWN, recovery, "recovery OS lifetime is unknown")
+        self._children[child.pid] = child
+        restored = replace(
+            recovery,
+            phase=ChildPhase.RUNNING,
+            selected_runtime=runtime.reference,
+            pid=child.pid,
+            start_token=token,
+            child_generation=recovery.child_generation + 1,
+            drain_nonce=recovery_nonce,
+            runtime_receipt=runtime.receipt,
+            source_receipt=runtime.source_receipt,
+            exit_cause="candidate_launch_failed",
+            intended_stop=False,
+            supervisor_incarnation=self.incarnation,
+            readiness="not_observed",
+        )
+        self.store.save(restored)
+        self._owned_launch_unresolved = False
+        deadline = time.monotonic() + 0.1
+        while time.monotonic() < deadline and child.poll() is None:
+            time.sleep(0.01)
+        if child.poll() is not None:
+            failed_restore = replace(restored, phase=ChildPhase.NEEDS_ATTENTION, pid=0, start_token="", exit_cause="previous_runtime_start_failed")
+            if self.store.reserve(restored, failed_restore):
+                return self._finish(operation_id, ResultStatus.NEEDS_ATTENTION, failed_restore, "the one previous-runtime process exited during startup")
+            return Observation(ResultStatus.UNKNOWN, self.store.load(), operation_id, detail="restore lifetime changed during startup observation")
+        # The original start effect may already contain the candidate's
+        # immutable observation. Retain the distinct restored lifetime under a
+        # separate observation identity before declaring the safety return.
+        observation_id = operation_id + ":safety-observation"
+        evidence = self.store.begin_effect(observation_id, restored.effect_attempt_id, "OBSERVE_SAFETY_RESTORE", restored.selected_runtime, self._identity(restored))
+        if evidence.phase != "prepared":
+            return Observation(ResultStatus.UNKNOWN, restored, operation_id, detail="safety return observation already exists")
+        self._finish(observation_id, ResultStatus.PROCESS_RESTORED, restored)
+        return self._finish(operation_id, ResultStatus.PROCESS_RESTORED, restored)
+
+    def _replay(self, effect: EffectRecord) -> Observation | None:
+        if effect.phase == "prepared":
+            return None
+        try:
+            result = json.loads(effect.result_json)
+            status = ResultStatus(result["status"])
+            record_value = result["record"]
+            record_value["phase"] = ChildPhase(record_value["phase"])
+            record = ChildRecord(**record_value)
+        except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+            return Observation(ResultStatus.UNKNOWN, self.store.load(), effect.operation_id, detail="corrupt effect receipt")
+        return Observation(status, record, effect.operation_id, bool(result.get("process_ready")), bool(result.get("application_ready")), result.get("detail", ""))
+
+    def _finish(self, operation_id: str, status: ResultStatus, record: ChildRecord, detail: str = "", *, persist_state: bool = False) -> Observation:
+        # Effect receipts are observations, not authority to overwrite a newer
+        # child generation or another Supervisor's durable transition claim.
+        # Callers must reserve or save an authoritative transition beforehand.
+        if persist_state:
+            self.store.save(record)
+        process_ready = status in {ResultStatus.OBSERVED_RUNNING, ResultStatus.PROCESS_RESTORED}
+        encoded_record = asdict(record)
+        encoded_record["phase"] = record.phase.value
+        self.store.finish_effect(operation_id, "observed", {"status": status.value, "detail": detail, "identity": self._identity(record), "record": encoded_record, "process_ready": process_ready, "application_ready": False})
+        return Observation(status, record, operation_id, process_ready, False, detail)
+
+    @staticmethod
+    def _drain_acknowledged(runtime: RuntimeSpec, record: ChildRecord) -> bool:
+        if runtime.drain_ack is None:
+            return False
+        try:
+            receipt = json.loads(runtime.drain_ack.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        return receipt == {"generation": record.child_generation, "nonce": record.drain_nonce, "pid": record.pid, "start_token": record.start_token}
+
+    def _runtime(self, reference: str) -> RuntimeSpec | None:
+        configured = next((item for item in self.config.runtimes if item.reference == reference), None)
+        if configured is not None or self.config.management_version_root is None:
+            return configured
+        from .self_update_handoff import HandoffStore, runtime_for_receipt
+
+        receipt = HandoffStore(self.config.state_root, self.config.instance_id).runtime(reference)
+        return runtime_for_receipt(self.config, receipt) if receipt is not None else None
+
+    @staticmethod
+    def _start_token(pid: int) -> str:
+        if pid <= 0:
+            return ""
+        try:
+            # Field 2 (comm) is parenthesized and may contain whitespace or
+            # parentheses.  Splitting the entire line shifts field 22.
+            fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()
+            return "" if fields[0] == "Z" else fields[19]
+        except (OSError, IndexError):
+            return ""
+
+    def _await_owner_start_token(self) -> str:
+        """Hold the owner fence and suspend effects until its lifetime is observable."""
+        warned = False
+        while True:
+            token = self._start_token(os.getpid())
+            if token:
+                return token
+            if not warned:
+                logger.warning("Management supervisor lifetime unavailable; preserving process state")
+                warned = True
+            time.sleep(0.2)
+
+    @staticmethod
+    def _identity(record: ChildRecord) -> str:
+        return f"{record.pid}:{record.start_token}:{record.child_generation}:{record.selected_runtime}:{record.supervisor_incarnation}"
+
+
+def main() -> None:
+    from ..logger_config import setup_logger
+
+    parser = argparse.ArgumentParser(description="Auto-Coder immutable management child supervisor")
+    parser.add_argument("--config", required=True, type=Path)
+    parser.add_argument("--fresh-initialization", action="store_true")
+    args = parser.parse_args()
+    config = BootstrapConfig.read(args.config)
+    setup_logger(stream=sys.stdout, log_file=str(config.state_root / "logs" / "management-bootstrap.log"))
+    raise SystemExit(ManagementBootstrapSupervisor(config, bootstrap_config_path=args.config, fresh_initialization=args.fresh_initialization).run())
+
+
+if __name__ == "__main__":
+    # Keep one canonical set of enum/dataclass identities when the supported
+    # module CLI composes the separately imported durable handoff consumer.
+    from auto_coder.management.bootstrap_supervisor import main as canonical_main
+
+    canonical_main()

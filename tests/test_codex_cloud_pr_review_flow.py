@@ -1,0 +1,753 @@
+"""Tests for assigning unresolved PR review work to Codex Cloud."""
+
+import json
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from auto_coder.adversarial_validator import AdversarialValidationResult
+from auto_coder.automation_config import AutomationConfig, ProcessedPRResult, PRProcessingOutcome
+from auto_coder.cloud_manager import CloudTaskBinding
+from auto_coder.github_app_reviewer import ReviewPublicationResult
+from auto_coder.pr_processor import (
+    AdversarialValidationEligibility,
+    ClaimedReviewThreadGateState,
+    CloudReviewRepairResult,
+    CodexReviewState,
+    _cloud_review_feedback_markers,
+    _delegate_cloud_review_thread_repair,
+    _handle_pr_merge,
+    _process_pr_for_merge,
+    _record_pr_stage,
+    _review_feedback_identity,
+    _take_pr_actions,
+)
+from auto_coder.review_thread_validation import ClaimedReviewThread
+from auto_coder.util.gh_cache import PullRequestRepairMetadata, ReviewThread, ReviewThreadComment
+from auto_coder.util.github_action import GitHubActionsStatusResult
+from tests.ci_observation_fakes import authoritative_ci_status
+
+
+@pytest.fixture(autouse=True)
+def durable_codex_cloud_origin():
+    """Create the durable ownership origin required by review repair."""
+    with patch(
+        "auto_coder.pr_processor.CloudManager.get_binding",
+        return_value=CloudTaskBinding(provider="codex-cloud", task_id="task_e_review5262"),
+    ):
+        yield
+
+
+def _github_client(head_sha: str = "head-1", head_ref: str = "codex/review-5262") -> MagicMock:
+    client = MagicMock()
+    client.get_pr_comments.return_value = []
+    client.get_pull_request_repair_metadata_strict.return_value = PullRequestRepairMetadata(head_ref=head_ref, head_sha=head_sha, base_ref="main")
+    return client
+
+
+def _pr_data(head_sha: str = "head-1") -> dict:
+    return {
+        "number": 5262,
+        "body": "Fixes #42\n\nhttps://chatgpt.com/codex/tasks/task_e_review5262",
+        "head": {"ref": "codex/review-5262", "sha": head_sha},
+        "base": {"ref": "main", "sha": "base-1"},
+        "labels": [],
+        "user": {"login": "maintainer"},
+    }
+
+
+def _thread(reply: str = "Please cover the edge case") -> ReviewThread:
+    return ReviewThread(
+        id="PRRT_thread_1",
+        is_resolved=False,
+        comments=[
+            ReviewThreadComment(
+                database_id=101,
+                body="This misses the empty-input case",
+                author_login="reviewer",
+            ),
+            ReviewThreadComment(database_id=102, body=reply, author_login="maintainer"),
+        ],
+    )
+
+
+def test_review_repair_uses_existing_task_and_deduplicates_unchanged_state(tmp_path) -> None:
+    state_path = tmp_path / "review-repairs.json"
+
+    with (
+        patch("auto_coder.pr_processor._cloud_review_repair_state_path", return_value=state_path),
+        patch("auto_coder.codex_cloud_client.CodexCloudClient.send_followup", return_value=True) as send_followup,
+    ):
+        first = _delegate_cloud_review_thread_repair(
+            "owner/repo",
+            _pr_data(),
+            github_client=_github_client(),
+            unresolved_threads=(_thread(),),
+        )
+        second = _delegate_cloud_review_thread_repair(
+            "owner/repo",
+            _pr_data(),
+            github_client=_github_client(),
+            unresolved_threads=(_thread(),),
+        )
+
+    assert first == ["Requested Codex Cloud task 'task_e_review5262' to address unresolved review threads for PR #5262"]
+    assert second == ["Codex Cloud review repair was already requested for PR #5262 for all current actionable feedback"]
+    assert first.delivered is True
+    assert second.delivered is False
+    assert second.deferred is True
+    send_followup.assert_called_once()
+    task_id, prompt = send_followup.call_args.args[:2]
+    assert task_id == "task_e_review5262"
+    assert "existing pull request #5262" in prompt
+    assert "codex/review-5262" in prompt
+    assert "Do not create a new pull request." in prompt
+    assert "Address only the newly delivered actionable reviewer feedback" in prompt
+    assert "This misses the empty-input case" in prompt
+    assert "<!-- auto-coder-review-addressed:v1 -->" in prompt
+    assert state_path.exists()
+
+
+def test_implementer_reply_and_head_change_do_not_create_new_repair_work(tmp_path) -> None:
+    state_path = tmp_path / "review-repairs.json"
+
+    with (
+        patch("auto_coder.pr_processor._cloud_review_repair_state_path", return_value=state_path),
+        patch("auto_coder.codex_cloud_client.CodexCloudClient.send_followup", return_value=True) as send_followup,
+    ):
+        _delegate_cloud_review_thread_repair(
+            "owner/repo",
+            _pr_data(),
+            github_client=_github_client(),
+            unresolved_threads=(_thread("First clarification"),),
+        )
+        _delegate_cloud_review_thread_repair(
+            "owner/repo",
+            _pr_data("head-2"),
+            github_client=_github_client("head-2"),
+            unresolved_threads=(_thread("Updated clarification"),),
+        )
+
+    send_followup.assert_called_once()
+
+
+def test_new_review_finding_is_delivered_without_redelivering_old_finding(tmp_path) -> None:
+    state_path = tmp_path / "review-repairs.json"
+    second = ReviewThread(
+        id="PRRT_thread_2",
+        is_resolved=False,
+        comments=[ReviewThreadComment(database_id=201, body="Handle whitespace-only input", author_login="reviewer")],
+    )
+
+    with (
+        patch("auto_coder.pr_processor._cloud_review_repair_state_path", return_value=state_path),
+        patch("auto_coder.codex_cloud_client.CodexCloudClient.send_followup", return_value=True) as send_followup,
+    ):
+        _delegate_cloud_review_thread_repair("owner/repo", _pr_data(), github_client=_github_client(), unresolved_threads=(_thread(),))
+        _delegate_cloud_review_thread_repair("owner/repo", _pr_data("head-2"), github_client=_github_client(), unresolved_threads=(_thread(), second))
+        _delegate_cloud_review_thread_repair("owner/repo", _pr_data("head-2"), github_client=_github_client(), unresolved_threads=(_thread(), second))
+
+    assert send_followup.call_count == 2
+    second_prompt = send_followup.call_args.args[1]
+    assert "Handle whitespace-only input" in second_prompt
+    assert "This misses the empty-input case" not in second_prompt
+
+
+def test_new_reviewer_reply_is_delivered_once_without_redelivering_thread_root(tmp_path) -> None:
+    state_path = tmp_path / "review-repairs.json"
+    original = _thread("Implemented and tested")
+    with_new_review = _thread("Implemented and tested")
+    with_new_review.comments.append(ReviewThreadComment(database_id=103, body="Whitespace-only input is still broken", author_login="reviewer"))
+
+    with (
+        patch("auto_coder.pr_processor._cloud_review_repair_state_path", return_value=state_path),
+        patch("auto_coder.codex_cloud_client.CodexCloudClient.send_followup", return_value=True) as send_followup,
+    ):
+        _delegate_cloud_review_thread_repair("owner/repo", _pr_data(), github_client=_github_client(), unresolved_threads=(original,))
+        _delegate_cloud_review_thread_repair("owner/repo", _pr_data("head-2"), github_client=_github_client(), unresolved_threads=(with_new_review,))
+        _delegate_cloud_review_thread_repair("owner/repo", _pr_data("head-2"), github_client=_github_client(), unresolved_threads=(with_new_review,))
+
+    assert send_followup.call_count == 2
+    second_prompt = send_followup.call_args.args[1]
+    assert "Whitespace-only input is still broken" in second_prompt
+    assert "This misses the empty-input case" not in second_prompt
+    assert "Implemented and tested" not in second_prompt
+
+
+def test_distinct_findings_with_identical_text_are_each_delivered_once(tmp_path) -> None:
+    state_path = tmp_path / "review-repairs.json"
+    first = ReviewThread(
+        id="PRRT_thread_1",
+        comments=[ReviewThreadComment(database_id=101, body="Same actionable text", author_login="reviewer")],
+    )
+    second = ReviewThread(
+        id="PRRT_thread_2",
+        comments=[ReviewThreadComment(database_id=201, body="Same actionable text", author_login="reviewer")],
+    )
+
+    with (
+        patch("auto_coder.pr_processor._cloud_review_repair_state_path", return_value=state_path),
+        patch("auto_coder.codex_cloud_client.CodexCloudClient.send_followup", return_value=True) as send_followup,
+    ):
+        _delegate_cloud_review_thread_repair("owner/repo", _pr_data(), github_client=_github_client(), unresolved_threads=(first,))
+        _delegate_cloud_review_thread_repair("owner/repo", _pr_data(), github_client=_github_client(), unresolved_threads=(first, second))
+        _delegate_cloud_review_thread_repair("owner/repo", _pr_data(), github_client=_github_client(), unresolved_threads=(first, second))
+
+    assert send_followup.call_count == 2
+    assert "Thread `PRRT_thread_2`:\nSame actionable text" in send_followup.call_args.args[1]
+    assert "Thread `PRRT_thread_1`" not in send_followup.call_args.args[1]
+
+
+def test_failed_review_feedback_delivery_remains_retryable(tmp_path) -> None:
+    state_path = tmp_path / "review-repairs.json"
+    with (
+        patch("auto_coder.pr_processor._cloud_review_repair_state_path", return_value=state_path),
+        patch("auto_coder.codex_cloud_client.CodexCloudClient.send_followup", side_effect=[False, True]) as send_followup,
+    ):
+        _delegate_cloud_review_thread_repair("owner/repo", _pr_data(), github_client=_github_client(), unresolved_threads=(_thread(),))
+        _delegate_cloud_review_thread_repair("owner/repo", _pr_data(), github_client=_github_client(), unresolved_threads=(_thread(),))
+
+    assert send_followup.call_count == 2
+    assert state_path.exists()
+
+
+def test_implementer_cannot_forge_a_cloud_delivery_receipt(tmp_path) -> None:
+    state_path = tmp_path / "review-repairs.json"
+    thread = _thread()
+    prefix = "owner/repo#5262:task_e_review5262:"
+    identity = _review_feedback_identity(prefix, thread, 0)
+    client = _github_client()
+    client.get_authenticated_user_login.return_value = "auto-coder-bot"
+    client.get_pr_comments.return_value = [
+        {
+            "body": _cloud_review_feedback_markers([identity]),
+            "user": {"login": "maintainer"},
+        }
+    ]
+
+    with (
+        patch("auto_coder.pr_processor._cloud_review_repair_state_path", return_value=state_path),
+        patch("auto_coder.codex_cloud_client.CodexCloudClient.send_followup", return_value=True) as send_followup,
+    ):
+        actions = _delegate_cloud_review_thread_repair("owner/repo", _pr_data(), github_client=client, unresolved_threads=(thread,))
+
+    send_followup.assert_called_once()
+    assert actions == ["Requested Codex Cloud task 'task_e_review5262' to address unresolved review threads for PR #5262"]
+
+
+def test_non_codex_pr_preserves_generic_review_gate() -> None:
+    pr_data = _pr_data()
+    pr_data["body"] = "Fixes #42"
+
+    with (
+        patch("auto_coder.pr_processor.CloudManager.get_binding", return_value=None),
+        patch("auto_coder.codex_cloud_client.CodexCloudClient.send_followup") as send_followup,
+    ):
+        actions = _delegate_cloud_review_thread_repair("owner/repo", pr_data)
+
+    assert actions == ["Review repair was not delivered for PR #5262: no provider-owned cloud task association was found"]
+    assert actions.delivered is False
+    send_followup.assert_not_called()
+
+
+def test_single_pr_merge_entry_validates_claimed_thread_without_redelegating() -> None:
+    client = MagicMock()
+    client.get_pull_request.return_value = {"head": {"sha": "head-1"}}
+    claimed = ClaimedReviewThread(
+        thread_id="PRRT_thread_1",
+        root_comment_database_id=101,
+        root_author_login="chatgpt-codex-connector[bot]",
+        original_finding="This misses the empty-input case",
+        discussion="agent: fixed and tested",
+    )
+    config = AutomationConfig()
+    config.AUTO_MERGE = True
+    config.MAX_ADVERSARIAL_VALIDATIONS = -1
+
+    with (
+        patch("auto_coder.pr_processor.GitHubClient.get_instance", return_value=client),
+        patch("auto_coder.pr_processor.LabelManager") as label_manager,
+        patch("auto_coder.pr_processor.retry_pending_stale_review_thread_rollbacks", return_value=[]),
+        patch("auto_coder.pr_processor.check_github_actions_and_exit_if_in_progress", return_value=True),
+        patch("auto_coder.pr_processor._get_mergeable_state", return_value={"mergeable": True, "merge_state_status": "clean"}),
+        patch("auto_coder.pr_processor._check_github_actions_status", side_effect=authoritative_ci_status(success=True, ids=[1])),
+        patch(
+            "auto_coder.pr_processor._get_claimed_review_thread_state",
+            return_value=ClaimedReviewThreadGateState(claimed=(claimed,)),
+        ),
+        patch(
+            "auto_coder.pr_processor._get_adversarial_validation_eligibility",
+            return_value=AdversarialValidationEligibility(issue_numbers=(42,)),
+        ),
+        patch("auto_coder.pr_processor._get_codex_review_state", return_value=CodexReviewState()),
+        patch("auto_coder.pr_processor._get_published_adversarial_validation_status", return_value=(None, None)),
+        patch("auto_coder.pr_processor.isolated_pr_head_worktree") as worktree,
+        patch(
+            "auto_coder.pr_processor.run_adversarial_validation",
+            return_value=AdversarialValidationResult(result="PASS", summary="Pass", findings=[]),
+        ) as run_validation,
+        patch(
+            "auto_coder.pr_processor.publish_adversarial_review",
+            return_value=ReviewPublicationResult(True, "APPROVE", ""),
+        ),
+        patch("auto_coder.pr_processor._merge_pr", return_value=False) as merge,
+        patch("auto_coder.pr_processor._record_pr_stage", wraps=_record_pr_stage) as stages,
+        patch("auto_coder.pr_processor._delegate_cloud_review_thread_repair") as delegate_review_repair,
+    ):
+        label_manager.return_value.__enter__.return_value = MagicMock()
+        worktree.return_value.__enter__.return_value = "/tmp/worktree"
+        result = _process_pr_for_merge("owner/repo", _pr_data(), config)
+
+    assert any("claimed-addressed review thread" in action for action in result.actions_taken)
+    # A PR-level PASS without a disposition cannot complete the selected thread.
+    assert result.outcome is PRProcessingOutcome.FAILED, result.actions_taken
+    assert result.error == "Review-thread closure remains unfinished for 1 thread(s): PRRT_thread_1"
+    assert any("Review-thread closure incomplete" in action for action in result.actions_taken)
+    assert not any("Adversarial validation passed" in action for action in result.actions_taken)
+    closure_stages = [call for call in stages.call_args_list if call.args[1] == "pr.review-thread-closure"]
+    assert len(closure_stages) == 1
+    closure_facts = closure_stages[0].args[4]
+    assert closure_facts["confirmed_count"] == 0
+    assert closure_facts["unfinished_count"] == 1
+    assert closure_facts["unfinished"] == [
+        {
+            "thread_id": claimed.thread_id,
+            "phase": "independent-decision",
+            "reason": "Disposition omitted from validator response",
+            "decision": "MISSING",
+            "acceptance_state": "NOT_ACCEPTED",
+            "effect_state": "NOT_ATTEMPTED",
+        }
+    ]
+    run_validation.assert_called_once()
+    assert "PRRT_thread_1" in run_validation.call_args.kwargs["claimed_review_threads_section"]
+    merge.assert_not_called()
+    client.reply_to_review_thread.assert_not_called()
+    client.resolve_review_thread.assert_not_called()
+    delegate_review_repair.assert_not_called()
+
+
+@patch("auto_coder.pr_processor.check_github_actions_and_exit_if_in_progress", return_value=True)
+@patch("auto_coder.pr_processor._get_mergeable_state", return_value={"mergeable": True, "merge_state_status": "clean"})
+@patch("auto_coder.pr_processor._check_github_actions_status")
+@patch("auto_coder.pr_processor._get_claimed_review_thread_state")
+@patch("auto_coder.pr_processor._delegate_cloud_review_thread_repair")
+def test_passing_codex_pr_delegates_blocking_review_threads(
+    delegate_review_repair,
+    claimed_state,
+    checks,
+    _mergeable,
+    _continue,
+) -> None:
+    thread = _thread()
+    checks.side_effect = authoritative_ci_status(success=True, ids=[1])
+    claimed_state.return_value = ClaimedReviewThreadGateState(
+        unresolved=(thread,),
+        blocking_unresolved=(thread,),
+        has_blocking_unresolved=True,
+    )
+    delegate_review_repair.return_value = CloudReviewRepairResult(
+        ["Requested Codex Cloud task 'task_e_review5262' to address unresolved review threads for PR #5262"],
+        delivered=True,
+    )
+    config = AutomationConfig()
+    config.AUTO_MERGE = True
+    client = MagicMock()
+
+    actions = _handle_pr_merge(client, "owner/repo", _pr_data(), config, {})
+
+    assert actions == [
+        "All GitHub Actions checks passed for PR #5262",
+        "Skipping merge for PR #5262 due to unresolved review threads",
+        "Requested Codex Cloud task 'task_e_review5262' to address unresolved review threads for PR #5262",
+    ]
+    delegate_review_repair.assert_called_once_with(
+        "owner/repo",
+        _pr_data(),
+        github_client=client,
+        unresolved_threads=(thread,),
+    )
+
+
+def test_passing_jules_pr_routes_review_repair_from_durable_origin(tmp_path) -> None:
+    """Exercise the production merge gate through ownership and transport."""
+    repair = _thread()
+    provenance = ReviewThread(
+        id="PRRT_provenance",
+        comments=[ReviewThreadComment(database_id=301, body="<!-- auto-coder-change-provenance-clarification:v1 -->\nWhich commit introduced this?", author_login="reviewer")],
+    )
+    client = _github_client(head_sha="head-2", head_ref="jules/live-repair-5262")
+    jules = MagicMock()
+    jules.send_followup.return_value = True
+    config = AutomationConfig()
+    config.AUTO_MERGE = True
+    pr_data = _pr_data()
+    pr_data["user"] = {"login": "google-labs-jules[bot]"}
+
+    with (
+        patch("auto_coder.pr_processor._cloud_review_repair_state_path", return_value=tmp_path / "repairs.json"),
+        patch("auto_coder.pr_processor._get_mergeable_state", return_value={"mergeable": True, "merge_state_status": "clean"}),
+        patch("auto_coder.pr_processor.check_github_actions_and_exit_if_in_progress", return_value=True),
+        patch("auto_coder.pr_processor._check_github_actions_status", side_effect=authoritative_ci_status(success=True, ids=[1])),
+        patch(
+            "auto_coder.pr_processor._get_claimed_review_thread_state",
+            return_value=ClaimedReviewThreadGateState(unresolved=(repair, provenance), blocking_unresolved=(repair, provenance), has_blocking_unresolved=True),
+        ),
+        patch("auto_coder.pr_processor.CloudManager.get_binding", return_value=CloudTaskBinding(provider="jules", task_id="existing-jules-session")),
+        patch("auto_coder.cloud_task_engine.CloudTaskEngine.get_client_for_provider", return_value=jules),
+    ):
+        actions = _handle_pr_merge(client, "owner/repo", pr_data, config, {})
+
+    jules.send_followup.assert_called_once()
+    task_id, prompt = jules.send_followup.call_args.args
+    assert task_id == "existing-jules-session"
+    assert "existing pull request #5262" in prompt
+    assert "jules/live-repair-5262" in prompt
+    assert "head-2" in prompt
+    assert "head-1" not in prompt
+    assert "codex/review-5262" not in prompt
+    assert "This misses the empty-input case" in prompt
+    assert "Which commit introduced this?" not in prompt
+    assert any("Requested Jules task 'existing-jules-session'" in action for action in actions)
+
+
+def test_unresolved_repair_without_durable_owner_fails_processing_visibly() -> None:
+    thread = _thread()
+    client = MagicMock()
+    config = AutomationConfig()
+    config.AUTO_MERGE = True
+    status = ProcessedPRResult(pr_data=_pr_data())
+
+    with (
+        patch("auto_coder.pr_processor._get_mergeable_state", return_value={"mergeable": True, "merge_state_status": "clean"}),
+        patch("auto_coder.pr_processor.check_github_actions_and_exit_if_in_progress", return_value=True),
+        patch("auto_coder.pr_processor._check_github_actions_status", side_effect=authoritative_ci_status(success=True, ids=[1])),
+        patch(
+            "auto_coder.pr_processor._get_claimed_review_thread_state",
+            return_value=ClaimedReviewThreadGateState(unresolved=(thread,), blocking_unresolved=(thread,), has_blocking_unresolved=True),
+        ),
+        patch("auto_coder.pr_processor.CloudManager.get_binding", return_value=None),
+    ):
+        actions = _take_pr_actions(client, "owner/repo", _pr_data(), config, status)
+
+    assert status.outcome is PRProcessingOutcome.FAILED
+    assert status.error == "Review repair was not delivered for PR #5262: no provider-owned cloud task association was found"
+    assert status.error in actions
+    assert not any("processing deferred" in action for action in actions)
+
+
+@pytest.mark.parametrize("shared_account_guidance", [False, True])
+def test_accepted_repair_without_any_durable_receipt_is_not_redelivered(tmp_path, shared_account_guidance) -> None:
+    """A transport success with indeterminate persistence fails closed across runs."""
+    thread = _thread()
+    if shared_account_guidance:
+        from auto_coder.review_feedback_marker import REVIEW_GUIDANCE_MARKER
+
+        thread.comments = [ReviewThreadComment(database_id=104, body="Retain the required oracle\n" + REVIEW_GUIDANCE_MARKER, author_login="maintainer")]
+        thread.comments.insert(0, ReviewThreadComment(database_id=101, body="Old finding", author_login="maintainer"))
+    client = _github_client()
+    if shared_account_guidance:
+        client.get_authenticated_user_login.return_value = "controller"
+        identity = _review_feedback_identity("owner/repo#5262:jules:existing-jules-session:", thread, 0)
+        client.get_pr_comments.return_value = [{"user": {"login": "controller"}, "body": _cloud_review_feedback_markers([identity])}]
+    provider = MagicMock()
+    provider.send_followup.return_value = True
+    config = AutomationConfig()
+    config.AUTO_MERGE = True
+
+    common_patches = (
+        patch("auto_coder.pr_processor._cloud_review_repair_state_path", return_value=tmp_path / "repairs.json"),
+        patch("auto_coder.pr_processor._get_mergeable_state", return_value={"mergeable": True, "merge_state_status": "clean"}),
+        patch("auto_coder.pr_processor.check_github_actions_and_exit_if_in_progress", return_value=True),
+        patch("auto_coder.pr_processor._check_github_actions_status", side_effect=authoritative_ci_status(success=True, ids=[1])),
+        patch(
+            "auto_coder.pr_processor._get_claimed_review_thread_state",
+            return_value=ClaimedReviewThreadGateState(unresolved=(thread,), blocking_unresolved=(thread,), has_blocking_unresolved=True),
+        ),
+        patch("auto_coder.pr_processor.CloudManager.get_binding", return_value=CloudTaskBinding(provider="jules", task_id="existing-jules-session")),
+        patch("auto_coder.cloud_task_engine.CloudTaskEngine.get_client_for_provider", return_value=provider),
+        patch("auto_coder.pr_processor._record_delivered_review_feedback", side_effect=OSError("local disk unavailable")),
+        patch("auto_coder.pr_processor._record_pr_delivered_review_feedback", side_effect=RuntimeError("GitHub receipt unavailable")),
+    )
+
+    with common_patches[0], common_patches[1], common_patches[2], common_patches[3], common_patches[4], common_patches[5], common_patches[6], common_patches[7], common_patches[8]:
+        first_status = ProcessedPRResult(pr_data=_pr_data())
+        first_actions = _take_pr_actions(client, "owner/repo", _pr_data(), config, first_status)
+        second_status = ProcessedPRResult(pr_data=_pr_data())
+        second_actions = _take_pr_actions(client, "owner/repo", _pr_data(), config, second_status)
+
+    provider.send_followup.assert_called_once()
+    assert first_status.outcome is PRProcessingOutcome.FAILED
+    assert any("durable delivery confirmation failed" in action for action in first_actions)
+    assert second_status.outcome is PRProcessingOutcome.FAILED
+    assert any("duplicate delivery was suppressed" in action for action in second_actions)
+    persisted = json.loads((tmp_path / "repairs.json").read_text(encoding="utf-8"))
+    assert persisted["delivered_feedback"] == ([identity] if shared_account_guidance else [])
+    assert len(persisted["pending_feedback"]) == 1
+
+
+def test_new_finding_remains_deliverable_beside_indeterminate_old_finding(tmp_path) -> None:
+    old_finding = _thread()
+    new_finding = ReviewThread(
+        id="PRRT_thread_2",
+        comments=[ReviewThreadComment(database_id=201, body="A distinct new defect", author_login="reviewer")],
+    )
+    client = _github_client()
+    provider = MagicMock()
+    provider.send_followup.return_value = True
+
+    with (
+        patch("auto_coder.pr_processor._cloud_review_repair_state_path", return_value=tmp_path / "repairs.json"),
+        patch("auto_coder.pr_processor.CloudManager.get_binding", return_value=CloudTaskBinding(provider="jules", task_id="existing-jules-session")),
+        patch("auto_coder.cloud_task_engine.CloudTaskEngine.get_client_for_provider", return_value=provider),
+        patch("auto_coder.pr_processor._record_delivered_review_feedback", side_effect=OSError("local disk unavailable")),
+        patch("auto_coder.pr_processor._record_pr_delivered_review_feedback", side_effect=RuntimeError("GitHub receipt unavailable")),
+    ):
+        first = _delegate_cloud_review_thread_repair("owner/repo", _pr_data(), client, (old_finding,))
+        second = _delegate_cloud_review_thread_repair("owner/repo", _pr_data(), client, (old_finding,))
+        third = _delegate_cloud_review_thread_repair("owner/repo", _pr_data(), client, (old_finding, new_finding))
+
+    assert first.delivered is False
+    assert second.delivered is False
+    assert third.delivered is False
+    assert provider.send_followup.call_count == 2
+    latest_prompt = provider.send_followup.call_args.args[1]
+    assert "A distinct new defect" in latest_prompt
+    assert "This misses the empty-input case" not in latest_prompt
+
+
+def test_external_and_managed_feedback_share_the_repair_bundle(tmp_path):
+    from auto_coder.canonical_pr_blocker_ledger import BlockerAdmissionPayload, CanonicalPRBlockerLedger, CorrectionScope
+
+    ledger = CanonicalPRBlockerLedger(tmp_path / "blockers.sqlite3")
+    snapshot = ledger.initialize_namespace("https://api.github.com", "owner/repo", 5262)
+    managed_id, _ = ledger.admit_blocker(
+        "https://api.github.com",
+        "owner/repo",
+        5262,
+        "managed",
+        snapshot.ledger_revision,
+        BlockerAdmissionPayload(category="IMPLEMENTATION", authoritative_boundary="parser", required_correction_outcome="Fix parser", accepted_scope=CorrectionScope(description="Fix parser")),
+    )
+    managed = ReviewThread(id="managed-thread", comments=[ReviewThreadComment(database_id=301, body=f"### Auto-Coder adversarial finding\nBlocker identity: `{managed_id}`\nFix parser")])
+    client = _github_client()
+    with (
+        patch("auto_coder.pr_processor.CanonicalPRBlockerLedger", return_value=ledger),
+        patch("auto_coder.pr_processor._cloud_review_repair_state_path", return_value=tmp_path / "repairs.json"),
+        patch("auto_coder.codex_cloud_client.CodexCloudClient.send_followup", return_value=True) as send_followup,
+    ):
+        result = _delegate_cloud_review_thread_repair("owner/repo", _pr_data(), client, (managed, _thread()))
+    assert result.delivered is True
+    send_followup.assert_called_once()
+    snapshot = ledger.get_snapshot("https://api.github.com", "owner/repo", 5262)
+    external = snapshot.get_blockers_for_alias("github_root_comment", "101")
+    assert len(external) == 1
+    prompt = send_followup.call_args.args[1]
+    assert external[0].blocker_id in prompt
+    assert managed_id in prompt
+    assert "This misses the empty-input case" in prompt
+    bundle = ledger.get_latest_repair_bundle("https://api.github.com", "owner/repo", 5262)
+    assert {blocker.blocker_id for blocker in bundle.blockers} == {managed_id, external[0].blocker_id}
+    client.resolve_review_thread.assert_not_called()
+
+
+def test_external_feedback_ledger_failure_prevents_provider_dispatch(tmp_path):
+    ledger = MagicMock()
+    ledger.initialize_namespace.side_effect = OSError("ledger unavailable")
+    with (
+        patch("auto_coder.pr_processor.CanonicalPRBlockerLedger", return_value=ledger),
+        patch("auto_coder.pr_processor._cloud_review_repair_state_path", return_value=tmp_path / "repairs.json"),
+        patch("auto_coder.codex_cloud_client.CodexCloudClient.send_followup") as send_followup,
+    ):
+        result = _delegate_cloud_review_thread_repair("owner/repo", _pr_data(), _github_client(), (_thread(),))
+    assert result.delivered is False
+    assert "external feedback identity is unavailable" in result[0]
+    send_followup.assert_not_called()
+
+
+@pytest.mark.parametrize("root_author", ["maintainer", "reviewer"])
+@pytest.mark.parametrize("existing_unmarked, retained_identity", [(False, "none"), (True, "none"), (True, "delivered"), (True, "pending")])
+def test_shared_account_guidance_reaches_production_gate_once(tmp_path, root_author, existing_unmarked, retained_identity):
+    """Old receipts are waits; only explicit new guidance creates a handoff."""
+    from auto_coder.execution_trace import Outcome
+    from auto_coder.review_feedback_marker import REVIEW_ADDRESSED_MARKER, REVIEW_GUIDANCE_MARKER
+
+    original = ReviewThread(id="PRRT_shared", comments=[ReviewThreadComment(database_id=701, body="Cover the required recovery boundary", author_login=root_author)])
+    acknowledged = ReviewThread(
+        id=original.id,
+        comments=original.comments
+        + [
+            ReviewThreadComment(database_id=702, body="Added a focused case\n" + REVIEW_ADDRESSED_MARKER, author_login="maintainer"),
+            ReviewThreadComment(database_id=703, body="The complete integration scenarios have not yet been established", author_login="maintainer"),
+        ],
+    )
+    guidance = ReviewThread(
+        id=original.id,
+        comments=acknowledged.comments + [ReviewThreadComment(database_id=704, body="The loaded resolver still lacks recovery coverage\n" + REVIEW_GUIDANCE_MARKER, author_login="MAINTAINER")],
+    )
+    unmarked = ReviewThread(
+        id=original.id,
+        comments=acknowledged.comments + [ReviewThreadComment(database_id=704, body="The loaded resolver still lacks recovery coverage", author_login="MAINTAINER")],
+    )
+    edited = ReviewThread(
+        id=original.id,
+        comments=acknowledged.comments + [ReviewThreadComment(database_id=704, body="Clarified wording for the same delivered correction\n" + REVIEW_GUIDANCE_MARKER, author_login="MAINTAINER")],
+    )
+    polls = (original, acknowledged, unmarked, guidance, edited, guidance) if existing_unmarked else (original, acknowledged, guidance, guidance)
+    client = _github_client()
+    client.get_authenticated_user_login.return_value = "controller"
+    root_identity = _review_feedback_identity("owner/repo#5262:codex-cloud:task_e_review5262:", original, 0)
+    guidance_identity = _review_feedback_identity("owner/repo#5262:codex-cloud:task_e_review5262:", guidance, len(guidance.comments) - 1)
+    state_path = tmp_path / "repairs.json"
+    if retained_identity != "none":
+        from auto_coder.pr_processor import _record_review_feedback_state
+
+        delivered = {root_identity, guidance_identity} if retained_identity == "delivered" else {root_identity}
+        pending = {guidance_identity} if retained_identity == "pending" else set()
+        _record_review_feedback_state(state_path, delivered, pending)
+    client.get_pr_comments.return_value = [{"user": {"login": "controller"}, "body": _cloud_review_feedback_markers([root_identity])}]
+    config = AutomationConfig()
+    config.AUTO_MERGE = True
+    state = ClaimedReviewThreadGateState(unresolved=(original,), blocking_unresolved=(original,), has_blocking_unresolved=True)
+    statuses = []
+    with (
+        patch("auto_coder.pr_processor._cloud_review_repair_state_path", return_value=tmp_path / "repairs.json"),
+        patch("auto_coder.pr_processor._get_mergeable_state", return_value={"mergeable": True, "merge_state_status": "clean"}),
+        patch("auto_coder.pr_processor.check_github_actions_and_exit_if_in_progress", return_value=True),
+        patch("auto_coder.pr_processor._check_github_actions_status", side_effect=authoritative_ci_status(success=True, ids=[1])),
+        patch("auto_coder.pr_processor._get_claimed_review_thread_state", return_value=state) as observe_threads,
+        patch("auto_coder.codex_cloud_client.CodexCloudClient.send_followup", return_value=True) as send,
+        patch("auto_coder.pr_processor._record_pr_stage", wraps=_record_pr_stage) as stages,
+        patch("auto_coder.pr_processor._merge_pr") as merge,
+    ):
+        for thread in polls:
+            observe_threads.return_value = ClaimedReviewThreadGateState(unresolved=(thread,), blocking_unresolved=(thread,), has_blocking_unresolved=True)
+            status = ProcessedPRResult(pr_data=_pr_data())
+            _take_pr_actions(client, "owner/repo", _pr_data(), config, status)
+            statuses.append(status)
+    assert send.call_count == (1 if retained_identity == "none" else 0)
+    if retained_identity == "none":
+        prompt = send.call_args.args[1]
+        assert "The loaded resolver still lacks recovery coverage" in prompt
+        assert "Cover the required recovery boundary" not in prompt
+        assert "Added a focused case" not in prompt
+        assert "The complete integration scenarios" not in prompt
+    delegation = [call.args[3] for call in stages.call_args_list if call.args[1] == "pr.repair-delegation"]
+    expected = [Outcome.DEFERRED, Outcome.DEFERRED, Outcome.DEFERRED, Outcome.ACCEPTED_HANDOFF, Outcome.DEFERRED, Outcome.DEFERRED] if existing_unmarked else [Outcome.DEFERRED, Outcome.DEFERRED, Outcome.ACCEPTED_HANDOFF, Outcome.DEFERRED]
+    if retained_identity == "delivered":
+        expected = [Outcome.DEFERRED] * len(polls)
+    elif retained_identity == "pending":
+        expected = [Outcome.DEFERRED] * 3 + [Outcome.FAILED] * 3
+    assert delegation == expected
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    assert set(persisted["delivered_feedback"]) == ({root_identity} if retained_identity == "pending" else {root_identity, guidance_identity})
+    assert set(persisted["pending_feedback"]) == ({guidance_identity} if retained_identity == "pending" else set())
+    if retained_identity == "pending":
+        assert all("duplicate delivery was suppressed" in status.error for status in statuses[3:])
+        assert statuses[-1].outcome is PRProcessingOutcome.FAILED
+    else:
+        assert all(status.error is None for status in statuses)
+        assert statuses[-1].outcome is PRProcessingOutcome.DEFERRED
+    assert statuses[0].outcome is PRProcessingOutcome.DEFERRED
+    merge.assert_not_called()
+    client.resolve_review_thread.assert_not_called()
+    client.reply_to_review_thread.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "reply_kind, receipt, expected_reason, expected_outcome, sends",
+    [
+        ("ordinary", "none", "unclassified_same_author_reply", "deferred", 0),
+        ("ordinary", "delivered", "actionable_feedback_already_delivered", "deferred", 0),
+        ("ordinary", "pending", "actionable_feedback_already_delivered", "deferred", 0),
+        ("ordinary", "remote_trusted", "actionable_feedback_already_delivered", "deferred", 0),
+        ("ordinary", "remote_untrusted", "unclassified_same_author_reply", "deferred", 0),
+        ("addressed", "none", "actionable_feedback_already_delivered", "deferred", 0),
+        ("addressed_guidance", "none", "actionable_feedback_already_delivered", "deferred", 0),
+        ("third_party", "none", "", "accepted_handoff", 1),
+        ("third_party", "delivered", "actionable_feedback_already_delivered", "deferred", 0),
+        ("third_party", "pending", "unconfirmed_delivery_receipt", "failed", 0),
+        ("guidance", "delivered", "actionable_feedback_already_delivered", "deferred", 0),
+        ("guidance", "pending", "unconfirmed_delivery_receipt", "failed", 0),
+        ("adjudication", "none", "actionable_feedback_already_delivered", "deferred", 0),
+    ],
+)
+def test_review_delivery_reason_reaches_public_projection_without_changing_effects(tmp_path, monkeypatch, reply_kind, receipt, expected_reason, expected_outcome, sends):
+    """Real gate/delegate/trace/projection, controlled GitHub and provider I/O."""
+    from auto_coder.execution_trace import TraceCollector, get_trace_collector
+    from auto_coder.pr_processor import _reconcile_codex_review_feedback, _record_review_feedback_state
+    from auto_coder.public_api import project_event
+    from auto_coder.review_feedback_marker import REVIEW_ADDRESSED_MARKER, REVIEW_GUIDANCE_MARKER
+
+    private_prose = "Private discussion payload ghp_" + "a" * 30
+    body = private_prose
+    if reply_kind in {"addressed", "addressed_guidance"}:
+        body += "\n" + REVIEW_ADDRESSED_MARKER
+    if reply_kind in {"guidance", "addressed_guidance"}:
+        body += "\n" + REVIEW_GUIDANCE_MARKER
+    if reply_kind == "adjudication":
+        body = '<!-- auto-coder-review-adjudication:v1 -->\n```json\n{"private": "' + private_prose + '"}\n```\n' + REVIEW_GUIDANCE_MARKER
+    thread = _thread(body)
+    thread.comments[1].author_login = "another-reviewer" if reply_kind == "third_party" else "MAINTAINER"
+    prefix = "owner/repo#5262:codex-cloud:task_e_review5262:"
+    root_identity = _review_feedback_identity(prefix, thread, 0)
+    reply_identity = _review_feedback_identity(prefix, thread, 1)
+    state_path = tmp_path / "repairs.json"
+    delivered = {root_identity, reply_identity} if receipt == "delivered" else {root_identity}
+    pending = {reply_identity} if receipt == "pending" else set()
+    remote_only = receipt in {"remote_trusted", "remote_untrusted"}
+    if not remote_only:
+        _record_review_feedback_state(state_path, delivered, pending)
+    before = state_path.read_bytes() if state_path.exists() else None
+    client = _github_client()
+    client.get_authenticated_user_login.return_value = "controller"
+    if remote_only:
+        # Same native ID after a delivered guidance comment loses its marker;
+        # replacement workers can recover receipts without a local state file.
+        thread.comments[1].body += "\n" + REVIEW_GUIDANCE_MARKER
+        assert _review_feedback_identity(prefix, thread, 1) == reply_identity
+        thread.comments[1].body = body
+        client.get_pr_comments.return_value = [
+            {"user": {"login": "controller"}, "body": _cloud_review_feedback_markers([root_identity])},
+            {"user": {"login": "CoNtRoLlEr" if receipt == "remote_trusted" else "untrusted"}, "body": _cloud_review_feedback_markers([reply_identity])},
+        ]
+    config = AutomationConfig()
+    config.AUTO_MERGE = True
+    state = ClaimedReviewThreadGateState(unresolved=(thread,), blocking_unresolved=(thread,), has_blocking_unresolved=True)
+    monkeypatch.setattr(TraceCollector, "_instance", None)
+    collector = get_trace_collector()
+    status = ProcessedPRResult(pr_data=_pr_data())
+    with (
+        patch("auto_coder.pr_processor._cloud_review_repair_state_path", return_value=state_path),
+        patch("auto_coder.pr_processor._get_mergeable_state", return_value={"mergeable": True, "merge_state_status": "clean"}),
+        patch("auto_coder.pr_processor.check_github_actions_and_exit_if_in_progress", return_value=True),
+        patch("auto_coder.pr_processor._check_github_actions_status", side_effect=authoritative_ci_status(success=True, ids=[1])),
+        patch("auto_coder.pr_processor._get_claimed_review_thread_state", return_value=state),
+        patch("auto_coder.codex_cloud_client.CodexCloudClient.send_followup", return_value=True) as send,
+        patch("auto_coder.pr_processor._reconcile_codex_review_feedback", wraps=_reconcile_codex_review_feedback) as reconcile,
+        patch("auto_coder.pr_processor._merge_pr") as merge,
+        collector.start_execution("owner/repo", "pr", 5262, origin="worker"),
+    ):
+        _take_pr_actions(client, "owner/repo", _pr_data(), config, status)
+    event = next(event for event in collector.get_snapshot().events if event.stage_id == "pr.repair-delegation")
+    assert event.facts["reason"] == expected_reason
+    assert event.facts["head_sha"] == "head-1"
+    assert event.outcome == expected_outcome
+    public = project_event(event, "owner/repo")
+    assert public is not None
+    assert public.facts == {"reason": expected_reason, "head_sha": "head-1"}
+    assert (public.item_type, public.item_number, public.outcome) == ("pr", 5262, expected_outcome)
+    assert private_prose not in json.dumps(public.facts)
+    assert send.call_count == sends
+    if sends == 0:
+        assert (state_path.read_bytes() if state_path.exists() else None) == before
+        client.add_comment_to_pr.assert_not_called()
+    else:
+        assert private_prose in send.call_args.args[1]
+    if remote_only:
+        assert not state_path.exists()
+        assert reconcile.call_args.args[3] == []
+    assert status.outcome is (PRProcessingOutcome.FAILED if expected_outcome == "failed" else PRProcessingOutcome.DEFERRED)
+    merge.assert_not_called()
+    client.resolve_review_thread.assert_not_called()
+    client.reply_to_review_thread.assert_not_called()

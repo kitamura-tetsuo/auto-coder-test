@@ -1,0 +1,1708 @@
+"""Durable ownership and serialization for logical implementations."""
+
+from __future__ import annotations
+
+import copy
+import io
+import json
+import math
+import os
+import re
+import threading
+import time
+import uuid
+from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Dict, Iterator, NoReturn, Optional, cast
+
+from .cloud_manager import claude_session_alias
+from .issue_context import extract_lifecycle_branch_issue_number, extract_lifecycle_directive_issue_references
+from .logger_config import get_logger
+from .process_identity import ProcessIdentity, process_is_dead, read_process_identity
+from .runtime_locks import LockAcquisitionTimeout, ensure_lock_directory, file_lock, lock_path
+from .util.github_request_outcome import GitHubRequestError
+
+logger = get_logger(__name__)
+
+if TYPE_CHECKING:
+    from .local_job_handoff import LocalJobRecord
+
+
+@dataclass(frozen=True)
+class ImplementationOwner:
+    """Stable identity of an Issue-rooted or standalone-PR implementation."""
+
+    kind: str
+    number: int
+
+    @property
+    def key(self) -> str:
+        return f"{self.kind}:{self.number}"
+
+
+class ImplementationSlotUnavailable(RuntimeError):
+    """Raised when an independent implementation cannot reserve a slot."""
+
+
+class ImplementationSlotLockTimeout(ImplementationSlotUnavailable):
+    """Raised when slot coordination is busy beyond the requested wait."""
+
+
+class ImplementationHierarchyConflict(RuntimeError):
+    """Raised when a direct parent or child already owns implementation state."""
+
+
+class ImplementationHierarchyUnavailable(RuntimeError):
+    """Raised when current direct hierarchy evidence cannot authorize admission."""
+
+
+class ImplementationOwnerResolutionError(RuntimeError):
+    """Raised when resolving a PR owner is uncertain and must fail closed."""
+
+
+@dataclass(frozen=True)
+class ImplementationExecutionSnapshot:
+    """Recorded execution evidence without any liveness interpretation."""
+
+    execution_id: str
+    pid: Optional[int]
+    started_at: Optional[int | float]
+
+
+@dataclass(frozen=True)
+class ImplementationOwnerSnapshot:
+    """Detached public projection of one durable logical owner."""
+
+    kind: str
+    number: int
+    owner_key: str
+    emergency: bool
+    executions: tuple[ImplementationExecutionSnapshot, ...]
+    implementation_prs: tuple[int, ...]
+    provider_sessions: tuple[str, ...]
+    admission_pending: Optional[bool]
+    admission_established: Optional[bool]
+    incarnation: Optional[str] = None
+    activity_revision: Optional[int] = None
+
+    @property
+    def owner(self) -> ImplementationOwner:
+        return ImplementationOwner(self.kind, self.number)
+
+
+@dataclass(frozen=True)
+class ImplementationRetiredSnapshot:
+    """Detached projection of one retired implementation reservation."""
+
+    repository: str
+    owner: ImplementationOwner
+    incarnation: str
+    implementation_prs: tuple[int, ...]
+    provider_sessions: tuple[str, ...]
+    generation: Optional[str]
+    retired_at: float
+
+
+@dataclass(frozen=True)
+class ImplementationSlotSnapshot:
+    """One known, coherent image of durable implementation-slot state."""
+
+    repository: str
+    storage_path: str
+    observed_at: float
+    normal_limit: int
+    owners: tuple[ImplementationOwnerSnapshot, ...]
+    normal_usage: int
+    normal_available: int
+    emergency_usage: int
+
+
+@dataclass(frozen=True)
+class ImplementationSlotSnapshotUnavailable:
+    """A read that could not produce authoritative occupancy values."""
+
+    repository: str
+    storage_path: str
+    normal_limit: int
+    diagnostic: str
+
+
+ImplementationSlotObservation = ImplementationSlotSnapshot | ImplementationSlotSnapshotUnavailable
+
+
+class ImplementationSlotRepository:
+    """Persist active owners and atomically reserve capacity across processes."""
+
+    _SHARED_FILE_MODE = 0o660
+
+    def __init__(
+        self,
+        repo_name: str,
+        max_implementations: int,
+        storage_path: Optional[Path] = None,
+        retired_storage_path: Optional[Path] = None,
+    ):
+        if isinstance(max_implementations, bool) or max_implementations < 1:
+            raise ValueError("max_concurrent_implementations must be a positive integer")
+        self.repo_name = repo_name
+        self.max_implementations = max_implementations
+        runtime_root = os.environ.get("AUTO_CODER_RUNTIME_ROOT")
+        default_root = Path(runtime_root) / "state" if runtime_root else Path.home() / ".auto-coder"
+        self.storage_path = storage_path or default_root / repo_name / "implementation_slots.json"
+        self.retired_storage_path = retired_storage_path or self.storage_path.parent / f"{self.storage_path.stem}_retired.json"
+        self.lock_path = lock_path(repo_name, self.storage_path, "implementation-store")
+        self._execution_context = threading.local()
+
+    def resolve_owner(self, candidate_type: str, data: Dict[str, Any], github_client: Any) -> ImplementationOwner:
+        number = data.get("number")
+        if not isinstance(number, int):
+            raise ImplementationOwnerResolutionError("Candidate has no valid numeric identity")
+        if candidate_type == "issue":
+            return ImplementationOwner("issue", number)
+        if candidate_type != "pr":
+            raise ImplementationOwnerResolutionError(f"Unsupported candidate type: {candidate_type}")
+
+        issue_owner = self._lifecycle_issue_owner_for_pr(number, data, github_client)
+        if issue_owner is not None:
+            return issue_owner
+        provider_owner = self._provider_owner_for_pr(number, data.get("body", ""))
+        if provider_owner is not None:
+            return provider_owner
+        return ImplementationOwner("pr", number)
+
+    def _lifecycle_issue_owner_for_pr(self, pr_number: int, pr_data: Dict[str, Any], github_client: Any) -> Optional[ImplementationOwner]:
+        """Resolve a PR's Issue owner from restricted, non-mention lifecycle evidence.
+
+        Ordinary cross-references and general body/title mentions never reach
+        here (see ``issue_context.extract_lifecycle_directive_issue_references``
+        and ``extract_lifecycle_branch_issue_number``): only an explicit
+        closing-keyword directive, an Issue-bearing branch marker, or a live
+        GitHub native connection to an already-active Issue owner can identify
+        ownership.
+        """
+        body = pr_data.get("body") or ""
+        for qualifier, candidate in extract_lifecycle_directive_issue_references(str(body)):
+            resolved = self._validated_lifecycle_issue_reference(pr_number, candidate, qualifier, github_client)
+            if resolved is not None:
+                return ImplementationOwner("issue", resolved)
+
+        head = pr_data.get("head")
+        branch = head.get("ref") if isinstance(head, dict) else None
+        branch_candidate = extract_lifecycle_branch_issue_number(str(branch or ""))
+        if branch_candidate is not None:
+            resolved = self._validated_lifecycle_issue_reference(pr_number, branch_candidate, None, github_client)
+            if resolved is not None:
+                return ImplementationOwner("issue", resolved)
+
+        return self._native_connection_issue_owner(pr_number, github_client)
+
+    def _validated_lifecycle_issue_reference(
+        self,
+        pr_number: int,
+        candidate: int,
+        qualifier: Optional[str],
+        github_client: Any,
+    ) -> Optional[int]:
+        """Validate one candidate Issue number, raising only on genuine uncertainty.
+
+        A confirmed foreign repository, a confirmed pull request, or an exact
+        number that fails to resolve at all is excluded quietly (it is
+        definitive, not uncertain). An unreadable lookup instead raises, so the
+        caller cannot silently discard or fabricate an owner from it. Typed
+        GitHub failures retain their retry evidence for startup recovery.
+        """
+        if isinstance(candidate, bool) or not isinstance(candidate, int) or candidate <= 0 or candidate == pr_number:
+            return None
+        if qualifier is not None:
+            try:
+                candidate_owner, candidate_name = qualifier.split("/")
+            except ValueError:
+                return None
+            expected_owner, expected_name = self.repo_name.split("/")
+            if candidate_owner.lower() != expected_owner.lower() or candidate_name.lower() != expected_name.lower():
+                return None
+
+        strict_getter = getattr(type(github_client), "get_issue_strict", None)
+        try:
+            if callable(strict_getter):
+                issue = github_client.get_issue_strict(self.repo_name, candidate)
+            else:
+                issue = github_client.get_issue(self.repo_name, candidate)
+        except GitHubRequestError:
+            # Startup recovery retains typed failures as durable pending work.
+            # Wrapping them would bypass that retry boundary and stop the daemon.
+            raise
+        except Exception as exc:
+            raise ImplementationOwnerResolutionError(f"Cannot verify referenced Issue #{candidate}: {exc}") from exc
+        if not issue:
+            return None
+        if isinstance(issue, dict):
+            if issue.get("pull_request") is not None or issue.get("number") != candidate:
+                return None
+        else:
+            raw_data = getattr(issue, "_rawData", None)
+            if isinstance(raw_data, dict) and raw_data.get("pull_request") is not None:
+                return None
+            if getattr(issue, "number", None) != candidate:
+                return None
+        return candidate
+
+    def _native_connection_issue_owner(self, pr_number: int, github_client: Any) -> Optional[ImplementationOwner]:
+        """Attribute *pr_number* to an already-active Issue via its live native connection.
+
+        Bounded to currently active Issue owners: a PR with no explicit
+        directive or branch marker can still be genuinely, natively linked
+        (GitHub's Development panel, or a recognized closing association) to
+        an Issue that is already tracked here. This is never consulted to
+        discover brand-new ownership from an unbounded scan of every Issue.
+        """
+        getter = getattr(github_client, "get_connected_prs", None)
+        if not callable(getter):
+            return None
+        for owner in self.active_owners():
+            if owner.kind == "issue" and pr_number in getter(self.repo_name, owner.number):
+                return owner
+        return None
+
+    def _provider_owner_for_pr(self, pr_number: int, body: object) -> Optional[ImplementationOwner]:
+        """Resolve a source-less PR from durable provider-run membership."""
+        session_ids: set[str] = set()
+        if isinstance(body, str):
+            session_ids.update(re.findall(r"jules\.google\.com/(?:session|task)/([A-Za-z0-9_-]+)", body))
+            session_ids.update(re.findall(r"https://claude\.ai/code/(session_[A-Za-z0-9_-]+)(?=[\s/#?)]|$)", body))
+            session_ids.update(re.findall(r"\bSession ID:\s*([A-Za-z0-9_-]+)", body, re.IGNORECASE))
+        session_ids.update(alias for session_id in tuple(session_ids) if (alias := claude_session_alias(session_id)) is not None)
+        with self._state_lock():
+            records = self._read()
+        for key, record in records.items():
+            kind = record.get("kind")
+            number = record.get("number")
+            implementation_prs = record.get("implementation_prs", [])
+            provider_sessions = record.get("provider_sessions", [])
+            if not isinstance(implementation_prs, list) or any(isinstance(value, bool) or not isinstance(value, int) for value in implementation_prs) or not isinstance(provider_sessions, list) or any(not isinstance(value, str) for value in provider_sessions):
+                raise ImplementationSlotUnavailable("Cannot safely parse provider implementation membership")
+            if pr_number in implementation_prs or session_ids.intersection(provider_sessions):
+                if not isinstance(kind, str) or isinstance(number, bool) or not isinstance(number, int):
+                    raise ImplementationSlotUnavailable(f"Cannot safely parse implementation owner {key}")
+                return ImplementationOwner(kind, number)
+        return None
+
+    @contextmanager
+    def _state_lock(self) -> Iterator[None]:
+        try:
+            self.storage_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self._raise_permission_error(self.storage_path.parent, exc)
+        try:
+            ensure_lock_directory(self.lock_path, os.stat(self.storage_path.parent).st_gid)
+        except (OSError, RuntimeError) as exc:
+            self._raise_permission_error(self.lock_path.parent, exc)
+        with self._file_lock(self.lock_path):
+            yield
+
+    @contextmanager
+    def _file_lock(self, path: Path, timeout: float = 30.0) -> Iterator[None]:
+        def open_shared_lock() -> int:
+            fd = self._open_lock_file(path)
+            try:
+                self._establish_shared_permissions(fd, path)
+            except BaseException:
+                os.close(fd)
+                raise
+            return fd
+
+        entered = False
+        try:
+            with file_lock(path, opener=open_shared_lock, timeout=timeout):
+                entered = True
+                yield
+        except LockAcquisitionTimeout as exc:
+            if timeout > 0:
+                logger.warning(str(exc))
+            raise ImplementationSlotLockTimeout(str(exc)) from exc
+        except OSError as exc:
+            if entered:
+                raise
+            self._raise_permission_error(path, exc)
+
+    def _open_lock_file(self, lock_path: Path) -> int:
+        """Open the lock, atomically publishing fully prepared metadata if new."""
+        try:
+            return os.open(lock_path, os.O_RDWR)
+        except FileNotFoundError:
+            pass
+
+        bootstrap = lock_path.with_name(f".{lock_path.name}.{uuid.uuid4().hex}.tmp")
+        bootstrap_fd = os.open(bootstrap, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            self._establish_shared_permissions(bootstrap_fd, bootstrap)
+            try:
+                os.link(bootstrap, lock_path)
+            except FileExistsError:
+                pass
+        finally:
+            os.close(bootstrap_fd)
+            try:
+                os.unlink(bootstrap)
+            except FileNotFoundError:
+                pass
+        return os.open(lock_path, os.O_RDWR)
+
+    def _read(self) -> Dict[str, Dict[str, object]]:
+        try:
+            os.stat(self.storage_path)
+        except FileNotFoundError:
+            return {}
+        except OSError as exc:
+            self._raise_permission_error(self.storage_path, exc)
+        try:
+            with io.open(self.storage_path, "r", encoding="utf-8") as state_file:
+                value = json.load(state_file)
+            if not isinstance(value, dict):
+                raise ValueError("slot state root must be an object")
+            return value
+        except (json.JSONDecodeError, UnicodeError, ValueError) as exc:
+            raise ImplementationSlotUnavailable(f"Cannot safely parse implementation slot state at '{self.storage_path}': {exc}") from exc
+        except OSError as exc:
+            self._raise_permission_error(self.storage_path, exc)
+
+    def snapshot(self) -> ImplementationSlotObservation:
+        """Return a non-blocking, read-only image of this instance's store.
+
+        Writers publish complete images with ``os.replace``. Reading a single
+        descriptor therefore observes one published image even while admission
+        holds its coordination locks for external hierarchy checks. This is
+        recorded state, including pending admissions, not an admission decision.
+        """
+        source = str(self.storage_path.expanduser().resolve())
+        try:
+            owners = self._read_snapshot_image()
+            projected, normal_usage, emergency_usage = self._project_snapshot_owners(owners)
+        except (ImplementationSlotUnavailable, OSError) as exc:
+            return self._snapshot_unavailable(source, str(exc))
+        return ImplementationSlotSnapshot(
+            repository=self.repo_name,
+            storage_path=source,
+            observed_at=time.time(),
+            normal_limit=self.max_implementations,
+            owners=projected,
+            normal_usage=normal_usage,
+            normal_available=max(0, self.max_implementations - normal_usage),
+            emergency_usage=emergency_usage,
+        )
+
+    def _snapshot_unavailable(self, source: str, diagnostic: str) -> ImplementationSlotSnapshotUnavailable:
+        return ImplementationSlotSnapshotUnavailable(
+            repository=self.repo_name,
+            storage_path=source,
+            normal_limit=self.max_implementations,
+            diagnostic=diagnostic,
+        )
+
+    def _read_snapshot_image(self) -> Dict[str, object]:
+        """Read one file descriptor without creating or repairing the store."""
+        try:
+            with io.open(self.storage_path, "r", encoding="utf-8") as state_file:
+                value = json.load(state_file)
+        except FileNotFoundError:
+            return {}
+        except (json.JSONDecodeError, UnicodeError, OSError) as exc:
+            raise ImplementationSlotUnavailable(f"cannot read implementation store '{self.storage_path}': {exc}") from exc
+        if not isinstance(value, dict):
+            raise ImplementationSlotUnavailable(f"invalid root in implementation store '{self.storage_path}': expected object")
+        return value
+
+    @staticmethod
+    def _project_snapshot_owners(owners: Dict[str, object]) -> tuple[tuple[ImplementationOwnerSnapshot, ...], int, int]:
+        projected: list[ImplementationOwnerSnapshot] = []
+        emergency_usage = 0
+        for key, untyped_record in owners.items():
+            field = f"owner {key!r}"
+            if not isinstance(key, str) or not isinstance(untyped_record, dict):
+                raise ImplementationSlotUnavailable(f"invalid {field}: expected object")
+            record = untyped_record
+            kind = record.get("kind")
+            number = record.get("number")
+            if not isinstance(kind, str) or kind not in {"issue", "pr"}:
+                raise ImplementationSlotUnavailable(f"invalid {field}.kind: expected issue or pr")
+            if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
+                raise ImplementationSlotUnavailable(f"invalid {field}.number: expected positive integer")
+            owner = ImplementationOwner(kind, number)
+            if key != owner.key:
+                raise ImplementationSlotUnavailable(f"invalid {field}: key does not match kind and number")
+
+            emergency = bool(ImplementationSlotRepository._optional_bool(record, "emergency", False, field))
+            pending = ImplementationSlotRepository._optional_bool(record, "admission_pending", None, field)
+            established = ImplementationSlotRepository._optional_bool(record, "admission_established", None, field)
+            prs = ImplementationSlotRepository._positive_integer_list(record, "implementation_prs", field)
+            sessions = ImplementationSlotRepository._string_list(record, "provider_sessions", field)
+            executions = ImplementationSlotRepository._execution_snapshots(record, field)
+            incarnation = record.get("incarnation")
+            if incarnation is not None and (not isinstance(incarnation, str) or not incarnation):
+                raise ImplementationSlotUnavailable(f"invalid {field}.incarnation: expected non-empty string")
+            activity_revision = record.get("activity_revision")
+            if activity_revision is not None and (isinstance(activity_revision, bool) or not isinstance(activity_revision, int) or activity_revision < 0):
+                raise ImplementationSlotUnavailable(f"invalid {field}.activity_revision: expected non-negative integer")
+            if emergency:
+                emergency_usage += 1
+                if emergency_usage > 1:
+                    raise ImplementationSlotUnavailable("invalid emergency projection: multiple emergency owners")
+            projected.append(
+                ImplementationOwnerSnapshot(
+                    owner.kind,
+                    owner.number,
+                    owner.key,
+                    emergency,
+                    executions,
+                    prs,
+                    sessions,
+                    pending,
+                    established,
+                    incarnation=incarnation,
+                    activity_revision=activity_revision,
+                )
+            )
+        projected.sort(key=lambda value: (value.kind, value.number))
+        normal_usage = len(projected) - emergency_usage
+        return tuple(projected), normal_usage, emergency_usage
+
+    @staticmethod
+    def _optional_bool(record: Dict[str, object], name: str, absent: Optional[bool], field: str) -> Optional[bool]:
+        if name not in record:
+            return absent
+        value = record[name]
+        if not isinstance(value, bool):
+            raise ImplementationSlotUnavailable(f"invalid {field}.{name}: expected Boolean")
+        return value
+
+    @staticmethod
+    def _positive_integer_list(record: Dict[str, object], name: str, field: str) -> tuple[int, ...]:
+        values = record.get(name, [])
+        if not isinstance(values, list):
+            raise ImplementationSlotUnavailable(f"invalid {field}.{name}: expected list")
+        if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in values):
+            raise ImplementationSlotUnavailable(f"invalid {field}.{name}: expected positive integer entries")
+        return tuple(values)
+
+    @staticmethod
+    def _string_list(record: Dict[str, object], name: str, field: str) -> tuple[str, ...]:
+        values = record.get(name, [])
+        if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
+            raise ImplementationSlotUnavailable(f"invalid {field}.{name}: expected string list")
+        return tuple(values)
+
+    @staticmethod
+    def _execution_snapshots(record: Dict[str, object], field: str) -> tuple[ImplementationExecutionSnapshot, ...]:
+        values = record.get("executions", [])
+        if not isinstance(values, list):
+            raise ImplementationSlotUnavailable(f"invalid {field}.executions: expected list")
+        result: list[ImplementationExecutionSnapshot] = []
+        for index, value in enumerate(values):
+            execution_field = f"{field}.executions[{index}]"
+            if not isinstance(value, dict):
+                raise ImplementationSlotUnavailable(f"invalid {execution_field}: expected object")
+            execution_id = value.get("id")
+            if not isinstance(execution_id, str) or not execution_id:
+                raise ImplementationSlotUnavailable(f"invalid {execution_field}.id: expected non-empty string")
+            pid = value.get("pid")
+            if "pid" in value and (isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0):
+                raise ImplementationSlotUnavailable(f"invalid {execution_field}.pid: expected positive integer")
+            started_at = value.get("started_at")
+            if "started_at" in value and (isinstance(started_at, bool) or not isinstance(started_at, (int, float)) or started_at < 0 or (isinstance(started_at, float) and not math.isfinite(started_at))):
+                raise ImplementationSlotUnavailable(f"invalid {execution_field}.started_at: expected finite non-negative number")
+            result.append(
+                ImplementationExecutionSnapshot(
+                    execution_id=execution_id,
+                    pid=pid if isinstance(pid, int) else None,
+                    started_at=started_at if isinstance(started_at, (int, float)) and not isinstance(started_at, bool) else None,
+                )
+            )
+        return tuple(result)
+
+    def _write(self, owners: Dict[str, Dict[str, object]]) -> None:
+        temporary = self.storage_path.with_suffix(".tmp")
+        try:
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, self._SHARED_FILE_MODE)
+            with os.fdopen(fd, "w", encoding="utf-8") as state_file:
+                self._establish_shared_permissions(state_file.fileno(), temporary)
+                json.dump(owners, state_file, indent=2, sort_keys=True)
+                state_file.flush()
+                os.fsync(state_file.fileno())
+            os.replace(temporary, self.storage_path)
+        except OSError as exc:
+            self._raise_permission_error(temporary if temporary.exists() else self.storage_path, exc)
+
+    def _establish_shared_permissions(self, fd: int, path: Path) -> None:
+        """Apply the containing directory's group and a non-world shared mode."""
+        try:
+            directory_gid = os.stat(self.storage_path.parent).st_gid
+            metadata = os.fstat(fd)
+            if metadata.st_gid != directory_gid:
+                os.fchown(fd, -1, directory_gid)
+            if metadata.st_mode & 0o777 != self._SHARED_FILE_MODE:
+                os.fchmod(fd, self._SHARED_FILE_MODE)
+        except OSError as exc:
+            self._raise_permission_error(path, exc)
+
+    @staticmethod
+    def _raise_permission_error(path: Path, exc: OSError | RuntimeError) -> NoReturn:
+        raise ImplementationSlotUnavailable(f"Cannot safely establish or use implementation slot shared-state permissions for '{path}': {exc}") from exc
+
+    @staticmethod
+    def _capacity_usage(owners: Dict[str, Dict[str, object]]) -> tuple[int, bool]:
+        """Return normal slot usage and whether the durable emergency lane is held."""
+        normal = 0
+        emergency_in_use = False
+        for record in owners.values():
+            emergency = record.get("emergency", False)
+            if not isinstance(emergency, bool):
+                raise ImplementationSlotUnavailable("Cannot safely parse implementation slot capacity class")
+            if emergency:
+                if emergency_in_use:
+                    raise ImplementationSlotUnavailable("Implementation slot state contains multiple emergency owners")
+                emergency_in_use = True
+            else:
+                normal += 1
+        return normal, emergency_in_use
+
+    @staticmethod
+    def _increment_activity_revision(record: Dict[str, object]) -> None:
+        rev = record.get("activity_revision", 0)
+        current = rev if isinstance(rev, int) and not isinstance(rev, bool) else 0
+        record["activity_revision"] = current + 1
+
+    def reserve(self, owner: ImplementationOwner, implementation_pr: Optional[int] = None) -> bool:
+        """Reserve *owner* and durably record a PR known to belong to it."""
+        if implementation_pr is not None and (owner.kind == "pr" or isinstance(implementation_pr, bool) or not isinstance(implementation_pr, int)):
+            raise ValueError("implementation_pr must identify a PR belonging to a non-PR implementation owner")
+        with self._state_lock():
+            owners = self._read()
+            if owner.key in owners:
+                if implementation_pr is not None:
+                    record = owners[owner.key]
+                    known_prs = record.setdefault("implementation_prs", [])
+                    if not isinstance(known_prs, list):
+                        raise ImplementationSlotUnavailable("Cannot safely parse implementation slot PR membership")
+                    if implementation_pr not in known_prs:
+                        known_prs.append(implementation_pr)
+                        if "incarnation" not in record or not record["incarnation"]:
+                            record["incarnation"] = uuid.uuid4().hex
+                        self._increment_activity_revision(record)
+                        self._write(owners)
+                return True
+            normal_usage, _ = self._capacity_usage(owners)
+            if normal_usage >= self.max_implementations:
+                return False
+            owners[owner.key] = {
+                "kind": owner.kind,
+                "number": owner.number,
+                "incarnation": uuid.uuid4().hex,
+                "activity_revision": 1,
+                "implementation_prs": [implementation_pr] if implementation_pr is not None else [],
+                "provider_sessions": [],
+            }
+            self._write(owners)
+            return True
+
+    def reserve_new(self, owner: ImplementationOwner) -> bool:
+        """Atomically reserve *owner* only when it is not already active."""
+        with self._state_lock():
+            owners = self._read()
+            normal_usage, _ = self._capacity_usage(owners)
+            if owner.key in owners or normal_usage >= self.max_implementations:
+                return False
+            owners[owner.key] = {
+                "kind": owner.kind,
+                "number": owner.number,
+                "incarnation": uuid.uuid4().hex,
+                "activity_revision": 1,
+                "implementation_prs": [],
+                "provider_sessions": [],
+            }
+            self._write(owners)
+            return True
+
+    def available_normal_slots(self) -> int:
+        """Return normal capacity from the current cross-process state."""
+        with self._state_lock():
+            normal_usage, _ = self._capacity_usage(self._read())
+        return max(0, self.max_implementations - normal_usage)
+
+    def normal_capacity_snapshot(self) -> tuple[int, tuple[int, int]]:
+        """Return capacity and an identity that changes on every state replacement."""
+        with self._state_lock():
+            normal_usage, _ = self._capacity_usage(self._read())
+            try:
+                state = self.storage_path.stat()
+                identity = (state.st_ino, state.st_mtime_ns)
+            except FileNotFoundError:
+                identity = (0, 0)
+        return max(0, self.max_implementations - normal_usage), identity
+
+    def start_execution(
+        self,
+        owner: ImplementationOwner,
+        *,
+        implementation_pr: Optional[int] = None,
+        bypass_capacity: bool = False,
+        bypass_active_execution: bool = False,
+        allow_urgent_emergency: bool = False,
+        github_client: Optional[Any] = None,
+        generation: Optional[str] = None,
+        retry_request_id: Optional[str] = None,
+        implementation_attempt_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Atomically admit and durably identify one mutating execution.
+
+        Capacity and duplicate-execution admission are deliberately independent:
+        explicit ``--only`` work may bypass the former, while only the additional
+        operator ``--force`` flag may bypass the latter.
+
+        ``generation`` binds the durable Implementation generation this
+        execution belongs to (see :mod:`implementation_ownership`) atomically
+        with the execution record it creates, so the binding survives a
+        stale-execution reclaim and a crash before any further tombstone
+        write. It is ``None`` for owners the ownership adapter does not track
+        (a standalone PR, or a recurrent provider-owned task).
+        """
+        if implementation_pr is not None and (owner.kind == "pr" or isinstance(implementation_pr, bool) or not isinstance(implementation_pr, int)):
+            raise ValueError("implementation_pr must identify a PR belonging to a non-PR implementation owner")
+        if (retry_request_id is None) != (implementation_attempt_id is None):
+            raise ValueError("retry_request_id and implementation_attempt_id must be supplied together")
+        if retry_request_id is not None and (not retry_request_id or not implementation_attempt_id):
+            raise ValueError("retry and attempt identities must be non-empty")
+        if retry_request_id is not None and generation is None:
+            raise ValueError("explicit retry acquisition requires a generation")
+        execution_id = uuid.uuid4().hex
+        process_identity = self._current_process_identity()
+        with self._state_lock():
+            owners = self._read()
+            admission_hierarchy: Optional[tuple[Optional[int], tuple[int, ...]]] = None
+            reclaimed = self._remove_stale_executions(owners)
+            if reclaimed:
+                # Persist cleanup even when capacity or duplicate admission
+                # returns early below.
+                self._write(owners)
+            record = owners.get(owner.key)
+            established_record: Optional[Dict[str, object]] = None
+            if record is not None and record.get("admission_pending", False):
+                established = record.get("admission_established", False)
+                if not isinstance(established, bool):
+                    raise ImplementationHierarchyUnavailable(f"Interrupted hierarchy admission for {owner.key} has invalid establishment state")
+                # Every pre-existing logical owner is authoritative lifecycle
+                # ownership. The establishment marker describes admission
+                # progress; it never licenses this attempt to retire the record.
+                established_record = copy.deepcopy(record)
+                if owner.kind != "issue" or github_client is None:
+                    raise ImplementationHierarchyUnavailable(f"Interrupted hierarchy admission for {owner.key} requires authoritative GitHub evidence")
+                admission_hierarchy = self._parse_stored_hierarchy(record)
+            if record is None:
+                if owner.kind == "issue":
+                    if github_client is not None:
+                        first_hierarchy = self._read_issue_hierarchy(github_client, owner.number)
+                        second_hierarchy = self._read_issue_hierarchy(github_client, owner.number)
+                        if first_hierarchy != second_hierarchy:
+                            raise ImplementationHierarchyUnavailable(f"Direct hierarchy changed while admitting issue:{owner.number}")
+                        self._raise_hierarchy_conflict(owner, owners, second_hierarchy)
+                        admission_hierarchy = second_hierarchy
+                normal_usage, emergency_in_use = self._capacity_usage(owners)
+                use_emergency = False
+                if normal_usage >= self.max_implementations and not bypass_capacity:
+                    if not allow_urgent_emergency or emergency_in_use:
+                        return None
+                    use_emergency = True
+                record = {
+                    "kind": owner.kind,
+                    "number": owner.number,
+                    "incarnation": uuid.uuid4().hex,
+                    "activity_revision": 0,
+                    "implementation_prs": [],
+                    "provider_sessions": [],
+                    "executions": [],
+                    "emergency": use_emergency,
+                }
+                if admission_hierarchy is not None:
+                    record["admission_pending"] = True
+                    record["admission_hierarchy"] = {
+                        "parent": admission_hierarchy[0],
+                        "children": list(admission_hierarchy[1]),
+                    }
+                owners[owner.key] = record
+            if generation is not None:
+                # A generation binding is rebound here only for a fresh or
+                # fully idle owner; the caller (implementation_ownership.py)
+                # is responsible for tombstoning a still-bound different
+                # generation before requesting this rebind, so retained
+                # qualifying evidence for another generation must refuse
+                # rather than silently mix attempts under one owner record.
+                existing_generation = record.get("implementation_generation")
+                if isinstance(existing_generation, str) and existing_generation != generation:
+                    retained = record.get("executions") or record.get("provider_sessions") or record.get("implementation_prs")
+                    if retained:
+                        return None
+            executions = record.setdefault("executions", [])
+            if not isinstance(executions, list) or any(not isinstance(value, dict) or not isinstance(value.get("id"), str) for value in executions):
+                raise ImplementationSlotUnavailable("Cannot safely parse active implementation executions")
+            if executions and not bypass_active_execution:
+                return None
+            known_prs = record.setdefault("implementation_prs", [])
+            if not isinstance(known_prs, list):
+                raise ImplementationSlotUnavailable("Cannot safely parse implementation slot PR membership")
+            if implementation_pr is not None and implementation_pr not in known_prs:
+                known_prs.append(implementation_pr)
+            execution = {"id": execution_id, "pid": os.getpid(), "started_at": time.time()}
+            if retry_request_id is not None:
+                execution["retry_request_id"] = retry_request_id
+                execution["implementation_attempt_id"] = implementation_attempt_id
+            if process_identity is not None:
+                execution.update({"boot_id": process_identity.boot_id, "process_start_ticks": process_identity.start_ticks})
+            executions.append(execution)
+            if retry_request_id is not None:
+                # The duplicate-execution check above proves there is no live
+                # local mutation. Retained remote/PR membership is historical
+                # association, not a local-execution conflict.
+                record["retry_request_id"] = retry_request_id
+                record["implementation_attempt_id"] = implementation_attempt_id
+            if "incarnation" not in record or not record["incarnation"]:
+                record["incarnation"] = uuid.uuid4().hex
+            self._increment_activity_revision(record)
+            if generation is not None:
+                record["implementation_generation"] = generation
+            self._write(owners)
+            if admission_hierarchy is not None:
+                try:
+                    committed_hierarchy = self._read_issue_hierarchy(github_client, owner.number)
+                    self._raise_hierarchy_conflict(owner, owners, committed_hierarchy)
+                    if committed_hierarchy != admission_hierarchy:
+                        raise ImplementationHierarchyUnavailable(f"Direct hierarchy changed while committing issue:{owner.number}")
+                except (ImplementationHierarchyConflict, ImplementationHierarchyUnavailable):
+                    if established_record is None:
+                        owners.pop(owner.key, None)
+                    else:
+                        owners[owner.key] = established_record
+                    self._write(owners)
+                    raise
+        active = getattr(self._execution_context, "owners", {})
+        active[owner.key] = execution_id
+        self._execution_context.owners = active
+        return execution_id
+
+    def retry_acquisition_reference(
+        self,
+        owner: ImplementationOwner,
+        request_id: str,
+        attempt_id: str,
+        generation: str,
+    ) -> Optional[str]:
+        """Recover the execution that captured an explicit retry binding."""
+        with self._state_lock():
+            record = self._read().get(owner.key)
+        if record is None:
+            return None
+        if record.get("retry_request_id") != request_id or record.get("implementation_attempt_id") != attempt_id or record.get("implementation_generation") != generation:
+            return None
+        executions = record.get("executions", [])
+        if not isinstance(executions, list) or any(not isinstance(value, dict) or not isinstance(value.get("id"), str) for value in executions):
+            raise ImplementationSlotUnavailable("Cannot safely parse retry acquisition executions")
+        matches = [value["id"] for value in executions if value.get("retry_request_id") == request_id and value.get("implementation_attempt_id") == attempt_id]
+        if len(matches) > 1:
+            raise ImplementationSlotUnavailable("Retry attempt has contradictory ownership references")
+        return matches[0] if matches else None
+
+    @staticmethod
+    def _parse_stored_hierarchy(record: Dict[str, object]) -> tuple[Optional[int], tuple[int, ...]]:
+        evidence = record.get("admission_hierarchy")
+        if not isinstance(evidence, dict):
+            raise ImplementationHierarchyUnavailable("Interrupted admission has no valid durable hierarchy evidence")
+        parent = evidence.get("parent")
+        children = evidence.get("children")
+        if parent is not None and (isinstance(parent, bool) or not isinstance(parent, int)):
+            raise ImplementationHierarchyUnavailable("Interrupted admission has an invalid durable parent identity")
+        if not isinstance(children, list) or any(isinstance(number, bool) or not isinstance(number, int) for number in children):
+            raise ImplementationHierarchyUnavailable("Interrupted admission has invalid durable child membership")
+        if len(children) != len(set(children)):
+            raise ImplementationHierarchyUnavailable("Interrupted admission has duplicate durable child membership")
+        return parent, tuple(children)
+
+    @staticmethod
+    def _raise_hierarchy_conflict(
+        owner: ImplementationOwner,
+        owners: Dict[str, Dict[str, object]],
+        hierarchy: tuple[Optional[int], tuple[int, ...]],
+    ) -> None:
+        related = set(hierarchy[1])
+        if hierarchy[0] is not None:
+            related.add(hierarchy[0])
+        conflicts = sorted(number for number in related if number != owner.number and f"issue:{number}" in owners)
+        if conflicts:
+            raise ImplementationHierarchyConflict(f"issue:{owner.number} conflicts with active direct parent/child issue:{conflicts[0]}")
+
+    def _read_issue_hierarchy(self, github_client: Any, issue_number: int) -> tuple[Optional[int], tuple[int, ...]]:
+        """Read and strictly validate cache-bypassing direct hierarchy evidence."""
+        parent_reader = getattr(github_client, "get_parent_issue_number_strict", None)
+        child_reader = getattr(github_client, "get_direct_sub_issues_strict", None)
+        generation_reader = getattr(github_client, "get_issue_hierarchy_generation_strict", None)
+        if not callable(parent_reader) or not callable(child_reader) or not callable(generation_reader):
+            raise ImplementationHierarchyUnavailable("Cache-bypassing GitHub hierarchy and generation readers are required")
+        try:
+            generation = generation_reader(self.repo_name, issue_number)
+            parent = parent_reader(self.repo_name, issue_number)
+            children_payload = child_reader(self.repo_name, issue_number)
+            confirmed_generation = generation_reader(self.repo_name, issue_number)
+        except Exception as exc:
+            raise ImplementationHierarchyUnavailable(f"Cannot establish current direct hierarchy for issue:{issue_number}: {exc}") from exc
+        if not isinstance(generation, str) or not generation or not isinstance(confirmed_generation, str) or not confirmed_generation:
+            raise ImplementationHierarchyUnavailable("GitHub returned an invalid Issue hierarchy generation")
+        if confirmed_generation != generation:
+            raise ImplementationHierarchyUnavailable(f"Issue hierarchy generation changed while reading issue:{issue_number}")
+        if parent is not None and (isinstance(parent, bool) or not isinstance(parent, int)):
+            raise ImplementationHierarchyUnavailable("GitHub returned an invalid direct parent identity")
+        if parent == issue_number or not isinstance(children_payload, list):
+            raise ImplementationHierarchyUnavailable("GitHub returned contradictory direct hierarchy evidence")
+        children = self._parse_direct_children(issue_number, children_payload)
+        return parent, children
+
+    @staticmethod
+    def _parse_direct_children(issue_number: int, payload: list[object]) -> tuple[int, ...]:
+        children: list[int] = []
+        for child in payload:
+            number = child.get("number") if isinstance(child, dict) else None
+            if isinstance(number, bool) or not isinstance(number, int) or number == issue_number:
+                raise ImplementationHierarchyUnavailable("GitHub returned an invalid direct child identity")
+            children.append(number)
+        if len(children) != len(set(children)):
+            raise ImplementationHierarchyUnavailable("GitHub returned duplicate direct-child membership")
+        return tuple(sorted(children))
+
+    @staticmethod
+    def _read_process_identity(pid: int) -> Optional[ProcessIdentity]:
+        """Read a Linux process identity, returning ``None`` when it is uncertain.
+
+        The kernel boot ID and ``/proc/<pid>/stat`` start time together remain
+        stable for a process lifetime and prevent a reused PID from being
+        mistaken for the execution which originally wrote the record.
+        """
+        return read_process_identity(pid)
+
+    def _current_process_identity(self) -> Optional[ProcessIdentity]:
+        return self._read_process_identity(os.getpid())
+
+    def _execution_is_stale(self, execution: Dict[str, object]) -> bool:
+        """Return true only when strong OS identity proves an execution is dead."""
+        local_job_id = execution.get("local_job_id")
+        if isinstance(local_job_id, str) and local_job_id:
+            from .local_job_handoff import LocalJobState, LocalJobStore
+
+            job = LocalJobStore().get(local_job_id)
+            return job is not None and job.repository == self.repo_name and job.implementation_execution_id == execution.get("id") and job.state is LocalJobState.SETTLED
+        pid = execution.get("pid")
+        boot_id = execution.get("boot_id")
+        start_ticks = execution.get("process_start_ticks")
+        if isinstance(pid, bool) or not isinstance(pid, int) or not isinstance(boot_id, str) or isinstance(start_ticks, bool) or not isinstance(start_ticks, int):
+            return False
+        return process_is_dead(ProcessIdentity(pid, boot_id, start_ticks), self._read_process_identity(pid))
+
+    def _remove_stale_executions(self, owners: Dict[str, Dict[str, object]]) -> tuple[str, ...]:
+        """Remove only executions conclusively shown stale from locked state."""
+        from .local_job_handoff import LocalJobStore, default_local_job_db_path
+
+        configured_root = os.environ.get("AUTO_CODER_RUNTIME_ROOT")
+        default_root = Path(configured_root) / "state" if configured_root else Path.home() / ".auto-coder"
+        default_store = default_root / self.repo_name / "implementation_slots.json"
+        try:
+            retained = LocalJobStore().retained_execution_ids(self.repo_name) if self.storage_path.resolve() == default_store.resolve() and any(record.get("executions") for record in owners.values()) and default_local_job_db_path().is_file() else frozenset()
+        except Exception as exc:
+            raise ImplementationSlotUnavailable(f"Cannot verify durable local execution responsibility: {exc}") from exc
+        removed = []
+        for owner_key, record in owners.items():
+            executions = record.setdefault("executions", [])
+            if not isinstance(executions, list) or any(not isinstance(value, dict) or not isinstance(value.get("id"), str) for value in executions):
+                raise ImplementationSlotUnavailable("Cannot safely parse active implementation executions")
+            remaining = []
+            for execution in executions:
+                if execution["id"] not in retained and self._execution_is_stale(execution):
+                    removed.append(str(execution["id"]))
+                    logger.info(f"Reclaimed stale implementation execution {execution['id']} for {owner_key}")
+                else:
+                    remaining.append(execution)
+            if len(remaining) != len(executions):
+                record["executions"] = remaining
+                self._increment_activity_revision(record)
+        return tuple(removed)
+
+    def restore_local_pr_repair_execution(self, job: "LocalJobRecord", owner: ImplementationOwner) -> bool:
+        """Reattach a never-started PR job to its existing idle lifecycle owner."""
+        from .local_job_handoff import LocalJobKind, LocalJobState
+
+        if job.repository != self.repo_name or job.kind not in {LocalJobKind.PR_CI_FAILURE, LocalJobKind.PR_MERGE_CONFLICT} or job.state is not LocalJobState.PENDING or job.provider_entered or job.execution_incarnation or not job.implementation_execution_id:
+            return False
+        with self._state_lock():
+            owners = self._read()
+            record = owners.get(owner.key)
+            if record is None or self._execution_snapshots(record, owner.key) or self._string_list(record, "provider_sessions", owner.key):
+                return False
+            if owner.kind == "pr":
+                if owner.number != job.target_number:
+                    return False
+            elif job.target_number not in self._positive_integer_list(record, "implementation_prs", owner.key):
+                return False
+            if any(execution.execution_id == job.implementation_execution_id for key, value in owners.items() for execution in self._execution_snapshots(value, key)):
+                return False
+            record["executions"] = [{"id": job.implementation_execution_id, "local_job_id": job.job_id}]
+            self._increment_activity_revision(record)
+            self._write(owners)
+        return True
+
+    def restore_local_issue_execution(self, job: "LocalJobRecord", current_generation: str) -> bool:
+        """Restore an exact unretired publication owner, without model admission."""
+        from .local_job_handoff import InvocationOutcome, LocalJobKind, LocalJobState
+
+        if (
+            job.repository != self.repo_name
+            or job.kind is not LocalJobKind.ISSUE_IMPLEMENTATION
+            or job.state not in {LocalJobState.RESULT_RECORDED, LocalJobState.DOWNSTREAM_EFFECTS_PENDING}
+            or job.invocation_outcome is not InvocationOutcome.COMPLETED
+            or not job.owner_incarnation
+            or not job.implementation_execution_id
+            or not job.owner_generation
+            or current_generation != job.owner_generation
+        ):
+            return False
+        owner = ImplementationOwner("issue", job.target_number)
+        with self._state_lock():
+            owners = self._read()
+            if owner.key in owners or job.owner_incarnation in self._read_retired():
+                return False
+            owners[owner.key] = {
+                "kind": owner.kind,
+                "number": owner.number,
+                "incarnation": job.owner_incarnation,
+                "activity_revision": 1,
+                "implementation_generation": job.owner_generation,
+                "implementation_prs": [],
+                "provider_sessions": [],
+                "executions": [{"id": job.implementation_execution_id, "local_job_id": job.job_id}],
+                "emergency": False,
+            }
+            self._write(owners)
+        return True
+
+    def reclaim_stale_executions(self) -> tuple[str, ...]:
+        """Atomically reclaim executions whose strong process identity is dead."""
+        with self._state_lock():
+            owners = self._read()
+            removed = self._remove_stale_executions(owners)
+            if removed:
+                self._write(owners)
+            return removed
+
+    def finish_execution(self, owner: ImplementationOwner, execution_id: str) -> None:
+        """Remove only the named execution, preserving its owner and siblings."""
+        with self._state_lock():
+            owners = self._read()
+            record = owners.get(owner.key)
+            if record is None:
+                return
+            executions = record.setdefault("executions", [])
+            if not isinstance(executions, list) or any(not isinstance(value, dict) or not isinstance(value.get("id"), str) for value in executions):
+                raise ImplementationSlotUnavailable("Cannot safely parse active implementation executions")
+            remaining = [value for value in executions if value["id"] != execution_id]
+            if len(remaining) != len(executions):
+                record["executions"] = remaining
+                self._increment_activity_revision(record)
+                if record.get("admission_pending", False):
+                    record["admission_established"] = True
+                self._write(owners)
+        active = getattr(self._execution_context, "owners", {})
+        if active.get(owner.key) == execution_id:
+            active.pop(owner.key, None)
+
+    def current_execution_id(self, owner: ImplementationOwner) -> Optional[str]:
+        """Return this thread's enclosing execution for reentrant lifecycle work."""
+        return getattr(self._execution_context, "owners", {}).get(owner.key)
+
+    def finish_execution_by_id(self, execution_id: str) -> None:
+        """Retire one globally unique execution while preserving its owner."""
+        if not execution_id:
+            return
+        with self._state_lock():
+            owners = self._read()
+            matches: list[tuple[str, Dict[str, object], list[Dict[str, object]]]] = []
+            for owner_key, record in owners.items():
+                executions = record.setdefault("executions", [])
+                if not isinstance(executions, list) or any(not isinstance(value, dict) or not isinstance(value.get("id"), str) for value in executions):
+                    raise ImplementationSlotUnavailable("Cannot safely parse active implementation executions")
+                typed_executions = cast(list[Dict[str, object]], executions)
+                if any(value["id"] == execution_id for value in typed_executions):
+                    matches.append((owner_key, record, typed_executions))
+            if len(matches) > 1:
+                raise ImplementationSlotUnavailable("Implementation execution identity is not unique")
+            if matches:
+                owner_key, record, executions = matches[0]
+                record["executions"] = [value for value in executions if value["id"] != execution_id]
+                self._increment_activity_revision(record)
+                if record.get("admission_pending", False):
+                    record["admission_established"] = True
+                self._write(owners)
+                active = getattr(self._execution_context, "owners", {})
+                if active.get(owner_key) == execution_id:
+                    active.pop(owner_key, None)
+
+    def active_execution_ids(self, owner: ImplementationOwner) -> tuple[str, ...]:
+        """Return durable active execution identities for an owner."""
+        with self._state_lock():
+            record = self._read().get(owner.key)
+        if record is None:
+            return ()
+        executions = record.get("executions", [])
+        if not isinstance(executions, list) or any(not isinstance(value, dict) or not isinstance(value.get("id"), str) for value in executions):
+            raise ImplementationSlotUnavailable("Cannot safely parse active implementation executions")
+        return tuple(value["id"] for value in executions)
+
+    def release(self, owner: ImplementationOwner) -> None:
+        with self._state_lock():
+            owners = self._read()
+            if owners.pop(owner.key, None) is not None:
+                self._write(owners)
+
+    def _release_if_idle(self, owner: ImplementationOwner, expected_implementation_prs: Optional[tuple[int, ...]] = None) -> bool:
+        """Release an owner only if relevant durable state is still unchanged.
+
+        Lifecycle evidence is necessarily fetched without holding the registry
+        lock. Admission or PR discovery may therefore race that lookup; the final
+        state checks and removal must be one registry transaction so newly
+        admitted work can never be discarded with its owner.
+        """
+        with self._state_lock():
+            owners = self._read()
+            record = owners.get(owner.key)
+            if record is None:
+                return False
+            executions = record.get("executions", [])
+            if not isinstance(executions, list) or any(not isinstance(value, dict) or not isinstance(value.get("id"), str) for value in executions):
+                raise ImplementationSlotUnavailable("Cannot safely parse active implementation executions")
+            if executions:
+                return False
+            if expected_implementation_prs is not None:
+                implementation_prs = record.get("implementation_prs", [])
+                if not isinstance(implementation_prs, list) or any(isinstance(number, bool) or not isinstance(number, int) for number in implementation_prs):
+                    raise ImplementationSlotUnavailable("Cannot safely parse implementation slot PR membership")
+                if tuple(implementation_prs) != expected_implementation_prs:
+                    return False
+            owners.pop(owner.key)
+            self._write(owners)
+            return True
+
+    def record_implementation_pr(self, owner: ImplementationOwner, pr_number: int) -> bool:
+        """Record PR membership only when *owner* is already reserved."""
+        if isinstance(pr_number, bool) or not isinstance(pr_number, int):
+            raise ValueError("pr_number must identify a PR belonging to an implementation owner")
+        with self._state_lock():
+            owners = self._read()
+            record = owners.get(owner.key)
+            if record is None:
+                return False
+            changed = False
+            known_prs = record.setdefault("implementation_prs", [])
+            if not isinstance(known_prs, list):
+                raise ImplementationSlotUnavailable("Cannot safely parse implementation slot PR membership")
+            if pr_number not in known_prs:
+                known_prs.append(pr_number)
+                changed = True
+            if record.get("admission_pending", False) and not record.get("admission_established", False):
+                record["admission_established"] = True
+                changed = True
+            if changed:
+                if "incarnation" not in record or not record["incarnation"]:
+                    record["incarnation"] = uuid.uuid4().hex
+                self._increment_activity_revision(record)
+                self._write(owners)
+            return True
+
+    def record_implementation_pr_if_current(
+        self,
+        owner: ImplementationOwner,
+        pr_number: int,
+        incarnation: str,
+        generation: Optional[str],
+    ) -> bool:
+        """Associate a PR only with the exact retained owner generation."""
+        if isinstance(pr_number, bool) or not isinstance(pr_number, int) or not incarnation:
+            return False
+        with self._state_lock():
+            owners = self._read()
+            record = owners.get(owner.key)
+            if record is None or record.get("incarnation") != incarnation or record.get("implementation_generation") != generation:
+                return False
+            known_prs = record.setdefault("implementation_prs", [])
+            if not isinstance(known_prs, list):
+                raise ImplementationSlotUnavailable("Cannot safely parse implementation slot PR membership")
+            if pr_number not in known_prs:
+                known_prs.append(pr_number)
+                self._increment_activity_revision(record)
+                self._write(owners)
+            return True
+
+    def record_provider_session(self, owner: ImplementationOwner, session_id: str) -> bool:
+        """Persist a provider session as evidence of logical ownership."""
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ValueError("session_id must be a non-empty string")
+        with self._state_lock():
+            owners = self._read()
+            record = owners.get(owner.key)
+            if record is None:
+                return False
+            changed = False
+            provider_sessions = record.setdefault("provider_sessions", [])
+            if not isinstance(provider_sessions, list):
+                raise ImplementationSlotUnavailable("Cannot safely parse provider session membership")
+            if session_id not in provider_sessions:
+                provider_sessions.append(session_id)
+                changed = True
+            if record.get("admission_pending", False) and not record.get("admission_established", False):
+                record["admission_established"] = True
+                changed = True
+            if changed:
+                if "incarnation" not in record or not record["incarnation"]:
+                    record["incarnation"] = uuid.uuid4().hex
+                self._increment_activity_revision(record)
+                self._write(owners)
+        return True
+
+    def restore_accepted_retry_session(
+        self,
+        owner: ImplementationOwner,
+        *,
+        request_id: str,
+        attempt_id: str,
+        generation: str,
+        acquisition_reference: str,
+        session_id: str,
+    ) -> str:
+        """Restore bookkeeping for accepted work without admitting new work.
+
+        The retained retry authority is deliberately more specific than an
+        Issue number.  This operation neither checks capacity nor creates an
+        execution: it only reconstructs the logical owner which the accepted
+        provider responsibility already consumes.  The caller must hold
+        :meth:`serialize` so pointer, retirement, and acknowledgement checks
+        can share the same owner fence.
+
+        Returns ``restored``, ``existing``, ``retired``, or ``conflict``.
+        Unreadable state raises rather than being interpreted as absence.
+        """
+        identities = (request_id, attempt_id, generation, acquisition_reference, session_id)
+        if any(not isinstance(value, str) or not value.strip() for value in identities):
+            raise ValueError("accepted retry restoration identities must be non-empty strings")
+        with self._state_lock():
+            owners = self._read()
+            retired = self._read_retired()
+            for value in retired.values():
+                if not isinstance(value, dict):
+                    raise ImplementationSlotUnavailable("Cannot safely parse retired record")
+                sessions = value.get("provider_sessions", [])
+                if not isinstance(sessions, list) or any(not isinstance(item, str) for item in sessions):
+                    raise ImplementationSlotUnavailable("Cannot safely parse retired provider membership")
+                if value.get("kind") == owner.kind and value.get("number") == owner.number and value.get("generation") == generation and session_id in sessions:
+                    return "retired"
+
+            record = owners.get(owner.key)
+            restored = record is None
+            if record is None:
+                record = {
+                    "kind": owner.kind,
+                    "number": owner.number,
+                    "incarnation": uuid.uuid4().hex,
+                    "activity_revision": 1,
+                    "implementation_prs": [],
+                    "provider_sessions": [],
+                    "executions": [],
+                    "emergency": False,
+                    "implementation_generation": generation,
+                }
+                owners[owner.key] = record
+            else:
+                existing_generation = record.get("implementation_generation")
+                if existing_generation is None:
+                    retained = record.get("executions") or record.get("provider_sessions") or record.get("implementation_prs")
+                    retry_matches = record.get("retry_request_id") == request_id and record.get("implementation_attempt_id") == attempt_id
+                    if retained and not retry_matches:
+                        return "conflict"
+                    record["implementation_generation"] = generation
+                elif not isinstance(existing_generation, str) or existing_generation != generation:
+                    return "conflict"
+
+            sessions = record.setdefault("provider_sessions", [])
+            if not isinstance(sessions, list) or any(not isinstance(item, str) for item in sessions):
+                raise ImplementationSlotUnavailable("Cannot safely parse provider implementation membership")
+            restorations = record.setdefault("accepted_retry_handoffs", [])
+            if not isinstance(restorations, list) or any(not isinstance(item, dict) for item in restorations):
+                raise ImplementationSlotUnavailable("Cannot safely parse accepted retry ownership")
+            evidence = {
+                "request_id": request_id,
+                "attempt_id": attempt_id,
+                "generation": generation,
+                "acquisition_reference": acquisition_reference,
+                "session_id": session_id,
+            }
+            changed = False
+            if evidence not in restorations:
+                restorations.append(evidence)
+                changed = True
+            if session_id not in sessions:
+                sessions.append(session_id)
+                changed = True
+            if changed:
+                if not restored:
+                    self._increment_activity_revision(record)
+                self._write(owners)
+            return "restored" if restored else "existing"
+
+    def admit_outbound_provider_activity(self, owner: ImplementationOwner, session_id: str) -> bool:
+        """Durably admit new implementation-mutating provider responsibility (Issue #2147, REQ-007).
+
+        Unlike ``record_provider_session`` — which is membership-idempotent and
+        does not advance ``activity_revision`` when *session_id* is already
+        known — this operation unconditionally advances the activity revision
+        for *owner*'s current incarnation, even when the session ID is
+        unchanged (same-session continuation). Callers must invoke this
+        *before* sending any outbound Jules mutation (resume, feedback, plan
+        approval, replacement session, or publication request) so that:
+
+        - the admission is persisted before the outbound call starts;
+        - any retirement observation collected before this call becomes
+          stale (``retire_implementation_slot`` will detect the activity
+          revision mismatch and return ``STALE_OBSERVATION`` rather than
+          releasing the slot);
+        - if the owner's incarnation has already retired (absent from the
+          active store), this returns False and callers must not send the
+          outbound mutation.
+
+        Session membership (``provider_sessions``) is still recorded here so
+        that ``record_provider_session``'s idempotent membership meaning is
+        preserved and not overloaded with this new revision-advancing
+        semantic; this method simply also unconditionally increments the
+        revision on top of that membership bookkeeping.
+        """
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ValueError("session_id must be a non-empty string")
+        with self._state_lock():
+            owners = self._read()
+            record = owners.get(owner.key)
+            if record is None:
+                # Owner incarnation already retired (or never reserved) — the
+                # outbound mutation must not be sent (REQ-009).
+                return False
+            provider_sessions = record.setdefault("provider_sessions", [])
+            if not isinstance(provider_sessions, list):
+                raise ImplementationSlotUnavailable("Cannot safely parse provider session membership")
+            if session_id not in provider_sessions:
+                provider_sessions.append(session_id)
+            if record.get("admission_pending", False) and not record.get("admission_established", False):
+                record["admission_established"] = True
+            if "incarnation" not in record or not record["incarnation"]:
+                record["incarnation"] = uuid.uuid4().hex
+            # Unconditional revision advance — this is the defining difference
+            # from record_provider_session's idempotent membership semantics.
+            self._increment_activity_revision(record)
+            try:
+                self._write(owners)
+            except Exception:
+                # Failure to persist admission must prevent the outbound
+                # mutation (REQ-007): surface the failure to the caller.
+                raise
+            return True
+
+    def has_provider_sessions(self, owner: ImplementationOwner) -> bool:
+        """Return whether logical ownership includes asynchronous provider work."""
+        with self._state_lock():
+            record = self._read().get(owner.key)
+        if record is None:
+            return False
+        sessions = record.get("provider_sessions", [])
+        if not isinstance(sessions, list) or any(not isinstance(value, str) for value in sessions):
+            raise ImplementationSlotUnavailable("Cannot safely parse provider implementation membership")
+        return bool(sessions)
+
+    def finish_provider_session(self, owner: ImplementationOwner, session_id: str) -> bool:
+        """Remove stopped remote work and release its idle logical ownership."""
+        with self._state_lock():
+            owners = self._read()
+            record = owners.get(owner.key)
+            if record is None:
+                return False
+            sessions = record.get("provider_sessions", [])
+            executions = record.get("executions", [])
+            implementation_prs = record.get("implementation_prs", [])
+            if not isinstance(sessions, list) or any(not isinstance(value, str) for value in sessions):
+                raise ImplementationSlotUnavailable("Cannot safely parse provider implementation membership")
+            if session_id not in sessions:
+                return False
+            remaining = [value for value in sessions if value != session_id]
+            record["provider_sessions"] = remaining
+            self._increment_activity_revision(record)
+            if not remaining and not executions and not implementation_prs:
+                owners.pop(owner.key)
+            self._write(owners)
+            return True
+
+    def release_unbound_idle_owner(self, owner: ImplementationOwner) -> bool:
+        """Release ownership with no execution, provider task, or implementation PR."""
+        with self._state_lock():
+            owners = self._read()
+            record = owners.get(owner.key)
+            if record is None:
+                return False
+            executions = record.get("executions", [])
+            sessions = record.get("provider_sessions", [])
+            implementation_prs = record.get("implementation_prs", [])
+            if not isinstance(executions, list) or not isinstance(sessions, list) or not isinstance(implementation_prs, list):
+                raise ImplementationSlotUnavailable("Cannot safely parse retained implementation ownership")
+            if executions or sessions or implementation_prs:
+                return False
+            owners.pop(owner.key)
+            self._write(owners)
+            return True
+
+    def implementation_generation(self, owner: ImplementationOwner) -> Optional[str]:
+        """Return the durable Implementation generation captured for *owner*.
+
+        This is the production ownership-adapter binding consumed by
+        :mod:`implementation_ownership`; it is distinct from
+        ``validation_identity`` (the specification validator's identity hash).
+        """
+        with self._state_lock():
+            record = self._read().get(owner.key)
+        if record is None:
+            return None
+        generation = record.get("implementation_generation")
+        if generation is not None and not isinstance(generation, str):
+            raise ImplementationSlotUnavailable("Cannot safely parse implementation generation binding")
+        return generation
+
+    def has_qualifying_implementation_activity(self, owner: ImplementationOwner) -> bool:
+        """Return whether *owner* retains durable implementation-mutating evidence.
+
+        Qualifying evidence is a durable local execution, a retained provider
+        session, or implementation-PR membership (REQ-003 of #2061); a bare
+        idle reservation with none of these does not qualify.
+        """
+        with self._state_lock():
+            record = self._read().get(owner.key)
+        if record is None:
+            return False
+        executions = record.get("executions", [])
+        sessions = record.get("provider_sessions", [])
+        prs = record.get("implementation_prs", [])
+        if not isinstance(executions, list) or not isinstance(sessions, list) or not isinstance(prs, list):
+            raise ImplementationSlotUnavailable("Cannot safely parse retained implementation ownership")
+        return bool(executions or sessions or prs)
+
+    def record_validation_identity(self, owner: ImplementationOwner, identity: str) -> bool:
+        """Bind logical Issue ownership to its authorized specification identity."""
+        with self._state_lock():
+            owners = self._read()
+            record = owners.get(owner.key)
+            if record is None:
+                return False
+            record["validation_identity"] = identity
+            self._increment_activity_revision(record)
+            if record.get("admission_pending", False):
+                record["admission_established"] = True
+            self._write(owners)
+            return True
+
+    def validation_identity(self, owner: ImplementationOwner) -> Optional[str]:
+        """Return the generation identity attached to retained ownership."""
+        with self._state_lock():
+            record = self._read().get(owner.key)
+        if record is None:
+            return None
+        identity = record.get("validation_identity")
+        if identity is not None and not isinstance(identity, str):
+            raise ImplementationSlotUnavailable("Cannot safely parse implementation validation identity")
+        return identity
+
+    def active_owners(self) -> tuple[ImplementationOwner, ...]:
+        with self._state_lock():
+            records = self._read()
+        owners = []
+        for record in records.values():
+            kind = record.get("kind")
+            number = record.get("number")
+            if not isinstance(kind, str) or isinstance(number, bool) or not isinstance(number, int):
+                raise ImplementationSlotUnavailable("Cannot safely parse implementation slot state")
+            owners.append(ImplementationOwner(kind, number))
+        return tuple(owners)
+
+    def _record_open_pr_memberships(self, github_client: Any) -> None:
+        """Persist supported PR ownership oracles before startup reconciliation."""
+        active_owner_keys = {owner.key for owner in self.active_owners()}
+        for pull_request in github_client.get_open_pull_requests(self.repo_name):
+            owner = self.resolve_owner("pr", pull_request, github_client)
+            pr_number = pull_request.get("number")
+            # Every non-PR owner can have implementation PRs.  This includes
+            # provider-owned recurrent runs as well as Issue-owned work.
+            if owner.kind == "pr" or owner.key not in active_owner_keys:
+                continue
+            if isinstance(pr_number, bool) or not isinstance(pr_number, int):
+                raise ImplementationOwnerResolutionError("Open pull request has no valid numeric identity")
+            if not self.record_implementation_pr(owner, pr_number):
+                raise ImplementationSlotUnavailable(f"Could not retain active implementation owner {owner.key}")
+
+    def reconcile(self, github_client: Any, discover_open_prs: bool = False) -> None:
+        """Release only owners whose complete authoritative lifecycle is terminal."""
+        # Execution cleanup is deliberately independent from owner cleanup. A
+        # dead process ceases to block lifecycle evaluation, but the GitHub
+        # lifecycle below remains the sole authority for releasing its owner.
+        self.reclaim_stale_executions()
+        if discover_open_prs:
+            # Unlike the failure handling below, discovery failure is not
+            # swallowed here: the caller (startup reconciliation) owns
+            # retaining this as recoverable work and retrying it durably, so
+            # a deferred or throttled discovery must propagate rather than
+            # silently declare recovery complete with a partial owner set.
+            self._record_open_pr_memberships(github_client)
+        for owner in self.active_owners():
+            try:
+                # Lifecycle reconciliation must never erase live execution
+                # identities, including forced siblings of the execution that
+                # just completed.
+                if self.active_execution_ids(owner):
+                    continue
+                if owner.kind == "issue":
+                    item = github_client.get_issue(self.repo_name, owner.number)
+                    details = github_client.get_issue_details(item)
+                    if details.get("state", "").lower() != "closed":
+                        continue
+
+                    # Closing the source Issue is not terminal while any PR in
+                    # the same logical implementation is still active (for
+                    # example, a sibling PR waiting for CI or review).  Use the
+                    # existing authoritative Issue-to-PR relationship lookup;
+                    # an unavailable lookup raises and retains the slot.
+                    # Native connections are not the only supported ownership
+                    # oracle: branch metadata can also associate a PR with its
+                    # source Issue.  PR membership learned during owner resolution
+                    # is therefore persisted with the slot and reconciled together
+                    # with native connections after a restart.
+                    with self._state_lock():
+                        record = self._read().get(owner.key, {})
+                        recorded_prs = record.get("implementation_prs", [])
+                    if not isinstance(recorded_prs, list) or any(isinstance(number, bool) or not isinstance(number, int) for number in recorded_prs):
+                        raise ImplementationSlotUnavailable("Cannot safely parse implementation slot PR membership")
+                    linked_pr_numbers = set(github_client.get_connected_prs(self.repo_name, owner.number, strict=True))
+                    linked_pr_numbers.update(recorded_prs)
+                    linked_prs_terminal = True
+                    for pr_number in linked_pr_numbers:
+                        pull_request = self._authoritative_pull_request(github_client, pr_number)
+                        pr_details = github_client.get_pr_details(pull_request)
+                        if pr_details.get("state", "").lower() != "closed" and pr_details.get("merged") is not True:
+                            linked_prs_terminal = False
+                            break
+                    if linked_prs_terminal and self._release_if_idle(owner, tuple(recorded_prs)):
+                        logger.info(f"Released terminal logical implementation slot {owner.key}")
+                elif owner.kind == "pr":
+                    item = self._authoritative_pull_request(github_client, owner.number)
+                    details = github_client.get_pr_details(item)
+                    if (details.get("state", "").lower() == "closed" or details.get("merged") is True) and self._release_if_idle(owner):
+                        logger.info(f"Released terminal logical implementation slot {owner.key}")
+                else:
+                    # Provider-owned implementations are reconciled by their
+                    # provider lifecycle scanner. Uncertain lifecycle evidence
+                    # must retain capacity rather than be treated as a PR.
+                    continue
+            except Exception as exc:
+                logger.warning(f"Could not reconcile logical implementation {owner.key}; retaining its slot: {exc}")
+
+    def _authoritative_pull_request(self, github_client: Any, pr_number: int) -> Any:
+        """Return PR lifecycle evidence, or raise rather than read absence into it.
+
+        ``get_pull_request`` reports an unavailable read as ``None``.  Releasing
+        a slot needs positive terminal evidence, so an unavailable read must
+        retain the slot under its own cause instead of reaching the lifecycle
+        comparison as a PR with no state.
+        """
+        pull_request = github_client.get_pull_request(self.repo_name, pr_number)
+        if pull_request is None:
+            raise ImplementationSlotUnavailable(f"Could not read pull request #{pr_number} lifecycle from {self.repo_name}")
+        return pull_request
+
+    @contextmanager
+    def serialize(self, owner: ImplementationOwner, *, timeout: float = 30.0) -> Iterator[None]:
+        """Prevent simultaneous mutation paths for one owner across processes."""
+        mutation_lock_path = lock_path(self.repo_name, self.storage_path, "implementation-owner", owner.key)
+        try:
+            ensure_lock_directory(mutation_lock_path, os.stat(self.storage_path.parent).st_gid)
+        except (OSError, RuntimeError) as exc:
+            self._raise_permission_error(mutation_lock_path.parent, exc)
+        with self._file_lock(mutation_lock_path, timeout):
+            yield
+
+    @contextmanager
+    def try_serialize(self, owner: ImplementationOwner) -> Iterator[bool]:
+        """Attempt owner serialization immediately, yielding False when busy.
+
+        Only acquisition contention is handled; permission errors and failures
+        from the protected operation still propagate to the caller.
+        """
+        with ExitStack() as stack:
+            try:
+                stack.enter_context(self.serialize(owner, timeout=0))
+            except ImplementationSlotLockTimeout:
+                yield False
+                return
+            yield True
+
+    def establish_incarnation(self, owner: ImplementationOwner) -> str:
+        """Ensure *owner* has a durable reservation incarnation and activity revision."""
+        with self._state_lock():
+            owners = self._read()
+            record = owners.get(owner.key)
+            if record is None:
+                raise ImplementationSlotUnavailable(f"Cannot establish incarnation for unreserved owner {owner.key}")
+            changed = False
+            incarnation = record.get("incarnation")
+            if not isinstance(incarnation, str) or not incarnation:
+                incarnation = uuid.uuid4().hex
+                record["incarnation"] = incarnation
+                changed = True
+            if "activity_revision" not in record or not isinstance(record["activity_revision"], int):
+                record["activity_revision"] = 1
+                changed = True
+            if changed:
+                self._write(owners)
+            return incarnation
+
+    def owner_incarnation(self, owner: ImplementationOwner) -> Optional[str]:
+        """Return the current reservation incarnation for *owner*."""
+        with self._state_lock():
+            record = self._read().get(owner.key)
+        if record is None:
+            return None
+        incarnation = record.get("incarnation")
+        if incarnation is not None and not isinstance(incarnation, str):
+            raise ImplementationSlotUnavailable("Cannot safely parse implementation reservation incarnation")
+        return incarnation
+
+    def owner_activity_revision(self, owner: ImplementationOwner) -> Optional[int]:
+        """Return the current activity revision counter for *owner*."""
+        with self._state_lock():
+            record = self._read().get(owner.key)
+        if record is None:
+            return None
+        revision = record.get("activity_revision")
+        if revision is not None and (isinstance(revision, bool) or not isinstance(revision, int)):
+            raise ImplementationSlotUnavailable("Cannot safely parse implementation activity revision")
+        return revision
+
+    def _read_retired(self) -> Dict[str, Dict[str, object]]:
+        try:
+            os.stat(self.retired_storage_path)
+        except FileNotFoundError:
+            return {}
+        except OSError as exc:
+            self._raise_permission_error(self.retired_storage_path, exc)
+        try:
+            with io.open(self.retired_storage_path, "r", encoding="utf-8") as state_file:
+                value = json.load(state_file)
+            if not isinstance(value, dict):
+                raise ValueError("retired slot state root must be an object")
+            return value
+        except (json.JSONDecodeError, UnicodeError, ValueError) as exc:
+            raise ImplementationSlotUnavailable(f"Cannot safely parse retired slot state at '{self.retired_storage_path}': {exc}") from exc
+        except OSError as exc:
+            self._raise_permission_error(self.retired_storage_path, exc)
+
+    def _write_retired(self, retired_records: Dict[str, Dict[str, object]]) -> None:
+        temporary = self.retired_storage_path.with_suffix(".tmp")
+        try:
+            self.retired_storage_path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, self._SHARED_FILE_MODE)
+            with os.fdopen(fd, "w", encoding="utf-8") as state_file:
+                self._establish_shared_permissions(state_file.fileno(), temporary)
+                json.dump(retired_records, state_file, indent=2, sort_keys=True)
+                state_file.flush()
+                os.fsync(state_file.fileno())
+            os.replace(temporary, self.retired_storage_path)
+        except OSError as exc:
+            self._raise_permission_error(temporary if temporary.exists() else self.retired_storage_path, exc)
+
+    def retired_records(self) -> tuple[ImplementationRetiredSnapshot, ...]:
+        """Return detached projections of all durably retired reservations."""
+        with self._state_lock():
+            data = self._read_retired()
+        results: list[ImplementationRetiredSnapshot] = []
+        for key, record in data.items():
+            if not isinstance(record, dict):
+                raise ImplementationSlotUnavailable("Cannot safely parse retired record")
+            kind = record.get("kind")
+            number = record.get("number")
+            incarnation = record.get("incarnation")
+            if not isinstance(kind, str) or kind not in {"issue", "pr"}:
+                raise ImplementationSlotUnavailable("invalid retired record kind")
+            if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
+                raise ImplementationSlotUnavailable("invalid retired record number")
+            if not isinstance(incarnation, str) or not incarnation:
+                raise ImplementationSlotUnavailable("invalid retired record incarnation")
+            prs = self._positive_integer_list(record, "implementation_prs", f"retired {key}")
+            sessions = self._string_list(record, "provider_sessions", f"retired {key}")
+            generation = record.get("generation")
+            if generation is not None and not isinstance(generation, str):
+                raise ImplementationSlotUnavailable("invalid retired record generation")
+            retired_at = record.get("retired_at", 0.0)
+            if isinstance(retired_at, bool) or not isinstance(retired_at, (int, float)):
+                raise ImplementationSlotUnavailable("invalid retired record retired_at")
+            results.append(
+                ImplementationRetiredSnapshot(
+                    repository=str(record.get("repository", self.repo_name)),
+                    owner=ImplementationOwner(kind, number),
+                    incarnation=incarnation,
+                    implementation_prs=prs,
+                    provider_sessions=sessions,
+                    generation=generation,
+                    retired_at=float(retired_at),
+                )
+            )
+        results.sort(key=lambda r: (r.owner.kind, r.owner.number, r.retired_at))
+        return tuple(results)
+
+    def is_incarnation_retired(self, incarnation: str) -> bool:
+        with self._state_lock():
+            return incarnation in self._read_retired()
+
+    def has_retired_pr(self, pr_number: int) -> bool:
+        for r in self.retired_records():
+            if pr_number in r.implementation_prs:
+                return True
+        return False
+
+    def has_retired_session(self, session_id: str) -> bool:
+        for r in self.retired_records():
+            if session_id in r.provider_sessions:
+                return True
+        return False
+
+    def has_retired_generation(self, generation: str) -> bool:
+        for r in self.retired_records():
+            if r.generation == generation:
+                return True
+        return False
+
+    def retired_associations(self, owner: ImplementationOwner) -> tuple[ImplementationRetiredSnapshot, ...]:
+        return tuple(r for r in self.retired_records() if r.owner == owner)
+
+    def has_retired_associations(self, owner: ImplementationOwner) -> bool:
+        return bool(self.retired_associations(owner))
+
+    def retire_owner(
+        self,
+        observation: Any,
+        routing: Optional[Any] = None,
+        *,
+        pre_lock_barrier: Optional[Any] = None,
+    ) -> Any:
+        from .implementation_retirement import retire_implementation_slot
+
+        return retire_implementation_slot(self, observation, routing, pre_lock_barrier=pre_lock_barrier)

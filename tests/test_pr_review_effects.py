@@ -1,0 +1,581 @@
+import json
+import threading
+from dataclasses import replace
+
+import pytest
+
+from auto_coder import pr_processor
+from auto_coder.accepted_finding_bridge import ObservedRoot, RootObservation
+from auto_coder.github_app_reviewer import ReviewerAppIdentity, ReviewPublicationResult
+from auto_coder.pr_review_cycle import (
+    PUBLICATION_ACKNOWLEDGED,
+    ContractSnapshot,
+    Finding,
+    FindingDisposition,
+    PrReviewCycleRepository,
+    RoundProvenance,
+    StrongAuditRound,
+    StrongPolicyIdentity,
+)
+from auto_coder.pr_review_effects import (
+    CONFIRMED,
+    REJECTED,
+    RESERVED,
+    UNCERTAIN,
+    AcceptedReviewPayload,
+    EffectAttempt,
+    ReviewEffectExecutor,
+    ReviewEffectRepository,
+)
+from auto_coder.review_thread_validation import substantive_discussion_digest
+from auto_coder.two_tier_pr_gate import TwoTierPrGate
+from auto_coder.util.gh_cache import ReviewThread, ReviewThreadComment
+
+
+def _payload() -> AcceptedReviewPayload:
+    contract = ContractSnapshot(("#2209",), "REQ-001: Preserve the accepted payload.")
+    policy = StrongPolicyIdentity("strong-route", '{"model":"reviewer"}', "v1")
+    finding = Finding(
+        "finding-1",
+        "claim-1",
+        ("#2209/REQ-002",),
+        ("Publish every finding.",),
+        "An unanchored finding disappears.",
+        "The finding remains portable.",
+        "The finding was omitted.",
+        "Production publication payload lacks it.",
+        "review publication",
+        True,
+        "Drop findings without a line number.",
+        "Only anchored findings are asserted.",
+        "A material defect is hidden.",
+        "Assert the unanchored provider payload.",
+    )
+    round_record = StrongAuditRound(
+        "round-1",
+        3,
+        "head-a",
+        "base-a",
+        contract.identity,
+        policy.identity,
+        contract,
+        policy,
+        "claim-1",
+        2,
+        "reviewer/model",
+        "FINDINGS",
+        (finding.finding_id,),
+        7,
+    )
+    return AcceptedReviewPayload.strong("owner/repo", 42, round_record, (finding,))
+
+
+class _Transport:
+    def __init__(self, send: EffectAttempt, reconcile: EffectAttempt = EffectAttempt(UNCERTAIN)):
+        self.send_result = send
+        self.reconcile_result = reconcile
+        self.sent = 0
+        self.reconciled = 0
+
+    def send(self, operation):
+        self.sent += 1
+        return self.send_result
+
+    def reconcile(self, operation):
+        self.reconciled += 1
+        return self.reconcile_result
+
+
+def test_exact_payload_and_distinct_attempt_identity_are_durable(tmp_path):
+    repository = ReviewEffectRepository("owner/repo", tmp_path / "effects.json")
+    payload = _payload()
+    operation = repository.reserve(payload, "publication", "github-reviewer-app", "worker-a")
+
+    persisted = json.loads(operation.exact_payload)
+    assert operation.status == RESERVED
+    assert persisted["mode"] == "STRONG_AUDIT"
+    assert persisted["round_id"] == "round-1"
+    assert persisted["contract_issue_ids"] == ["#2209"]
+    assert persisted["requirements_text"] == "REQ-001: Preserve the accepted payload."
+    assert persisted["findings"][0]["focused_regression_scenario"] == "Assert the unanchored provider payload."
+
+    different = AcceptedReviewPayload(**{**payload.__dict__, "round_id": "round-2"})
+    assert repository.operation_identity(payload, "publication", "github-reviewer-app") != repository.operation_identity(different, "publication", "github-reviewer-app")
+
+
+def test_rendered_review_exposes_findings_as_separate_threads():
+    payload = _payload()
+    body = pr_processor._render_two_tier_review(payload)
+    transport = pr_processor._GitHubReviewEffectTransport(None, payload, lambda: True)
+    assert len(transport.comments) == 1
+    visible = transport.comments[0].body
+    assert "### finding-1" in visible
+    assert "auto-coder-two-tier-finding:v1:" in visible
+    assert "1 actionable finding thread(s) are attached" in body.split("<details>", 1)[0]
+    assert "**Requirements:** #2209/REQ-002" in visible
+    assert "**Status:** OPEN" in visible
+    for field in (
+        "counterexample",
+        "expected_behavior",
+        "actual_behavior",
+        "evidence",
+        "affected_boundary",
+        "material_consequence",
+        "focused_regression_scenario",
+        "plausible_incorrect_implementation",
+        "why_tests_admit_it",
+    ):
+        assert getattr(payload.findings[0], field) in visible
+    assert payload.canonical_json() in body
+    assert f"auto-coder-two-tier-review:v1:{payload.identity}" in body
+
+
+def test_rendered_closure_shows_disposition_evidence():
+    original = _payload()
+    finding = replace(original.findings[0], status="FIXED", disposition_evidence="Both paths now enforce the guard.")
+    payload = replace(original, mode="ORDINARY_CLOSURE", verdict="CLOSURE", findings=(finding,))
+    visible = pr_processor._render_two_tier_review(payload).split("<details>", 1)[0]
+    assert "**Status:** FIXED" in visible
+    assert "**Disposition evidence:** Both paths now enforce the guard." in visible
+
+
+@pytest.mark.parametrize("author,recognized", [("reviewer[bot]", True), ("untrusted-user", False)])
+def test_strong_finding_threads_enter_normal_authenticated_revalidation(author, recognized):
+    transport = pr_processor._GitHubReviewEffectTransport(None, _payload(), lambda: True)
+    thread = ReviewThread(
+        id="strong-thread",
+        is_resolved=False,
+        comments=[ReviewThreadComment(database_id=12, body=transport.comments[0].body, author_login=author)],
+    )
+    identity = ReviewerAppIdentity("reviewer[bot]", 123)
+    assert pr_processor.is_authoritative_adversarial_thread(thread, "owner/repo", identity) is recognized
+    state = pr_processor.ClaimedReviewThreadGateState(claimed=(), unresolved=(thread,), blocking_unresolved=(thread,), has_blocking_unresolved=True)
+    updated = pr_processor._allow_older_head_adversarial_threads(state, identity.login)
+    assert updated.has_blocking_unresolved is not recognized
+    assert len(updated.claimed) == int(recognized)
+    if recognized:
+        assert updated.claimed[0].original_finding == transport.comments[0].body
+        assert updated.claimed[0].revalidation_after_head_change is True
+    assert thread.is_resolved is False
+
+
+def test_contention_allows_only_reservation_owner_to_send(tmp_path):
+    repository = ReviewEffectRepository("owner/repo", tmp_path / "effects.json")
+    payload = _payload()
+    first_transport = _Transport(EffectAttempt(CONFIRMED, "review:99"))
+    second_transport = _Transport(EffectAttempt(CONFIRMED, "review:100"))
+    first = ReviewEffectExecutor(repository, "worker-a")
+    second = ReviewEffectExecutor(repository, "worker-b")
+
+    entered = threading.Event()
+    release = threading.Event()
+    results = []
+
+    class BlockingTransport(_Transport):
+        def send(self, operation):
+            entered.set()
+            assert release.wait(timeout=5)
+            return first_transport.send(operation)
+
+    worker = threading.Thread(target=lambda: results.append(first.apply(payload, "publication", "github-reviewer-app", BlockingTransport(EffectAttempt(CONFIRMED)), lambda: True)))
+    worker.start()
+    try:
+        assert entered.wait(timeout=5)
+        contested = second.apply(payload, "publication", "github-reviewer-app", second_transport, lambda: True)
+        assert contested.status == UNCERTAIN
+        assert contested.owner_token == "worker-a"
+        assert second_transport.sent == second_transport.reconciled == 0
+    finally:
+        release.set()
+        worker.join(timeout=5)
+    assert not worker.is_alive()
+    confirmed = results[0]
+
+    assert contested.operation_id == confirmed.operation_id
+    assert confirmed.status == CONFIRMED
+    assert confirmed.receipt == "review:99"
+    assert first_transport.sent == 1
+
+
+def test_uncertain_effect_reconciles_without_resend_and_survives_restart(tmp_path):
+    path = tmp_path / "effects.json"
+    payload = _payload()
+    repository = ReviewEffectRepository("owner/repo", path)
+    executor = ReviewEffectExecutor(repository, "stable-worker")
+    lost_response = _Transport(EffectAttempt(UNCERTAIN, reason="response lost"))
+
+    uncertain = executor.apply(payload, "repair-handoff", "codex-cloud:task-1", lost_response, lambda: True)
+    assert uncertain.status == UNCERTAIN
+    assert lost_response.sent == 1
+
+    recovered_repository = ReviewEffectRepository("owner/repo", path)
+    recovered = ReviewEffectExecutor(recovered_repository, "new-worker")
+    transport = _Transport(EffectAttempt(REJECTED), EffectAttempt(CONFIRMED, "turn:abc"))
+    confirmed = recovered.apply(payload, "repair-handoff", "codex-cloud:task-1", transport, lambda: True)
+
+    assert confirmed.status == CONFIRMED
+    assert confirmed.receipt == "turn:abc"
+    assert transport.sent == 0
+    assert transport.reconciled == 1
+    assert confirmed.owner_token == "new-worker"
+
+
+@pytest.mark.parametrize("initial_status", [RESERVED, UNCERTAIN])
+def test_new_owner_reconciles_positive_absence_before_resending(tmp_path, initial_status):
+    repository = ReviewEffectRepository("owner/repo", tmp_path / "effects.json")
+    payload = _payload()
+    operation = repository.reserve(payload, "publication", "github-reviewer-app", "dead-worker")
+    if initial_status == UNCERTAIN:
+        repository.record(operation.operation_id, "dead-worker", EffectAttempt(UNCERTAIN))
+    order = []
+
+    class Transport(_Transport):
+        def reconcile(self, operation):
+            order.append("reconcile")
+            assert operation.exact_payload == payload.canonical_json()
+            return super().reconcile(operation)
+
+        def send(self, operation):
+            order.append("send")
+            assert repository.get(operation.operation_id).status == UNCERTAIN
+            return super().send(operation)
+
+    transport = Transport(EffectAttempt(CONFIRMED, "review:102"), EffectAttempt(REJECTED, reason="authenticated absence"))
+    confirmed = ReviewEffectExecutor(repository).apply(payload, "publication", "github-reviewer-app", transport, lambda: True)
+    assert confirmed.status == CONFIRMED
+    assert confirmed.receipt == "review:102"
+    assert order == ["reconcile", "send"]
+
+
+def test_unavailable_reconciliation_never_resends_and_authority_is_rechecked(tmp_path):
+    repository = ReviewEffectRepository("owner/repo", tmp_path / "effects.json")
+    payload = _payload()
+    operation = repository.reserve(payload, "publication", "github-reviewer-app", "old-worker")
+    repository.record(operation.operation_id, "old-worker", EffectAttempt(UNCERTAIN))
+    unavailable = _Transport(EffectAttempt(CONFIRMED), EffectAttempt(UNCERTAIN, reason="rate limited"))
+    result = ReviewEffectExecutor(repository).apply(payload, "publication", "github-reviewer-app", unavailable, lambda: True)
+    assert result.status == UNCERTAIN
+    assert unavailable.reconciled == 1
+    assert unavailable.sent == 0
+    checks = iter((True, False))
+    absent = _Transport(EffectAttempt(CONFIRMED), EffectAttempt(REJECTED))
+    result = ReviewEffectExecutor(repository).apply(payload, "publication", "github-reviewer-app", absent, lambda: next(checks))
+    assert result.status == REJECTED
+    assert absent.reconciled == 1
+    assert absent.sent == 0
+
+
+def test_send_exception_leaves_recoverable_uncertainty(tmp_path):
+    repository = ReviewEffectRepository("owner/repo", tmp_path / "effects.json")
+    payload = _payload()
+
+    class FailingTransport(_Transport):
+        def send(self, operation):
+            assert repository.get(operation.operation_id).status == UNCERTAIN
+            raise RuntimeError("response lost")
+
+    result = ReviewEffectExecutor(repository).apply(payload, "publication", "github-reviewer-app", FailingTransport(EffectAttempt(CONFIRMED)), lambda: True)
+    assert result.status == UNCERTAIN
+    transport = _Transport(EffectAttempt(CONFIRMED), EffectAttempt(CONFIRMED, "review:103"))
+    result = ReviewEffectExecutor(repository).apply(payload, "publication", "github-reviewer-app", transport, lambda: True)
+    assert result.receipt == "review:103"
+    assert result.status == CONFIRMED
+    assert transport.reconciled == 1
+    assert transport.sent == 0
+
+
+def test_stale_authority_rejects_before_mutation_and_positive_rejection_can_retry(tmp_path):
+    repository = ReviewEffectRepository("owner/repo", tmp_path / "effects.json")
+    payload = _payload()
+    executor = ReviewEffectExecutor(repository, "worker-a")
+    transport = _Transport(EffectAttempt(CONFIRMED, "must-not-send"))
+
+    rejected = executor.apply(payload, "publication", "github-reviewer-app", transport, lambda: False)
+    assert rejected.status == REJECTED
+    assert transport.sent == 0
+
+    retry_transport = _Transport(EffectAttempt(CONFIRMED, "review:101"))
+    confirmed = executor.apply(payload, "publication", "github-reviewer-app", retry_transport, lambda: True)
+    assert confirmed.status == CONFIRMED
+    assert retry_transport.sent == 1
+
+
+@pytest.mark.parametrize("verdict", ["PASS", "FINDINGS"])
+def test_production_consumer_publishes_exact_accepted_record_and_persists_receipt(tmp_path, monkeypatch, verdict):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    contract = ContractSnapshot(("#2209",), "REQ-001: Preserve the accepted payload.")
+    policy = StrongPolicyIdentity("strong-route", "options", "v1")
+    cycle = PrReviewCycleRepository("owner/repo", tmp_path / "cycle.json")
+    cycle.record_ordinary_pass(42, RoundProvenance("head-a", "base-a"), contract)
+    claim = cycle.claim_strong_audit(42, RoundProvenance("head-a", "base-a"), contract, policy)
+    findings = [replace(_payload().findings[0], origin_round_id=claim.claim_id)] if verdict == "FINDINGS" else []
+    accepted = cycle.record_strong_result(42, claim.claim_id, verdict, "reviewer/model", findings)
+    if findings:
+        with pytest.raises(ValueError, match="complete accepted finding bundle"):
+            AcceptedReviewPayload.strong("owner/repo", 42, accepted, ())
+    inputs = pr_processor.TwoTierGateInputs(TwoTierPrGate("owner/repo", cycle), contract, policy, "head-a", "base-a")
+    sent_bodies = []
+
+    class FakeReviewer:
+        def __init__(self, config):
+            pass
+
+        def publish_exact_pr_review(self, repository, pr_number, head_sha, body, authorize, comments=()):
+            assert (repository, pr_number, head_sha) == ("owner/repo", 42, "head-a")
+            assert authorize() is True
+            sent_bodies.append(body)
+            assert len(comments) == len(findings)
+            if comments:
+                assert "### finding-1" in comments[0].body
+                assert "Production publication payload lacks it." == comments[0].evidence
+            return ReviewPublicationResult(True, "987", "")
+
+        def find_exact_pr_review(self, repository, pr_number, head_sha, body, comments=()):
+            raise AssertionError("a new reserved operation must send before reconciliation")
+
+    monkeypatch.setattr(pr_processor, "load_reviewer_app_config", lambda repo_name: object())
+    monkeypatch.setattr(pr_processor, "GitHubAppReviewer", FakeReviewer)
+
+    published, reason = pr_processor._consume_pending_two_tier_publication("owner/repo", 42, inputs)
+
+    assert published is True
+    assert reason == "confirmed authenticated STRONG_AUDIT publication receipt 987"
+    assert len(sent_bodies) == 1
+    assert f"auto-coder-two-tier-review:v1:" in sent_bodies[0]
+    assert '"requirements_text":"REQ-001: Preserve the accepted payload."' in sent_bodies[0]
+    published_payload = json.loads(sent_bodies[0].split("```json\n", 1)[1].split("\n```", 1)[0])
+    assert published_payload["verdict"] == verdict
+    assert [item["finding_id"] for item in published_payload["findings"]] == (["finding-1"] if verdict == "FINDINGS" else [])
+    if findings:
+        assert published_payload["findings"][0]["origin_round_id"] == claim.claim_id
+        assert published_payload["findings"][0]["focused_regression_scenario"] == "Assert the unanchored provider payload."
+    snapshot = cycle.snapshot(42)
+    assert snapshot.accepted_strong_round is not None
+    assert snapshot.accepted_strong_round.round_id == accepted.round_id
+    assert snapshot.accepted_strong_round.publication_status == PUBLICATION_ACKNOWLEDGED
+    operations = json.loads((tmp_path / ".auto-coder" / "owner/repo" / "pr_review_effects.json").read_text())["operations"]
+    assert list(operations.values())[0]["receipt"] == "987"
+    assert list(operations.values())[0]["status"] == CONFIRMED
+
+
+@pytest.mark.parametrize("remote_state", ["published", "absent", "unavailable"])
+def test_production_consumer_recovers_with_a_new_executor(tmp_path, monkeypatch, remote_state):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    payload = _payload()
+    contract = ContractSnapshot(payload.contract_issue_ids, payload.requirements_text)
+    policy = StrongPolicyIdentity(payload.policy_route, payload.policy_options, payload.policy_protocol)
+    cycle = PrReviewCycleRepository("owner/repo", tmp_path / "cycle.json")
+    cycle.record_ordinary_pass(42, RoundProvenance("head-a", "base-a"), contract)
+    claim = cycle.claim_strong_audit(42, RoundProvenance("head-a", "base-a"), contract, policy)
+    cycle.record_strong_result(42, claim.claim_id, "FINDINGS", "reviewer/model", [replace(payload.findings[0], origin_round_id=claim.claim_id)])
+    inputs = pr_processor.TwoTierGateInputs(TwoTierPrGate("owner/repo", cycle), contract, policy, "head-a", "base-a")
+    calls = []
+
+    class Reviewer:
+        def __init__(self, config):
+            pass
+
+        def publish_exact_pr_review(self, repo, number, head, body, authorize, comments=()):
+            assert authorize()
+            assert len(comments) == 1
+            calls.append("send")
+            return ReviewPublicationResult(len(calls) > 1, "receipt" if len(calls) > 1 else "", "response lost")
+
+        def find_exact_pr_review(self, repo, number, head, body, comments=()):
+            calls.append("reconcile")
+            assert len(comments) == 1
+            return ReviewPublicationResult(remote_state == "published", "receipt" if remote_state == "published" else "", "Exact authenticated review was not found" if remote_state == "absent" else "lookup unavailable")
+
+    monkeypatch.setattr(pr_processor, "load_reviewer_app_config", lambda repo_name: object())
+    monkeypatch.setattr(pr_processor, "GitHubAppReviewer", Reviewer)
+    assert pr_processor._consume_pending_two_tier_publication("owner/repo", 42, inputs)[0] is False
+    published, reason = pr_processor._consume_pending_two_tier_publication("owner/repo", 42, inputs)
+    assert published is (remote_state != "unavailable")
+    assert calls == (["send", "reconcile", "send"] if remote_state == "absent" else ["send", "reconcile"])
+    assert cycle.snapshot(42).accepted_strong_round.publication_status == ("PENDING" if remote_state == "unavailable" else PUBLICATION_ACKNOWLEDGED)
+    assert "publication uncertain" in reason if remote_state == "unavailable" else "receipt receipt" in reason
+
+
+@pytest.mark.parametrize("disposition", ["FIXED", "INVALID"])
+@pytest.mark.parametrize("failure", ["none", "reply", "resolve", "lost_response", "changed_head", "reply_changed_head", "reply_discussion", "stale_head", "missing_root", "untrusted_root", "truncated_thread"])
+def test_accepted_closure_resolves_only_its_authenticated_finding_and_resumes(tmp_path, monkeypatch, disposition, failure):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    contract = ContractSnapshot(("#2209",), "REQ-001: Preserve the accepted payload.")
+    policy = StrongPolicyIdentity("strong-route", "options", "v1")
+    cycle = PrReviewCycleRepository("owner/repo", tmp_path / "cycle.json")
+    cycle.record_ordinary_pass(42, RoundProvenance("head-a", "base-a"), contract)
+    claim = cycle.claim_strong_audit(42, RoundProvenance("head-a", "base-a"), contract, policy)
+    finding = replace(_payload().findings[0], origin_round_id=claim.claim_id)
+    strong = cycle.record_strong_result(42, claim.claim_id, "FINDINGS", "reviewer/model", [finding])
+    inputs = pr_processor.TwoTierGateInputs(TwoTierPrGate("owner/repo", cycle), contract, policy, "head-a", "base-a")
+    roots = []
+    publications = []
+    calls = []
+    stages = []
+    active_failure = "none"
+
+    class Reviewer:
+        def __init__(self, config):
+            pass
+
+        def publish_exact_pr_review(self, repo, number, head, body, authorize, comments=()):
+            assert authorize()
+            publications.append(body)
+            if comments:
+                roots.append(ObservedRoot(12, comments[0].body, True))
+            return ReviewPublicationResult(True, "review-receipt")
+
+        def observe_authenticated_review_roots(self, repo, number, head):
+            assert head == strong.head_sha
+            return RootObservation(tuple(replace(root, authenticated=active_failure != "untrusted_root") for root in roots), True)
+
+    class Client:
+        head = "head-b"
+        resolved = False
+        replies = []
+
+        def get_pull_request_head_sha_strict(self, repo, number):
+            return self.head
+
+        def get_authenticated_user_login(self):
+            return "controller[bot]"
+
+        def get_pr_review_threads_strict(self, repo, number):
+            if active_failure == "missing_root":
+                return []
+            return [
+                ReviewThread(id="finding-thread", is_resolved=self.resolved, comments=[ReviewThreadComment(database_id=12, author_id=4765828, author_login="reviewer[bot]", body=roots[0].body), *self.replies], comments_truncated=active_failure == "truncated_thread"),
+                ReviewThread(id="human-thread", is_resolved=False, comments=[ReviewThreadComment(database_id=13, author_id=99, author_login="human", body="Unrelated human finding")]),
+            ]
+
+        def reply_to_review_thread(self, repo, number, root, body):
+            assert root == 12
+            assert "auto-coder-review-thread-closure:v1" in body and "head-b" in body and "Verified correction evidence" in body
+            calls.append("reply")
+            if active_failure == "reply":
+                raise RuntimeError("reply unavailable")
+            self.replies.append(ReviewThreadComment(database_id=14, author_id=42, author_login="controller[bot]", body=body, in_reply_to_id=root))
+            if active_failure == "reply_changed_head":
+                self.head = "head-c"
+            if active_failure == "reply_discussion":
+                self.replies.append(ReviewThreadComment(database_id=15, author_id=88, author_login="reviewer", body="New counterexample", in_reply_to_id=root))
+
+        def update_review_thread_comment(self, repo, comment_id, body):
+            assert comment_id == 14
+            self.replies[0].body = body
+
+        def resolve_review_thread(self, thread):
+            assert thread == "finding-thread"
+            calls.append("resolve")
+            if active_failure == "resolve":
+                raise RuntimeError("mutation unavailable")
+            self.resolved = True
+            if active_failure == "changed_head":
+                self.head = "head-c"
+            if active_failure == "lost_response":
+                raise RuntimeError("mutation response lost")
+
+        def unresolve_review_thread(self, thread):
+            assert thread == "finding-thread"
+            calls.append("unresolve")
+            self.resolved = False
+
+    client = Client()
+    original_closure_payload = AcceptedReviewPayload.closure
+
+    def closure_payload(*args, **kwargs):
+        payload = original_closure_payload(*args, **kwargs)
+        return replace(payload, discussion_evidence=(("finding-thread", validated_digest),))
+
+    monkeypatch.setattr(AcceptedReviewPayload, "closure", staticmethod(closure_payload))
+    monkeypatch.setattr(pr_processor, "load_reviewer_app_config", lambda repo_name: object())
+    monkeypatch.setattr(pr_processor, "GitHubAppReviewer", Reviewer)
+    monkeypatch.setattr(pr_processor.GitHubClient, "get_instance", lambda: client)
+    monkeypatch.setattr(pr_processor, "_record_pr_stage", lambda *args: stages.append(args))
+    assert pr_processor._consume_pending_two_tier_publication("owner/repo", 42, inputs)[0] is True
+    assert calls == []  # OPEN findings never authorize resolution.
+    validated_digest = substantive_discussion_digest(client.get_pr_review_threads_strict("owner/repo", 42)[0], "controller[bot]")
+    snapshot = cycle.record_ordinary_pass(42, RoundProvenance("head-b", "base-a"), contract)
+    cycle.certify_closure(42, RoundProvenance("head-b", "base-a"), contract, policy, strong.round_id, snapshot.finding_set_revision, [FindingDisposition(finding.finding_id, disposition, "Verified correction evidence", "head-b")], bounded=True, bounded_evidence="Only the finding was corrected")
+    inputs = replace(inputs, head_sha="head-b")
+    active_failure = failure
+    if failure == "stale_head":
+        client.head = "head-c"
+
+    published, reason = pr_processor._consume_pending_two_tier_publication("owner/repo", 42, inputs)
+    assert published is (failure == "none"), reason
+    assert len(publications) == 2
+    assert stages[-1][1] == "pr.review-thread-closure"
+    assert stages[-1][-1]["confirmed_count"] == int(failure == "none")
+    assert stages[-1][-1]["unfinished_count"] == int(failure != "none")
+    if failure == "none":
+        assert client.resolved is True
+        assert calls == ["reply", "resolve"]
+        assert cycle.snapshot(42).accepted_closure.publication_status == PUBLICATION_ACKNOWLEDGED
+    else:
+        assert cycle.snapshot(42).pending_effect == "CLOSURE_PUBLICATION"
+        assert cycle.snapshot(42).accepted_closure.publication_status == "PENDING"
+        if failure == "changed_head":
+            assert calls == ["reply", "resolve", "unresolve"]
+            assert client.resolved is False
+        if failure in {"missing_root", "untrusted_root", "stale_head", "truncated_thread"}:
+            assert calls == []
+        if failure == "reply_changed_head":
+            assert calls == ["reply"]
+            assert client.resolved is False
+        if failure == "reply_discussion":
+            from auto_coder.review_thread_closure_receipt import parse_owned_receipt
+
+            receipt = parse_owned_receipt(client.get_pr_review_threads_strict("owner/repo", 42)[0], "controller[bot]")
+            assert receipt is not None and receipt.phase == "ROLLED_BACK"
+            assert calls == ["reply"] and not client.resolved
+            return
+        prior_resolves = calls.count("resolve")
+        active_failure = "none"
+        client.head = "head-b"
+        published, reason = pr_processor._consume_pending_two_tier_publication("owner/repo", 42, inputs)
+        assert published is True, reason
+        assert client.resolved is True
+        assert len(publications) == 2  # Confirmed closure publication is never resent.
+        assert calls.count("resolve") == prior_resolves + int(failure != "lost_response")
+        assert cycle.snapshot(42).accepted_closure.publication_status == PUBLICATION_ACKNOWLEDGED
+    from auto_coder.review_thread_closure_receipt import parse_owned_receipt
+
+    receipt = parse_owned_receipt(client.get_pr_review_threads_strict("owner/repo", 42)[0], "controller[bot]")
+    assert receipt is not None and receipt.phase == "RESOLVED"
+    assert len(client.replies) == 1
+
+
+def test_closure_payload_attribution_is_explicit_and_leaves_legacy_identity_unchanged() -> None:
+    import json
+
+    from auto_coder.pr_review_effects import AcceptedReviewPayload
+
+    base = dict(
+        repository="owner/repo",
+        pr_number=7,
+        open_epoch=0,
+        mode="ORDINARY_CLOSURE",
+        round_id="round",
+        attempt=1,
+        audited_head="a" * 40,
+        target_head="b" * 40,
+        base_sha="c" * 40,
+        contract_identity="m",
+        contract_issue_ids=("#1",),
+        requirements_text="REQ-001: x",
+        policy_identity="p",
+        policy_route="strong",
+        policy_options="",
+        policy_protocol="v1",
+        finding_set_revision=1,
+        reviewer_provenance="strong/model",
+        verdict="CLOSURE",
+        findings=(),
+    )
+    legacy = AcceptedReviewPayload(**base)
+    attributed = AcceptedReviewPayload(**base, ordinary_attempt_id="attempt-9", ordinary_attempt_sequence=9, ordinary_reviewer="ordinary/model")
+
+    assert "ordinary_attempt_id" not in json.loads(legacy.canonical_json())  # a payload that predates attribution keeps its identity
+    assert json.loads(attributed.canonical_json())["ordinary_reviewer"] == "ordinary/model"
+    assert attributed.identity != legacy.identity

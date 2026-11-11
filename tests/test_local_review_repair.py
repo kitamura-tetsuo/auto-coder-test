@@ -1,0 +1,1053 @@
+"""Regression tests for durable explicit-local review correction."""
+
+import multiprocessing
+import os
+import sqlite3
+import subprocess
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from auto_coder.durable_repair_allowance import RepairAllowanceLedger
+from auto_coder.git_commit import git_push
+from auto_coder.llm_backend_config import get_active_repo_name
+from auto_coder.local_review_repair import (
+    LocalBackendUnavailableError,
+    LocalReviewRepairOutcome,
+    LocalReviewRepairRequest,
+    LocalReviewRepairStore,
+    _default_executor,
+    admit_local_repair_allowance,
+    execute_local_review_repair,
+    select_local_review_repair_candidates,
+)
+from auto_coder.pr_processor import (
+    ReviewRepairRouteDecision,
+    ReviewRepairRouteDisposition,
+    _delegate_cloud_review_thread_repair,
+)
+from auto_coder.util.gh_cache import PullRequestRoutingMetadata, ReviewThread, ReviewThreadComment
+
+
+def _request(*, feedback: tuple[str, ...] = ("comment-1",)) -> LocalReviewRepairRequest:
+    return LocalReviewRepairRequest(
+        repository="owner/repo",
+        pr_number=42,
+        head_repository="owner/repo",
+        head_ref="issue-7_attempt-1",
+        head_sha="abc123",
+        feedback_identities=feedback,
+        prompt="repair exact finding",
+    )
+
+
+def _git(cwd: Path, *args: str) -> str:
+    result = subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
+    return result.stdout.strip()
+
+
+def _repository(tmp_path: Path) -> tuple[Path, str]:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _git(repository, "init")
+    _git(repository, "config", "user.name", "Test User")
+    _git(repository, "config", "user.email", "test@example.com")
+    (repository / "tracked.txt").write_text("base\n", encoding="utf-8")
+    _git(repository, "add", "tracked.txt")
+    _git(repository, "commit", "-m", "base")
+    return repository, _git(repository, "rev-parse", "HEAD")
+
+
+def test_store_serializes_same_pr_and_retains_indeterminate_execution(tmp_path: Path) -> None:
+    first_store = LocalReviewRepairStore(tmp_path / "repairs.sqlite3")
+    second_store = LocalReviewRepairStore(tmp_path / "repairs.sqlite3")
+    request = _request()
+
+    claim = first_store.admit(request)
+    assert (claim.admitted, claim.phase) == (True, "executing")
+    duplicate = second_store.admit(request)
+    assert (duplicate.admitted, duplicate.phase) == (False, "executing")
+    assert first_store.transition(request, claim, "indeterminate", reason="provider response lost") is True
+    retained = second_store.admit(request)
+    assert (retained.admitted, retained.phase) == (False, "indeterminate")
+
+
+def test_dead_owner_restarts_in_fresh_checkout_and_preserves_partial_output(tmp_path, monkeypatch, _use_custom_subprocess_mock):
+    repository, head = _repository(tmp_path)
+    monkeypatch.chdir(repository)
+    database = tmp_path / "repairs.sqlite3"
+    request = replace(_request(), head_sha=head)
+
+    def crash():
+        def edit_and_exit(_request, worktree):
+            Path(worktree, "tracked.txt").write_text("interrupted edit\n", encoding="utf-8")
+            os._exit(17)
+
+        execute_local_review_repair(request, store=LocalReviewRepairStore(database), executor=edit_and_exit)
+
+    process = multiprocessing.get_context("fork").Process(target=crash)
+    process.start()
+    process.join(15)
+    try:
+        assert process.exitcode == 17
+        store = LocalReviewRepairStore(database)
+        old = store.get(request)
+        assert old.phase == "executing"
+        assert Path(old.workspace_path, "tracked.txt").read_text() == "interrupted edit\n"
+        invocations = []
+
+        def retry(_request, worktree):
+            invocations.append(worktree)
+            assert Path(worktree, "tracked.txt").read_text() == "base\n"
+            return "ACTION_SUMMARY: checked"
+
+        result = execute_local_review_repair(request, store=store, executor=retry)
+        assert result.phase == "completed_no_change"
+        assert len(invocations) == 1
+        assert invocations[0] != old.workspace_path
+        assert Path(old.workspace_path, "tracked.txt").read_text() == "interrupted edit\n"
+        assert store.get(request).incarnation != old.incarnation
+        from auto_coder.local_review_repair import LocalReviewRepairClaim
+
+        assert store.transition(request, LocalReviewRepairClaim(True, "executing", old.attempt_id, old.incarnation), "terminal_failure") is False
+        assert execute_local_review_repair(request, store=store, executor=retry).phase == "completed_no_change"
+        assert len(invocations) == 1
+    finally:
+        if process.is_alive():
+            process.kill()
+            process.join()
+
+
+def test_live_owner_in_another_process_is_never_restarted(tmp_path):
+    database = tmp_path / "repairs.sqlite3"
+    context = multiprocessing.get_context("fork")
+    ready, stop = context.Event(), context.Event()
+
+    def own_claim():
+        LocalReviewRepairStore(database).admit(_request())
+        ready.set()
+        stop.wait(15)
+
+    process = context.Process(target=own_claim)
+    process.start()
+    try:
+        assert ready.wait(10)
+        store = LocalReviewRepairStore(database)
+        claim = store.admit(_request())
+        assert (claim.admitted, claim.phase) == (False, "executing")
+        assert store.admit(_request(feedback=("different",))).admitted is False
+    finally:
+        stop.set()
+        process.join(10)
+        if process.is_alive():
+            process.kill()
+            process.join()
+
+
+def test_concurrent_dead_owner_recovery_admits_exactly_one_retry(tmp_path):
+    database = tmp_path / "repairs.sqlite3"
+
+    def abandoned():
+        LocalReviewRepairStore(database).admit(_request())
+        os._exit(27)
+
+    process = multiprocessing.get_context("fork").Process(target=abandoned)
+    process.start()
+    process.join(10)
+    try:
+        assert process.exitcode == 27
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            claims = list(pool.map(lambda _: LocalReviewRepairStore(database).admit(_request()), range(4)))
+        assert sum(claim.admitted for claim in claims) == 1
+        assert {claim.phase for claim in claims} == {"executing"}
+        assert len({claim.incarnation for claim in claims}) == 1
+    finally:
+        if process.is_alive():
+            process.kill()
+            process.join()
+
+
+def test_existing_database_migration_preserves_legacy_claim_without_guessing_owner(tmp_path):
+    database = tmp_path / "repairs.sqlite3"
+    store = LocalReviewRepairStore(database)
+    original = store.admit(_request())
+    with sqlite3.connect(database) as connection:
+        for column in ("owner_pid", "owner_boot_id", "owner_start_ticks"):
+            connection.execute(f"ALTER TABLE local_review_repair_attempts DROP COLUMN {column}")
+    migrated = LocalReviewRepairStore(database)
+    claim = migrated.admit(_request())
+    assert (claim.admitted, claim.phase, claim.incarnation) == (False, "executing", original.incarnation)
+    assert migrated.get(_request()).head_sha == "abc123"
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT owner_pid, owner_boot_id, owner_start_ticks FROM local_review_repair_attempts").fetchone() == (None, None, None)
+
+
+@pytest.mark.parametrize("ownership", ["missing", "unreadable", "reused-pid", "reboot", "zombie"])
+def test_recovery_requires_positive_owner_exit_evidence(tmp_path, ownership):
+    from auto_coder.process_identity import ProcessIdentity, read_process_identity
+
+    store = LocalReviewRepairStore(tmp_path / "repairs.sqlite3")
+    request = _request()
+    original = store.admit(request)
+    owner = read_process_identity(os.getpid())
+    assert owner is not None
+    if ownership == "missing":
+        with sqlite3.connect(store.path) as connection:
+            connection.execute("UPDATE local_review_repair_attempts SET owner_pid=NULL, owner_boot_id=NULL, owner_start_ticks=NULL")
+        current = owner
+    elif ownership == "unreadable":
+        current = None
+    elif ownership == "reused-pid":
+        current = replace(owner, start_ticks=owner.start_ticks + 1)
+    elif ownership == "reboot":
+        current = replace(owner, boot_id="another-boot")
+    else:
+        current = ProcessIdentity(owner.pid, owner.boot_id, owner.start_ticks, "Z")
+    with patch("auto_coder.local_review_repair.read_process_identity", return_value=current):
+        claim = store.admit(request)
+    expected = ownership in {"reused-pid", "reboot", "zombie"}
+    assert claim.admitted is expected
+    assert claim.phase == "executing"
+    assert (claim.incarnation != original.incarnation) is expected
+
+
+def test_dead_owner_committed_output_resumes_publication_without_model(tmp_path, monkeypatch, _use_custom_subprocess_mock):
+    repository, head = _repository(tmp_path)
+    remote = tmp_path / "remote.git"
+    _git(tmp_path, "init", "--bare", str(remote))
+    _git(repository, "remote", "add", "origin", str(remote))
+    _git(repository, "push", "origin", f"{head}:refs/heads/repair-head")
+    monkeypatch.chdir(repository)
+    database = tmp_path / "repairs.sqlite3"
+    allowance_database = tmp_path / "allowance.sqlite3"
+    request = replace(_request(), head_sha=head, head_ref="repair-head")
+    worktree = tmp_path / "retained"
+
+    def commit_then_crash():
+        authority, reason = admit_local_repair_allowance(request, RepairAllowanceLedger(allowance_database))
+        assert reason == ""
+        authority.mark_invocation()
+        store = LocalReviewRepairStore(database)
+        claim = store.admit(request)
+        _git(repository, "worktree", "add", "--detach", str(worktree), head)
+        store.transition(request, claim, "executing", workspace_path=str(worktree))
+        Path(worktree, "tracked.txt").write_text("committed correction\n")
+        _git(worktree, "add", "tracked.txt")
+        _git(worktree, "commit", "-m", "correction")
+        os._exit(19)
+
+    process = multiprocessing.get_context("fork").Process(target=commit_then_crash)
+    process.start()
+    process.join(15)
+    try:
+        assert process.exitcode == 19
+        executor = MagicMock()
+        ledger = RepairAllowanceLedger(allowance_database)
+        authority, reason = admit_local_repair_allowance(request, ledger)
+        assert reason == ""
+        result = execute_local_review_repair(request, store=LocalReviewRepairStore(database), executor=executor, allowance_authority=authority)
+        assert result.phase == "awaiting_validation"
+        assert result.published is True
+        executor.assert_not_called()
+        assert _git(tmp_path, "--git-dir", str(remote), "show", "refs/heads/repair-head:tracked.txt") == "committed correction"
+        from auto_coder.durable_repair_allowance import GenerationLifecycleState
+
+        assert ledger.get_snapshot("https://api.github.com", "owner/repo", 42).get_outstanding_generation().lifecycle_state == GenerationLifecycleState.PENDING_REVALIDATION
+    finally:
+        if process.is_alive():
+            process.kill()
+            process.join()
+
+
+def test_distinct_feedback_is_admitted_after_prior_completion(tmp_path: Path) -> None:
+    store = LocalReviewRepairStore(tmp_path / "repairs.sqlite3")
+    original = _request()
+    later = _request(feedback=("comment-1", "comment-2"))
+
+    original_claim = store.admit(original)
+    assert original_claim.admitted is True
+    assert store.admit(later).admitted is False
+    assert store.transition(original, original_claim, "awaiting_validation", result_sha="result-a") is True
+    assert store.admit(later).admitted is True
+    assert later.attempt_id != original.attempt_id
+
+
+def test_not_started_readmission_respects_other_active_claim_and_fences_old_incarnation(tmp_path: Path) -> None:
+    first_store = LocalReviewRepairStore(tmp_path / "repairs.sqlite3")
+    second_store = LocalReviewRepairStore(tmp_path / "repairs.sqlite3")
+    request_a = _request(feedback=("comment-a",))
+    request_b = _request(feedback=("comment-b",))
+    first_claim = first_store.admit(request_a)
+    assert first_store.transition(request_a, first_claim, "not_started") is True
+    claim_b = second_store.admit(request_b)
+    assert claim_b.admitted is True
+
+    blocked_a = first_store.admit(request_a)
+    assert blocked_a.admitted is False
+    assert blocked_a.attempt_id == request_b.attempt_id
+
+    assert second_store.transition(request_b, claim_b, "awaiting_validation") is True
+    new_claim_a = first_store.admit(request_a)
+    assert new_claim_a.admitted is True
+    assert new_claim_a.incarnation != first_claim.incarnation
+    assert first_store.transition(request_a, first_claim, "completed_no_change") is False
+    assert first_store.get(request_a).phase == "executing"
+
+
+def test_candidate_selection_excludes_task_only_types_and_preserves_ranked_groups() -> None:
+    config = MagicMock()
+    config.get_ordinary_priority_groups.return_value = [["jules-task", "local-b"], ["cloud-task", "local-a"]]
+    config.resolve_backend_type.side_effect = {
+        "jules-task": "jules",
+        "local-b": "codex",
+        "cloud-task": "codex-cloud",
+        "local-a": "claude",
+    }.get
+
+    with (
+        patch("auto_coder.local_review_repair.get_llm_config", return_value=config),
+        patch("auto_coder.quota_selector.rank_high_score_backends_by_quota", return_value=["local-b", "local-a"]) as rank,
+    ):
+        selected = select_local_review_repair_candidates("target/repo")
+
+    assert selected == ["local-b", "local-a"]
+    rank.assert_called_once_with([["local-b"], ["local-a"]], config)
+
+
+def test_candidate_selection_reads_target_repository_effective_config() -> None:
+    config = MagicMock()
+    config.get_ordinary_priority_groups.return_value = [["target-alias"]]
+    config.resolve_backend_type.return_value = "codex"
+    with (
+        patch("auto_coder.local_review_repair.get_llm_config", return_value=config) as load_config,
+        patch("auto_coder.quota_selector.rank_high_score_backends_by_quota", return_value=["target-alias"]),
+    ):
+        assert select_local_review_repair_candidates("owner/target") == ["target-alias"]
+
+    load_config.assert_called_once_with(repo_name="owner/target")
+
+
+def test_executor_builds_alias_models_and_options_inside_target_repository_context() -> None:
+    config = MagicMock()
+    config.get_ordinary_priority_groups.return_value = [["target-alias"]]
+    config.resolve_backend_type.return_value = "codex"
+    config.get_model_for_backend.return_value = "target-model"
+    manager = MagicMock()
+    manager.run_prompt.return_value = "ACTION_SUMMARY: fixed"
+    observed_contexts: list[str | None] = []
+
+    def build_manager(**_kwargs):
+        observed_contexts.append(get_active_repo_name())
+        return manager
+
+    with (
+        patch("auto_coder.local_review_repair.get_llm_config", return_value=config),
+        patch("auto_coder.quota_selector.rank_high_score_backends_by_quota", return_value=["target-alias"]),
+        patch("auto_coder.cli_helpers.build_backend_manager", side_effect=build_manager) as build,
+    ):
+        result = _default_executor(_request(), "/target/worktree")
+
+    assert result == "ACTION_SUMMARY: fixed"
+    assert observed_contexts == ["owner/repo"]
+    assert build.call_args.kwargs["selected_backends"] == ["target-alias"]
+    assert build.call_args.kwargs["models"] == {"target-alias": "target-model"}
+    manager.run_prompt.assert_called_once_with("repair exact finding")
+
+
+def test_production_allowance_admission_is_attributable_and_idempotent(tmp_path: Path) -> None:
+    ledger = RepairAllowanceLedger(tmp_path / "allowance.sqlite3")
+    first, reason = admit_local_repair_allowance(_request(), ledger)
+    assert reason == ""
+    assert first is not None
+    second, reason = admit_local_repair_allowance(_request(), ledger)
+    assert reason == ""
+    assert second is not None
+    assert second.generation_id == first.generation_id
+    snapshot = ledger.get_snapshot("https://api.github.com", "owner/repo", 42)
+    assert len(snapshot.generations) == 1
+    assert snapshot.generations[0].owning_identity == "local-review-repair"
+    assert snapshot.generations[0].covered_blocker_ids == ("comment-1",)
+
+
+def test_unreadable_production_allowance_prevents_local_route_execution() -> None:
+    evidence = PullRequestRoutingMetadata(
+        api_origin="https://api.github.com",
+        repository="owner/repo",
+        number=42,
+        state="open",
+        body="<!-- auto-coder:local-llm -->\nCloses #7",
+        head_repository="owner/repo",
+        head_ref="repair-head",
+        head_sha="abc123",
+    )
+    route = ReviewRepairRouteDecision(ReviewRepairRouteDisposition.LOCAL_REQUIRED, "local", evidence)
+    thread = ReviewThread(id="thread", comments=[ReviewThreadComment(database_id=1, body="fix it", author_login="reviewer")])
+    pr_data = {"number": 42, "body": evidence.body, "head": {"ref": "repair-head", "sha": "abc123"}, "base": {"ref": "main"}}
+    with (
+        patch("auto_coder.pr_processor._select_review_repair_route", return_value=route),
+        patch("auto_coder.pr_processor._revalidate_local_review_repair_route", return_value=route),
+        patch("auto_coder.pr_processor.get_linked_issues_context", return_value="REQ-004"),
+        patch("auto_coder.local_review_repair.admit_local_repair_allowance", side_effect=OSError("allowance unreadable")),
+        patch("auto_coder.local_review_repair.execute_local_review_repair") as execute,
+    ):
+        result = _delegate_cloud_review_thread_repair("owner/repo", pr_data, MagicMock(), (thread,), config=MagicMock())
+
+    assert result.local_phase == "not_admitted"
+    assert "allowance unreadable" in result[0]
+    execute.assert_not_called()
+
+
+def test_backend_unavailable_is_definitely_not_started_and_retryable(tmp_path: Path, monkeypatch, _use_custom_subprocess_mock) -> None:
+    repository, head = _repository(tmp_path)
+    monkeypatch.chdir(repository)
+    store = LocalReviewRepairStore(tmp_path / "repairs.sqlite3")
+    request = replace(_request(), head_sha=head)
+    with patch("auto_coder.local_review_repair._prepare_default_executor", side_effect=LocalBackendUnavailableError("temporarily unavailable")):
+        first = execute_local_review_repair(request, store=store)
+    assert first.phase == "backend_unavailable"
+    assert first.executed is False
+    assert store.get(request) is None
+
+    invocation = MagicMock(return_value="ACTION_SUMMARY: complete")
+    with patch("auto_coder.local_review_repair._prepare_default_executor", return_value=invocation):
+        second = execute_local_review_repair(request, store=store)
+    assert second.phase == "completed_no_change"
+    invocation.assert_called_once()
+
+
+def test_cannot_fix_is_terminal_failure_not_no_change(tmp_path: Path, monkeypatch, _use_custom_subprocess_mock) -> None:
+    repository, head = _repository(tmp_path)
+    monkeypatch.chdir(repository)
+    store = LocalReviewRepairStore(tmp_path / "repairs.sqlite3")
+    outcome = execute_local_review_repair(replace(_request(), head_sha=head), store=store, executor=MagicMock(return_value="CANNOT_FIX"))
+
+    assert outcome.phase == "terminal_failure"
+    assert outcome.executed is True
+    assert store.get(replace(_request(), head_sha=head)).phase == "terminal_failure"
+
+
+def test_production_boundary_retries_identical_definitely_not_started_request(tmp_path: Path, monkeypatch, _use_custom_subprocess_mock) -> None:
+    repository, _head = _repository(tmp_path)
+    monkeypatch.chdir(repository)
+    store = LocalReviewRepairStore(tmp_path / "repairs.sqlite3")
+    request = LocalReviewRepairRequest(
+        repository="owner/repo",
+        pr_number=42,
+        head_repository="owner/repo",
+        head_ref="repair-head",
+        head_sha="future-head",
+        feedback_identities=("comment-1",),
+        prompt="repair",
+    )
+    executor = MagicMock(return_value="ACTION_SUMMARY: no change")
+
+    first = execute_local_review_repair(request, store=store, executor=executor)
+    assert first.phase == "not_started"
+    executor.assert_not_called()
+
+    _git(repository, "branch", "future-head", "HEAD")
+    second = execute_local_review_repair(request, store=store, executor=executor)
+
+    assert second.phase == "completed_no_change"
+    assert second.executed is True
+    executor.assert_called_once()
+
+
+def test_production_boundary_admits_later_feedback_after_completed_attempt(tmp_path: Path, monkeypatch, _use_custom_subprocess_mock) -> None:
+    repository, head = _repository(tmp_path)
+    monkeypatch.chdir(repository)
+    store = LocalReviewRepairStore(tmp_path / "repairs.sqlite3")
+    first = _request(feedback=("comment-a",))
+    second = _request(feedback=("comment-a", "comment-b"))
+    first = replace(first, head_sha=head)
+    second = replace(second, head_sha=head)
+    executor = MagicMock(return_value="ACTION_SUMMARY: no change")
+
+    first_outcome = execute_local_review_repair(first, store=store, executor=executor)
+    second_outcome = execute_local_review_repair(second, store=store, executor=executor)
+
+    assert first_outcome.phase == "completed_no_change"
+    assert second_outcome.phase == "completed_no_change"
+    assert executor.call_count == 2
+
+
+def test_publication_pending_resumes_without_rerunning_executor(tmp_path: Path, monkeypatch, _use_custom_subprocess_mock) -> None:
+    repository, head = _repository(tmp_path)
+    remote = tmp_path / "remote.git"
+    _git(tmp_path, "init", "--bare", str(remote))
+    _git(repository, "remote", "add", "origin", str(remote))
+    _git(repository, "push", "origin", f"{head}:refs/heads/repair-head")
+    monkeypatch.chdir(repository)
+    store = LocalReviewRepairStore(tmp_path / "repairs.sqlite3")
+    request = replace(_request(), head_sha=head, head_ref="repair-head")
+
+    def edit(_request, worktree: str) -> str:
+        worktree_path = Path(worktree)
+        (worktree_path / "tracked.txt").write_text("corrected\n", encoding="utf-8")
+        (worktree_path / "test_regression.py").write_text("def test_fixed():\n    assert True\n", encoding="utf-8")
+        return "ACTION_SUMMARY: corrected"
+
+    executor = MagicMock(side_effect=edit)
+    rejected = MagicMock(success=False, stderr="response lost", stdout="", returncode=1)
+    with patch("auto_coder.local_review_repair.git_push", return_value=rejected) as push:
+        first = execute_local_review_repair(request, store=store, executor=executor)
+    retained = store.get(request)
+    assert retained is not None
+    _git(repository, "push", "origin", f"{retained.result_sha}:refs/heads/repair-head")
+    reconstructed = replace(request, head_sha=retained.result_sha, feedback_identities=("comment-1", "comment-2"))
+    with patch("auto_coder.local_review_repair.git_push") as recovery_push, patch("auto_coder.local_review_repair._prepare_default_executor") as prepare:
+        second = execute_local_review_repair(reconstructed, store=store)
+
+    assert first.phase == "publication_pending"
+    assert second.phase == "awaiting_validation"
+    assert second.published is True
+    executor.assert_called_once()
+    push.assert_called_once()
+    recovery_push.assert_not_called()
+    prepare.assert_not_called()
+
+
+def test_unstaged_output_is_committed_and_published_to_existing_branch(tmp_path: Path, monkeypatch, _use_custom_subprocess_mock) -> None:
+    repository, head = _repository(tmp_path)
+    remote = tmp_path / "remote.git"
+    _git(tmp_path, "init", "--bare", str(remote))
+    _git(repository, "remote", "add", "origin", str(remote))
+    _git(repository, "push", "origin", f"{head}:refs/heads/repair-head")
+    monkeypatch.chdir(repository)
+
+    def edit(_request, worktree: str) -> str:
+        path = Path(worktree)
+        (path / "tracked.txt").write_text("corrected\n", encoding="utf-8")
+        (path / "test_regression.py").write_text("def test_fixed():\n    assert True\n", encoding="utf-8")
+        return "ACTION_SUMMARY: corrected"
+
+    request = replace(_request(), head_sha=head, head_ref="repair-head")
+    outcome = execute_local_review_repair(request, store=LocalReviewRepairStore(tmp_path / "repairs.sqlite3"), executor=edit)
+
+    assert outcome.phase == "awaiting_validation"
+    published = _git(repository, "show", f"{outcome.reason.split()[1]}:tracked.txt")
+    added_test = _git(repository, "show", f"{outcome.reason.split()[1]}:test_regression.py")
+    assert published == "corrected"
+    assert "assert True" in added_test
+    assert _git(tmp_path, "--git-dir", str(remote), "rev-parse", "refs/heads/repair-head") == outcome.reason.split()[1]
+
+
+def test_commit_failure_preserves_corrective_workspace(tmp_path: Path, monkeypatch, _use_custom_subprocess_mock) -> None:
+    repository, head = _repository(tmp_path)
+    monkeypatch.chdir(repository)
+    store = LocalReviewRepairStore(tmp_path / "repairs.sqlite3")
+    request = replace(_request(), head_sha=head)
+
+    def edit(_request, worktree: str) -> str:
+        Path(worktree, "tracked.txt").write_text("recover me\n", encoding="utf-8")
+        Path(worktree, "new_test.py").write_text("def test_recovery(): pass\n", encoding="utf-8")
+        return "ACTION_SUMMARY: corrected"
+
+    failed = MagicMock(success=False, stderr="hook failure", stdout="", returncode=1)
+    with patch("auto_coder.local_review_repair.git_commit_with_retry", return_value=failed):
+        outcome = execute_local_review_repair(request, store=store, executor=edit)
+
+    record = store.get(request)
+    assert outcome.phase == "indeterminate"
+    assert record is not None
+    workspace = Path(record.workspace_path)
+    assert workspace.is_dir()
+    assert (workspace / "tracked.txt").read_text(encoding="utf-8") == "recover me\n"
+    assert (workspace / "new_test.py").exists()
+
+
+@pytest.mark.parametrize("body", ["<!-- auto-coder-two-tier-finding:v1 -->\nFix the reachable race.", "Human review: revert the unrelated nullable default change."])
+@pytest.mark.parametrize("shared_reply", [False, True])
+@pytest.mark.parametrize("envelope_author", ["human", "implementer"])
+def test_local_route_invokes_real_execution_boundary_with_two_tier_feedback(body: str, shared_reply: bool, envelope_author: str) -> None:
+    evidence = PullRequestRoutingMetadata(
+        api_origin="https://api.github.com",
+        repository="owner/repo",
+        number=42,
+        state="open",
+        body="<!-- auto-coder:local-llm -->\nCloses #7",
+        head_repository="owner/repo",
+        head_ref="issue-7_attempt-1",
+        head_sha="abc123",
+    )
+    route = ReviewRepairRouteDecision(ReviewRepairRouteDisposition.LOCAL_REQUIRED, "local", evidence)
+    thread = ReviewThread(
+        id="thread-strong",
+        comments=[
+            ReviewThreadComment(
+                database_id=91,
+                author_login="auto-coder-reviewer[bot]",
+                body=body,
+            )
+        ],
+    )
+    if shared_reply:
+        from auto_coder.review_feedback_marker import REVIEW_ADDRESSED_MARKER, REVIEW_GUIDANCE_MARKER
+
+        body += "\n" + REVIEW_GUIDANCE_MARKER
+        thread.comments = [
+            ReviewThreadComment(database_id=89, body="Previous finding", author_login="implementer"),
+            ReviewThreadComment(database_id=90, body="Implemented the fix\n" + REVIEW_ADDRESSED_MARKER, author_login="implementer"),
+            ReviewThreadComment(database_id=91, body=body, author_login="implementer"),
+        ]
+    from auto_coder.review_adjudication import Decision, render_decision
+    from auto_coder.review_feedback_marker import REVIEW_GUIDANCE_MARKER
+
+    envelope = render_decision(Decision("decision", "context", "a" * 40, "digest", "UPHOLD", "FIX", (), "bounded correction", "chatgpt-assisted"))
+    thread.comments.append(ReviewThreadComment(database_id=92, body=envelope + "\n" + REVIEW_GUIDANCE_MARKER, author_login=envelope_author))
+    pr_data = {
+        "number": 42,
+        "body": evidence.body,
+        "head": {"ref": evidence.head_ref, "sha": evidence.head_sha},
+        "base": {"ref": "main"},
+        "user": {"login": "implementer"},
+    }
+
+    with (
+        patch("auto_coder.pr_processor._select_review_repair_route", return_value=route),
+        patch("auto_coder.pr_processor._revalidate_local_review_repair_route", return_value=route),
+        patch("auto_coder.pr_processor.get_linked_issues_context", return_value="REQ-001: preserve the race invariant"),
+        patch("auto_coder.local_review_repair.admit_local_repair_allowance", return_value=(MagicMock(), "")),
+        patch("auto_coder.pr_correction_job.offer_pr_correction_job", return_value=MagicMock(job_id="job-42")) as offer,
+    ):
+        result = _delegate_cloud_review_thread_repair(
+            "owner/repo",
+            pr_data,
+            github_client=MagicMock(),
+            unresolved_threads=(thread,),
+            config=MagicMock(),
+        )
+
+    request = offer.call_args.args[0]
+    from auto_coder.canonical_pr_blocker_ledger import CanonicalPRBlockerLedger
+
+    snapshot = CanonicalPRBlockerLedger().get_snapshot("https://api.github.com", "owner/repo", 42)
+    blockers = snapshot.get_blockers_for_alias("external_review_comment", "comment:91")
+    if not shared_reply:
+        assert snapshot.get_blockers_for_alias("github_root_comment", "91") == blockers
+    else:
+        assert snapshot.get_blockers_for_alias("github_root_comment", "89") == ()
+        assert "Previous finding" not in request.prompt
+        assert "Implemented the fix" not in request.prompt
+    assert len(blockers) == 1
+    assert blockers[0].blocker_id in request.prompt
+    assert blockers[0].accepted_scope.description == body
+    assert body in request.prompt
+    assert "REQ-001: preserve the race invariant" in request.prompt
+    assert "auto-coder-review-adjudication:v1" not in request.prompt
+    assert request.head_ref == "issue-7_attempt-1"
+    assert request.feedback_identities
+    assert result.route_disposition == "LOCAL_EXECUTION"
+    assert result.deferred is True
+    assert "pending" in result[0]
+
+
+def test_local_route_propagates_cannot_fix_as_terminal_failure() -> None:
+    evidence = PullRequestRoutingMetadata(
+        api_origin="https://api.github.com",
+        repository="owner/repo",
+        number=42,
+        state="open",
+        body="<!-- auto-coder:local-llm -->\nCloses #7",
+        head_repository="owner/repo",
+        head_ref="repair-head",
+        head_sha="abc123",
+    )
+    route = ReviewRepairRouteDecision(ReviewRepairRouteDisposition.LOCAL_REQUIRED, "local", evidence)
+    thread = ReviewThread(id="thread", comments=[ReviewThreadComment(database_id=1, body="fix it")])
+    pr_data = {"number": 42, "body": evidence.body, "head": {"ref": "repair-head", "sha": "abc123"}, "base": {"ref": "main"}}
+    with (
+        patch("auto_coder.pr_processor._select_review_repair_route", return_value=route),
+        patch("auto_coder.pr_processor._revalidate_local_review_repair_route", return_value=route),
+        patch("auto_coder.pr_processor.get_linked_issues_context", return_value="REQ-010"),
+        patch("auto_coder.local_review_repair.admit_local_repair_allowance", return_value=(MagicMock(), "")),
+        patch("auto_coder.pr_correction_job.offer_pr_correction_job", return_value=MagicMock(job_id="job-42")),
+    ):
+        result = _delegate_cloud_review_thread_repair("owner/repo", pr_data, MagicMock(), (thread,), config=MagicMock())
+
+    assert result.local_phase == "pending"
+    assert result.deferred is True
+    assert "pending" in result[0]
+
+
+def test_exact_head_push_uses_lease_and_never_enters_recovery_fallback() -> None:
+    rejected = MagicMock(success=False, stderr="stale info", stdout="", returncode=1)
+    with (
+        patch("auto_coder.git_commit.CommandExecutor") as executor_type,
+        patch("auto_coder.git_commit.try_llm_commit_push", create=True) as fallback,
+    ):
+        executor_type.return_value.run_command.return_value = rejected
+        result = git_push(
+            cwd="/checkout",
+            remote="origin",
+            branch="HEAD:issue-7_attempt-1",
+            expected_remote_sha="abc123",
+        )
+
+    assert result is rejected
+    executor_type.return_value.run_command.assert_called_once_with(
+        [
+            "git",
+            "push",
+            "--force-with-lease=refs/heads/issue-7_attempt-1:abc123",
+            "origin",
+            "HEAD:issue-7_attempt-1",
+        ],
+        cwd="/checkout",
+    )
+    fallback.assert_not_called()
+
+
+@pytest.mark.parametrize("heading", ["### Auto-Coder adversarial finding", "### Auto-Coder material test-oracle gap", "<!-- auto-coder-two-tier-finding:v1:accepted:finding -->"])
+@pytest.mark.parametrize("replay", ["fresh", "verbatim", "disposition", "reworded"])
+def test_validated_local_feedback_overrides_addressed_claim_and_excludes_unrelated_threads(heading: str, replay: str) -> None:
+    from auto_coder.pr_processor import _send_adversarial_validation_feedback_to_cloud_task
+
+    evidence = PullRequestRoutingMetadata("https://api.github.com", "owner/repo", 42, "open", "<!-- auto-coder:local-llm -->", "owner/repo", "repair-head", "abc123")
+    route = ReviewRepairRouteDecision(ReviewRepairRouteDisposition.LOCAL_REQUIRED, "local", evidence)
+    finding = f"{heading}\n\nCorrect the broken invariant."
+    report = finding
+    if replay in {"disposition", "reworded"}:
+        from auto_coder.adversarial_validator import AdversarialValidationResult, ReviewThreadDisposition, format_adversarial_review_summary
+
+        report = format_adversarial_review_summary(
+            AdversarialValidationResult(result="NEEDS_FIX", thread_dispositions=[ReviewThreadDisposition(thread_id="validated", status="STILL_VALID", rationale="The correction remains necessary.", evidence="Current implementation retains the defect.")]),
+            "abc123",
+        )
+    thread = ReviewThread(id="validated", comments=[ReviewThreadComment(database_id=1, body=finding, author_login="reviewer"), ReviewThreadComment(database_id=2, body="<!-- auto-coder-review-addressed:v1 -->", author_login="implementer")])
+    unrelated = ReviewThread(id="unrelated", comments=[ReviewThreadComment(database_id=3, body="Unrelated request", author_login="reviewer")])
+    github = MagicMock()
+    github.get_pr_review_threads_strict.return_value = [thread, unrelated]
+    pr_data = {"number": 42, "body": evidence.body, "head": {"ref": "repair-head", "sha": "abc123"}, "base": {"ref": "main"}}
+    with (
+        patch("auto_coder.pr_processor._select_review_repair_route", return_value=route),
+        patch("auto_coder.pr_processor._revalidate_local_review_repair_route", return_value=route),
+        patch("auto_coder.pr_processor.get_linked_issues_context", return_value="REQ-001: preserve invariant"),
+        patch("auto_coder.local_review_repair.admit_local_repair_allowance", return_value=(object(), "")),
+        patch("auto_coder.pr_correction_job.offer_pr_correction_job", return_value=MagicMock(job_id="job-42")) as offer,
+        patch("auto_coder.pr_processor._resolve_cloud_task_origin") as cloud,
+    ):
+        actionable = [finding] if replay == "fresh" else [f"{heading}\n\nReworded current counterexample."] if replay == "reworded" else ()
+        result = _send_adversarial_validation_feedback_to_cloud_task("owner/repo", pr_data, "abc123", report, github, actionable, config=MagicMock())
+    offer.assert_called_once()
+    request = offer.call_args.args[0]
+    assert finding in request.prompt
+    assert "Unrelated request" not in request.prompt
+    assert len(request.feedback_identities) == 1
+    assert request.head_sha == "abc123"
+    assert result.route_disposition == "LOCAL_EXECUTION"
+    assert result.local_phase == "pending"
+    cloud.assert_not_called()
+
+
+@pytest.mark.parametrize("status", ["ADDRESSED", "INCONCLUSIVE", "STILL_VALID_EXTRA"])
+def test_report_disposition_does_not_repair_unverified_or_addressed_root(status: str) -> None:
+    from auto_coder.pr_processor import _adversarial_feedback_belongs_to_report
+
+    finding = "### Auto-Coder adversarial finding\n\nOriginal correction instructions."
+    report = f"{finding}\n\n#### `target`: {status}\n\nCurrent rationale."
+    assert _adversarial_feedback_belongs_to_report(finding, report, "target") is False
+    assert _adversarial_feedback_belongs_to_report(finding, "#### `other`: STILL_VALID", "target") is False
+
+
+@pytest.mark.parametrize("phase,expected_outcome,expected_stage", [("not_admitted", "failed", "failed"), ("awaiting_validation", "deferred", "deferred")])
+def test_adversarial_repair_processing_status_matches_stage(phase: str, expected_outcome: str, expected_stage: str) -> None:
+    from auto_coder.automation_config import ProcessedPRResult
+    from auto_coder.pr_processor import CloudReviewRepairResult, _adversarial_repair_outcome
+
+    status = ProcessedPRResult(pr_data={"number": 42})
+    diagnostic = f"Local correction is {phase}"
+    actions = CloudReviewRepairResult([diagnostic], route_disposition="LOCAL_EXECUTION", local_phase=phase, deferred=phase == "awaiting_validation")
+    stage = _adversarial_repair_outcome(actions, status)
+    assert status.outcome.value == expected_outcome
+    assert stage.value == expected_stage
+    assert status.error == (diagnostic if phase == "not_admitted" else None)
+
+
+def test_local_adversarial_repair_rejects_changed_validated_head() -> None:
+    evidence = PullRequestRoutingMetadata("https://api.github.com", "owner/repo", 42, "open", "<!-- auto-coder:local-llm -->", "owner/repo", "repair-head", "new-head")
+    route = ReviewRepairRouteDecision(ReviewRepairRouteDisposition.LOCAL_REQUIRED, "local", evidence)
+    with (
+        patch("auto_coder.pr_processor._select_review_repair_route", return_value=route),
+        patch("auto_coder.pr_processor._revalidate_local_review_repair_route", return_value=route),
+        patch("auto_coder.local_review_repair.execute_local_review_repair") as execute,
+    ):
+        result = _delegate_cloud_review_thread_repair("owner/repo", {"number": 42}, MagicMock(), config=MagicMock(), validated_feedback=("finding",), validated_head_sha="old-head")
+    assert result.route_disposition == "CONFLICT"
+    assert result == ["Local review repair was not admitted for PR #42: validated head has changed"]
+    execute.assert_not_called()
+
+
+def test_delivery_authority_failure_is_not_started_and_retries(tmp_path, monkeypatch, _use_custom_subprocess_mock):
+    repository, head = _repository(tmp_path)
+    monkeypatch.chdir(repository)
+    request = replace(_request(), head_sha=head)
+    store = LocalReviewRepairStore(tmp_path / "repairs.sqlite3")
+    authority = MagicMock()
+    authority.mark_invocation.side_effect = RuntimeError("invalid allowance state")
+    executor = MagicMock(return_value="ACTION_SUMMARY: no change")
+    outcome = execute_local_review_repair(request, store=store, executor=executor, allowance_authority=authority)
+    assert outcome.phase == "not_started"
+    assert outcome.executed is False
+    assert store.get(request).phase == "not_started"
+    executor.assert_not_called()
+    authority.mark_invocation.side_effect = None
+    outcome = execute_local_review_repair(request, store=store, executor=executor, allowance_authority=authority)
+    assert outcome.phase == "completed_no_change"
+    executor.assert_called_once()
+
+
+def test_completed_generation_requires_validation_before_new_attempt(tmp_path):
+    from auto_coder.local_review_repair import LocalRepairValidationRequired
+
+    ledger = RepairAllowanceLedger(tmp_path / "allowance.sqlite3")
+    authority, _ = admit_local_repair_allowance(_request(), ledger)
+    authority.mark_invocation()
+    authority.mark_completion(code_changed=True, evidence="published correction")
+    with pytest.raises(LocalRepairValidationRequired, match="awaits independent validation"):
+        admit_local_repair_allowance(replace(_request(), head_sha="new-head"), ledger)
+    snapshot = ledger.get_snapshot("https://api.github.com", "owner/repo", 42)
+    assert len(snapshot.generations) == 1
+    assert len(snapshot.generations[0].delivery_attempts) == 1
+
+
+def test_outstanding_local_generation_cannot_authorize_distinct_attempt(tmp_path):
+    ledger = RepairAllowanceLedger(tmp_path / "allowance.sqlite3")
+    authority, _ = admit_local_repair_allowance(_request(), ledger)
+    authority.mark_invocation()
+    later, reason = admit_local_repair_allowance(replace(_request(), head_sha="new-head"), ledger)
+    assert later is None
+    assert reason == f"another local corrective attempt is outstanding: {_request().attempt_id}"
+
+
+@pytest.mark.parametrize("related_head", [True, False])
+def test_independent_validation_settles_only_covered_causal_feedback(tmp_path, monkeypatch, _use_custom_subprocess_mock, related_head):
+    import time
+
+    from auto_coder.durable_repair_allowance import GenerationLifecycleState, ValidationObservation
+    from auto_coder.local_review_repair import settle_local_review_repair_validation
+
+    repository, head = _repository(tmp_path)
+    monkeypatch.chdir(repository)
+    request = replace(_request(feedback=("fixed", "still-open")), head_sha=head)
+    store = LocalReviewRepairStore(tmp_path / "repairs.sqlite3")
+    claim = store.admit(request)
+    store.transition(request, claim, "awaiting_validation", result_sha=head)
+    ledger = RepairAllowanceLedger(tmp_path / "allowance.sqlite3")
+    authority, _ = admit_local_repair_allowance(request, ledger)
+    authority.mark_invocation()
+    authority.mark_completion(code_changed=True, evidence="published")
+    observations = tuple(ValidationObservation(identity, unmet, validation_seq=time.time_ns(), evidence="independent validation") for identity, unmet in (("fixed", False), ("still-open", True), ("unrelated", True)))
+    validated_head = head if related_head else "missing-head"
+    settle_local_review_repair_validation(request.repository, request.pr_number, validated_head, observations, ledger=ledger, store=store)
+    snapshot = ledger.get_snapshot("https://api.github.com", request.repository, request.pr_number)
+    generation = snapshot.generations[0]
+    if related_head:
+        assert generation.lifecycle_state == GenerationLifecycleState.SETTLED
+        assert snapshot.get_blocker_allowance("fixed").failed_count == 0
+        assert snapshot.get_blocker_allowance("still-open").failed_count == 1
+        assert snapshot.get_blocker_allowance("unrelated") is None
+        later, reason = admit_local_repair_allowance(replace(request, head_sha="next-head", feedback_identities=("still-open",)), ledger)
+        assert later is not None
+        assert reason == ""
+        assert later.generation_id != authority.generation_id
+    else:
+        assert generation.lifecycle_state == GenerationLifecycleState.PENDING_REVALIDATION
+        assert generation.settlements == ()
+
+
+def test_partial_validation_keeps_missing_and_inconclusive_feedback_pending(tmp_path, monkeypatch, _use_custom_subprocess_mock):
+    import time
+
+    from auto_coder.durable_repair_allowance import GenerationLifecycleState, ValidationAvailability, ValidationObservation
+    from auto_coder.local_review_repair import LocalRepairValidationRequired, settle_local_review_repair_validation
+
+    repository, head = _repository(tmp_path)
+    monkeypatch.chdir(repository)
+    request = replace(_request(feedback=("fixed", "unknown", "missing")), head_sha=head)
+    store = LocalReviewRepairStore(tmp_path / "repairs.sqlite3")
+    claim = store.admit(request)
+    store.transition(request, claim, "awaiting_validation", result_sha=head)
+    ledger = RepairAllowanceLedger(tmp_path / "allowance.sqlite3")
+    authority, _ = admit_local_repair_allowance(request, ledger)
+    authority.mark_invocation()
+    authority.mark_completion(code_changed=True, evidence="published")
+    observations = (
+        ValidationObservation("fixed", False, validation_seq=time.time_ns()),
+        ValidationObservation("unknown", True, availability=ValidationAvailability.INCONCLUSIVE, validation_seq=time.time_ns()),
+    )
+    settle_local_review_repair_validation(request.repository, request.pr_number, head, observations, ledger=ledger, store=store)
+    snapshot = ledger.get_snapshot("https://api.github.com", request.repository, request.pr_number)
+    assert snapshot.generations[0].lifecycle_state == GenerationLifecycleState.PENDING_REVALIDATION
+    assert tuple(item.blocker_id for item in snapshot.generations[0].settlements) == ("fixed",)
+    assert snapshot.get_blocker_allowance("unknown").failed_count == 0
+    assert snapshot.get_blocker_allowance("missing").failed_count == 0
+    with pytest.raises(LocalRepairValidationRequired):
+        admit_local_repair_allowance(replace(request, head_sha="later-head"), ledger)
+
+
+@pytest.mark.parametrize("resolved", [False, True])
+def test_pending_local_repair_includes_original_root_after_resolution(tmp_path, monkeypatch, _use_custom_subprocess_mock, resolved):
+    from auto_coder.adversarial_validator import ReviewThreadDisposition
+    from auto_coder.durable_repair_allowance import GenerationLifecycleState, ValidationObservation
+    from auto_coder.local_review_repair import settle_local_review_repair_validation
+    from auto_coder.pr_processor import _include_pending_local_repair_threads, _review_feedback_identity
+    from auto_coder.review_thread_validation import ClaimedReviewThread
+
+    repository, head = _repository(tmp_path)
+    monkeypatch.chdir(repository)
+    root = ReviewThread(id="original", is_resolved=resolved, comments=[ReviewThreadComment(database_id=17, author_login="reviewer[bot]", body="### Auto-Coder material test-oracle gap\nOriginal invariant")])
+    identity = _review_feedback_identity("owner/repo#42:local:", root, 0)
+    request = replace(_request(feedback=(identity,)), head_sha=head)
+    ledger = RepairAllowanceLedger(tmp_path / "allowance.sqlite3")
+    authority, _ = admit_local_repair_allowance(request, ledger)
+    store = LocalReviewRepairStore(tmp_path / "repairs.sqlite3")
+    claim = store.admit(request)
+    assert store.transition(request, claim, "awaiting_validation", result_sha=head)
+    authority.mark_invocation()
+    authority.mark_completion(code_changed=True, evidence="published")
+    client = MagicMock()
+    client.get_pr_review_threads_strict.return_value = [root]
+    other = ClaimedReviewThread(thread_id="new-finding")
+    with patch("auto_coder.durable_repair_allowance.RepairAllowanceLedger", return_value=ledger):
+        claimed = _include_pending_local_repair_threads(client, "owner/repo", 42, "reviewer", (other,))
+    assert [thread.thread_id for thread in claimed] == ["original"]
+    assert claimed[0].root_comment_database_id == 17
+    assert claimed[0].original_finding == root.comments[0].body
+    assert claimed[0].revalidation_forced is True
+    assert root.is_resolved is resolved
+    # Independent evidence, rather than the UI state, settles the old generation.
+    disposition = ReviewThreadDisposition(thread_id="original", status="ADDRESSED", evidence="original invariant independently verified")
+    import time
+
+    settle_local_review_repair_validation("owner/repo", 42, head, (ValidationObservation(identity, False, validation_seq=time.time_ns(), evidence=disposition.evidence),), ledger=ledger, store=store)
+    snapshot = ledger.get_snapshot("https://api.github.com", "owner/repo", 42)
+    assert snapshot.generations[0].lifecycle_state == GenerationLifecycleState.SETTLED
+    later, reason = admit_local_repair_allowance(replace(request, feedback_identities=("new-finding",)), ledger)
+    assert reason == ""
+    assert later is not None
+    assert later.generation_id != authority.generation_id
+
+
+@pytest.mark.parametrize("failure", ["missing", "truncated", "foreign", "unavailable"])
+def test_pending_local_repair_root_evidence_fails_closed(tmp_path, failure):
+    from auto_coder.pr_processor import _include_pending_local_repair_threads, _review_feedback_identity
+
+    root = ReviewThread(id="original", is_resolved=True, comments=[ReviewThreadComment(database_id=17, author_login="reviewer", body="### Auto-Coder adversarial finding\nOriginal defect")])
+    identity = _review_feedback_identity("owner/repo#42:local:", root, 0)
+    ledger = RepairAllowanceLedger(tmp_path / "allowance.sqlite3")
+    authority, _ = admit_local_repair_allowance(_request(feedback=(identity,)), ledger)
+    authority.mark_invocation()
+    authority.mark_completion(code_changed=True, evidence="published")
+    client = MagicMock()
+    client.get_pr_review_threads_strict.return_value = [] if failure == "missing" else [replace(root, comments_truncated=failure == "truncated")]
+    if failure == "unavailable":
+        client.get_pr_review_threads_strict.side_effect = OSError("GitHub unavailable")
+    with patch("auto_coder.durable_repair_allowance.RepairAllowanceLedger", return_value=ledger), pytest.raises((RuntimeError, OSError)):
+        _include_pending_local_repair_threads(client, "owner/repo", 42, "foreign" if failure == "foreign" else "reviewer", ())
+    assert ledger.get_snapshot("https://api.github.com", "owner/repo", 42).get_outstanding_generation() is not None
+
+
+def test_pending_local_repair_preserves_already_classified_codex_claim(tmp_path):
+    from auto_coder.pr_processor import _include_pending_local_repair_threads, _review_feedback_identity
+    from auto_coder.review_thread_validation import ClaimedReviewThread
+
+    root = ReviewThread(id="codex", comments=[ReviewThreadComment(database_id=19, author_login="chatgpt-codex-connector[bot]", body="Supported Codex finding")])
+    identity = _review_feedback_identity("owner/repo#42:local:", root, 0)
+    ledger = RepairAllowanceLedger(tmp_path / "allowance.sqlite3")
+    authority, _ = admit_local_repair_allowance(_request(feedback=(identity,)), ledger)
+    authority.mark_invocation()
+    authority.mark_completion(code_changed=True, evidence="published")
+    claim = ClaimedReviewThread(thread_id="codex", root_comment_database_id=19, root_author_login=root.comments[0].author_login, original_finding=root.comments[0].body)
+    client = MagicMock()
+    client.get_pr_review_threads_strict.return_value = [root]
+    with patch("auto_coder.durable_repair_allowance.RepairAllowanceLedger", return_value=ledger):
+        assert _include_pending_local_repair_threads(client, "owner/repo", 42, "reviewer", (claim,)) == (claim,)
+
+
+def test_validated_gap_matches_stable_identity_and_uses_current_instructions():
+    evidence = PullRequestRoutingMetadata("https://api.github.com", "owner/repo", 42, "open", "<!-- auto-coder:local-llm -->", "owner/repo", "repair-head", "abc123")
+    route = ReviewRepairRouteDecision(ReviewRepairRouteDisposition.LOCAL_REQUIRED, "local", evidence)
+    old = "### Auto-Coder material test-oracle gap\n\nGap identity: `TOG-retained`\n\nOld reproduction"
+    current = "### Auto-Coder material test-oracle gap\n\nGap identity: `TOG-retained`\n\nCurrent independently validated reproduction"
+    unrelated = "### Auto-Coder material test-oracle gap\n\nGap identity: `TOG-other`\n\nCurrent independently validated reproduction"
+    threads = tuple(ReviewThread(id=str(index), comments=[ReviewThreadComment(database_id=index, body=body)]) for index, body in enumerate((old, unrelated)))
+    with (
+        patch("auto_coder.pr_processor._select_review_repair_route", return_value=route),
+        patch("auto_coder.pr_processor._revalidate_local_review_repair_route", return_value=route),
+        patch("auto_coder.pr_processor.get_linked_issues_context", return_value="REQ-001"),
+        patch("auto_coder.local_review_repair.admit_local_repair_allowance", return_value=(object(), "")),
+        patch("auto_coder.pr_correction_job.offer_pr_correction_job", return_value=MagicMock(job_id="job-42")) as offer,
+    ):
+        result = _delegate_cloud_review_thread_repair("owner/repo", {"number": 42, "body": evidence.body, "base": {"ref": "main"}}, MagicMock(), threads, config=MagicMock(), validated_feedback=(current,), validated_head_sha="abc123")
+    offer.assert_called_once()
+    request = offer.call_args.args[0]
+    assert current in request.prompt
+    assert "Old reproduction" not in request.prompt
+    assert "TOG-other" not in request.prompt
+    assert len(request.feedback_identities) == 1
+    assert result.local_phase == "pending"
+
+
+def test_execute_fetches_missing_head_commit_from_origin(tmp_path: Path, monkeypatch, _use_custom_subprocess_mock) -> None:
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    _git(origin, "init", "--bare")
+
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    _git(staging, "init")
+    _git(staging, "config", "user.name", "Test User")
+    _git(staging, "config", "user.email", "test@example.com")
+    (staging / "file.txt").write_text("initial\n", encoding="utf-8")
+    _git(staging, "add", "file.txt")
+    _git(staging, "commit", "-m", "initial")
+    _git(staging, "remote", "add", "origin", f"file://{origin}")
+    _git(staging, "push", "origin", "HEAD:refs/heads/main")
+
+    local = tmp_path / "local"
+    local.mkdir()
+    _git(local, "init")
+    _git(local, "config", "user.name", "Test User")
+    _git(local, "config", "user.email", "test@example.com")
+    _git(local, "remote", "add", "origin", f"file://{origin}")
+    _git(local, "fetch", "origin", "main")
+    _git(local, "checkout", "-b", "main", "origin/main")
+
+    # Staging commits and pushes feature-1 after local is already set up
+    (staging / "file.txt").write_text("branch edit\n", encoding="utf-8")
+    _git(staging, "add", "file.txt")
+    _git(staging, "commit", "-m", "branch commit")
+    head_sha = _git(staging, "rev-parse", "HEAD")
+    _git(staging, "push", "origin", "HEAD:refs/heads/feature-1")
+
+    result = subprocess.run(["git", "cat-file", "-e", f"{head_sha}^{{commit}}"], cwd=local, capture_output=True)
+    assert result.returncode != 0
+
+    monkeypatch.chdir(local)
+    database = tmp_path / "repairs.sqlite3"
+    request = replace(
+        _request(),
+        head_ref="feature-1",
+        head_sha=head_sha,
+    )
+
+    executed_worktrees = []
+
+    def executor(_req, worktree):
+        executed_worktrees.append(worktree)
+        return "CANNOT_FIX"
+
+    outcome = execute_local_review_repair(
+        request,
+        store=LocalReviewRepairStore(database),
+        executor=executor,
+        root=local,
+    )
+
+    assert len(executed_worktrees) == 1
+    assert outcome.phase == "terminal_failure"
+    assert outcome.executed is True

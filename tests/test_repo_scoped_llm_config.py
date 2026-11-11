@@ -1,0 +1,636 @@
+"""Unit tests for repository-scoped partial configuration overrides in llm_config.toml."""
+
+import os
+import tempfile
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from auto_coder.claude_routine_client import ClaudeRoutineClient
+from auto_coder.codex_cloud_client import CodexCloudClient
+from auto_coder.llm_backend_config import (
+    BackendConfig,
+    LLMBackendConfiguration,
+    _normalize_config_dict,
+    active_repo_context,
+    deep_merge_config_dict,
+    get_active_repo_name,
+    get_llm_config,
+    reset_llm_config,
+    resolve_repo_override_path,
+    set_active_repo_name,
+)
+from auto_coder.utils import CommandResult
+
+
+class TestResolveRepoOverridePath:
+    """Test resolution of repository override TOML paths."""
+
+    def test_default_base_path(self):
+        result = resolve_repo_override_path("owner/repo")
+        expected_dir = os.path.expanduser("~/.auto-coder")
+        assert result == os.path.join(expected_dir, "owner", "repo", "llm_config.toml")
+
+    def test_valid_owner_repo(self):
+        result = resolve_repo_override_path("kitamura-tetsuo/auto-coder")
+        expected_dir = os.path.expanduser("~/.auto-coder")
+        assert result == os.path.join(expected_dir, "kitamura-tetsuo", "auto-coder", "llm_config.toml")
+
+    def test_valid_owner_repo_with_git_suffix(self):
+        result = resolve_repo_override_path("kitamura-tetsuo/auto-coder.git")
+        expected_dir = os.path.expanduser("~/.auto-coder")
+        assert result == os.path.join(expected_dir, "kitamura-tetsuo", "auto-coder", "llm_config.toml")
+
+    def test_explicit_override_root_dir(self):
+        result = resolve_repo_override_path("owner/repo", override_root_dir="/custom/dir")
+        assert result == "/custom/dir/owner/repo/llm_config.toml"
+
+    def test_invalid_short_repo_name(self):
+        assert resolve_repo_override_path("auto-coder") is None
+        assert resolve_repo_override_path("") is None
+        assert resolve_repo_override_path(None) is None  # type: ignore[arg-type]
+
+    def test_invalid_malformed_repo_names(self):
+        assert resolve_repo_override_path("/") is None
+        assert resolve_repo_override_path("/repo") is None
+        assert resolve_repo_override_path("owner/") is None
+        assert resolve_repo_override_path("owner/repo/extra") is None
+
+    def test_reject_path_traversal_components(self):
+        assert resolve_repo_override_path("../something") is None
+        assert resolve_repo_override_path("owner/..") is None
+        assert resolve_repo_override_path("../..") is None
+        assert resolve_repo_override_path("owner/../other") is None
+        assert resolve_repo_override_path("../../etc/passwd") is None
+        assert resolve_repo_override_path("./repo") is None
+        assert resolve_repo_override_path("owner/.") is None
+        assert resolve_repo_override_path("owner/../other", override_root_dir="/custom") is None
+
+
+class TestDeepMergeConfigDict:
+    """Test recursive merging behavior for TOML dictionaries."""
+
+    def test_scalar_replacement(self):
+        base = {"model": "gpt-4", "attempts": 1, "enabled": True}
+        override = {"model": "gpt-5", "attempts": 3}
+        merged = deep_merge_config_dict(base, override)
+        assert merged == {"model": "gpt-5", "attempts": 3, "enabled": True}
+        # Verify base dictionary is unmutated
+        assert base["model"] == "gpt-4"
+
+    def test_nested_table_recursive_merge(self):
+        base = {
+            "backends": {
+                "codex": {"model": "codex-v1", "temperature": 0.2, "timeout": 30},
+                "gemini": {"model": "gemini-2.5", "temperature": 0.5},
+            }
+        }
+        override = {
+            "backends": {
+                "codex": {"model": "codex-v2", "temperature": 0.0},
+            }
+        }
+        merged = deep_merge_config_dict(base, override)
+        assert merged["backends"]["codex"]["model"] == "codex-v2"
+        assert merged["backends"]["codex"]["temperature"] == 0.0
+        assert merged["backends"]["codex"]["timeout"] == 30
+        assert merged["backends"]["gemini"]["model"] == "gemini-2.5"
+
+    def test_list_replaced_as_whole(self):
+        base = {"backend": {"order": ["codex", "gemini", "claude"]}}
+        override = {"backend": {"order": ["claude", "qwen"]}}
+        merged = deep_merge_config_dict(base, override)
+        assert merged["backend"]["order"] == ["claude", "qwen"]
+
+    def test_empty_override(self):
+        base = {"backend": {"default": "codex"}, "backends": {"codex": {"model": "default-model"}}}
+        merged = deep_merge_config_dict(base, {})
+        assert merged == base
+
+    def test_incompatible_type_dict_vs_scalar_raises_value_error(self):
+        base = {"backends": {"codex": {"environment": "env-1"}}}
+        override = {"backends": {"codex": "not-a-dict"}}
+        with pytest.raises(ValueError, match="Incompatible override type"):
+            deep_merge_config_dict(base, override)
+
+    def test_incompatible_type_scalar_vs_dict_raises_value_error(self):
+        base = {"backends": {"codex": "not-a-dict"}}
+        override = {"backends": {"codex": {"environment": "env-1"}}}
+        with pytest.raises(ValueError, match="Incompatible override type"):
+            deep_merge_config_dict(base, override)
+
+    def test_incompatible_type_list_vs_scalar_raises_value_error(self):
+        base = {"order": ["codex"]}
+        override = {"order": "codex"}
+        with pytest.raises(ValueError, match="Incompatible override type"):
+            deep_merge_config_dict(base, override)
+
+    def test_unrelated_tables_preserve_environment_key_unmodified(self):
+        """Regression test: unrelated non-backend tables must keep 'environment' keys untouched."""
+        data = {
+            "some_feature": {"environment": "production", "env_id": "prod-42"},
+            "logging_config": {"environment": "staging"},
+            "backends": {
+                "codex_cloud": {"environment": "env-cloud-1"},
+            },
+        }
+        normalized = _normalize_config_dict(data)
+        # Unrelated tables are NOT rewritten
+        assert normalized["some_feature"]["environment"] == "production"
+        assert normalized["some_feature"]["env_id"] == "prod-42"
+        assert "environment_id" not in normalized["some_feature"]
+        assert normalized["logging_config"]["environment"] == "staging"
+        # Backend tables ARE normalized
+        assert normalized["backends"]["codex_cloud"]["environment_id"] == "env-cloud-1"
+        assert "environment" not in normalized["backends"]["codex_cloud"]
+
+
+class TestRepoScopedLLMBackendConfiguration:
+    """Test LLMBackendConfiguration loading with repository-specific overrides."""
+
+    @pytest.fixture(autouse=True)
+    def clean_env_and_config(self):
+        reset_llm_config()
+        set_active_repo_name(None)
+        yield
+        reset_llm_config()
+        set_active_repo_name(None)
+
+    def test_load_from_file_with_repo_override(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            monkeypatch.setenv("HOME", tmpdir)
+
+            base_dir = os.path.join(tmpdir, "custom_base_dir")
+            os.makedirs(base_dir, exist_ok=True)
+            base_config_path = os.path.join(base_dir, "llm_config.toml")
+
+            repo_override_dir = os.path.join(tmpdir, ".auto-coder", "kitamura-tetsuo", "auto-coder")
+            os.makedirs(repo_override_dir, exist_ok=True)
+            repo_override_path = os.path.join(repo_override_dir, "llm_config.toml")
+
+            # Write base config
+            with open(base_config_path, "w", encoding="utf-8") as f:
+                f.write("""
+[backend]
+default = "codex"
+order = ["codex", "claude"]
+
+[backends.codex_cloud]
+model = "codex-base"
+environment_id = "env-outliner-123"
+attempts = 1
+
+[backends.claude_routine]
+url = "https://base.routine.anthropic.com"
+""")
+
+            # Write repo override for kitamura-tetsuo/auto-coder
+            with open(repo_override_path, "w", encoding="utf-8") as f:
+                f.write("""
+[backends.codex_cloud]
+environment = "env-autocoder-999"
+attempts = 3
+
+[backends.claude_routine]
+url = "https://custom.routine.anthropic.com"
+""")
+
+            # 1. Loading without repo returns base config
+            base_loaded = LLMBackendConfiguration.load_from_file(config_path=base_config_path)
+            codex_base = base_loaded.get_backend_config("codex_cloud")
+            assert codex_base is not None
+            assert codex_base.environment_id == "env-outliner-123"
+            assert codex_base.environment == "env-outliner-123"
+            assert codex_base.attempts == 1
+            assert codex_base.model == "codex-base"
+
+            # 2. Loading with repo returns merged config
+            repo_loaded = LLMBackendConfiguration.load_from_file(
+                config_path=base_config_path,
+                repo_name="kitamura-tetsuo/auto-coder",
+            )
+            codex_repo = repo_loaded.get_backend_config("codex_cloud")
+            assert codex_repo is not None
+            assert codex_repo.environment_id == "env-autocoder-999"
+            assert codex_repo.environment == "env-autocoder-999"
+            assert codex_repo.attempts == 3
+            assert codex_repo.model == "codex-base"  # Preserved from base!
+
+            claude_repo = repo_loaded.get_backend_config("claude_routine")
+            assert claude_repo is not None
+            assert claude_repo.url == "https://custom.routine.anthropic.com"
+
+    def test_explicit_base_path_does_not_relocate_override(self, monkeypatch):
+        """Oracle test: Explicit base path must not relocate override.
+
+        Base is loaded from /tmp/config/llm_config.toml.
+        Override must be loaded from ~/.auto-coder/kitamura-tetsuo/auto-coder/llm_config.toml.
+        Must NOT look under /tmp/config/kitamura-tetsuo/auto-coder/.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            monkeypatch.setenv("HOME", tmpdir)
+
+            base_dir = os.path.join(tmpdir, "custom_config")
+            os.makedirs(base_dir, exist_ok=True)
+            base_config_path = os.path.join(base_dir, "llm_config.toml")
+
+            # Decoy override placed next to base config (must be ignored)
+            decoy_dir = os.path.join(base_dir, "kitamura-tetsuo", "auto-coder")
+            os.makedirs(decoy_dir, exist_ok=True)
+            with open(os.path.join(decoy_dir, "llm_config.toml"), "w", encoding="utf-8") as f:
+                f.write("""
+[backends.codex_cloud]
+environment = "decoy-env-should-not-be-used"
+attempts = 99
+""")
+
+            # Real repo override in ~/.auto-coder/<owner>/<repo>/llm_config.toml
+            real_override_dir = os.path.join(tmpdir, ".auto-coder", "kitamura-tetsuo", "auto-coder")
+            os.makedirs(real_override_dir, exist_ok=True)
+            with open(os.path.join(real_override_dir, "llm_config.toml"), "w", encoding="utf-8") as f:
+                f.write("""
+[backends.codex_cloud]
+environment = "real-repo-env"
+attempts = 3
+""")
+
+            with open(base_config_path, "w", encoding="utf-8") as f:
+                f.write("""
+[backends.codex_cloud]
+model = "base-model"
+environment = "base-env"
+attempts = 1
+""")
+
+            loaded = LLMBackendConfiguration.load_from_file(
+                config_path=base_config_path,
+                repo_name="kitamura-tetsuo/auto-coder",
+            )
+            codex_cfg = loaded.get_backend_config("codex_cloud")
+            assert codex_cfg is not None
+            assert codex_cfg.model == "base-model"
+            assert codex_cfg.environment == "real-repo-env"
+            assert codex_cfg.attempts == 3
+
+    def test_env_var_base_path_does_not_relocate_override(self, monkeypatch):
+        """Oracle test: Environment-variable base path must not relocate override."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            monkeypatch.setenv("HOME", tmpdir)
+
+            env_base_dir = os.path.join(tmpdir, "env_config")
+            os.makedirs(env_base_dir, exist_ok=True)
+            base_config_path = os.path.join(env_base_dir, "llm_config.toml")
+
+            # Decoy next to env base config
+            decoy_dir = os.path.join(env_base_dir, "owner", "repo")
+            os.makedirs(decoy_dir, exist_ok=True)
+            with open(os.path.join(decoy_dir, "llm_config.toml"), "w", encoding="utf-8") as f:
+                f.write("""
+[backends.codex_cloud]
+environment = "decoy-env"
+""")
+
+            # Real repo override in ~/.auto-coder/owner/repo/llm_config.toml
+            real_dir = os.path.join(tmpdir, ".auto-coder", "owner", "repo")
+            os.makedirs(real_dir, exist_ok=True)
+            with open(os.path.join(real_dir, "llm_config.toml"), "w", encoding="utf-8") as f:
+                f.write("""
+[backends.codex_cloud]
+environment = "real-env"
+""")
+
+            with open(base_config_path, "w", encoding="utf-8") as f:
+                f.write("""
+[backends.codex_cloud]
+model = "env-base-model"
+environment = "env-base-env"
+""")
+
+            monkeypatch.setenv("AUTO_CODER_CONFIG_PATH", base_config_path)
+
+            cfg = get_llm_config(repo_name="owner/repo")
+            codex_cfg = cfg.get_backend_config("codex_cloud")
+            assert codex_cfg is not None
+            assert codex_cfg.model == "env-base-model"
+            assert codex_cfg.environment == "real-env"
+
+    def test_local_base_config_does_not_relocate_override(self, monkeypatch):
+        """Oracle test: Local base config (./.auto-coder/llm_config.toml) must not relocate override."""
+        with tempfile.TemporaryDirectory() as home_dir, tempfile.TemporaryDirectory() as project_dir:
+            monkeypatch.setenv("HOME", home_dir)
+            monkeypatch.delenv("AUTO_CODER_CONFIG_PATH", raising=False)
+            monkeypatch.delenv("AUTO_CODER_LLM_CONFIG_PATH", raising=False)
+
+            # Local project config
+            local_auto_coder = os.path.join(project_dir, ".auto-coder")
+            os.makedirs(local_auto_coder, exist_ok=True)
+            local_config_path = os.path.join(local_auto_coder, "llm_config.toml")
+            with open(local_config_path, "w", encoding="utf-8") as f:
+                f.write("""
+[backends.codex_cloud]
+model = "local-base-model"
+environment = "local-base-env"
+""")
+
+            # Decoy inside project's .auto-coder/<owner>/<repo>/
+            decoy_dir = os.path.join(local_auto_coder, "owner", "repo")
+            os.makedirs(decoy_dir, exist_ok=True)
+            with open(os.path.join(decoy_dir, "llm_config.toml"), "w", encoding="utf-8") as f:
+                f.write("""
+[backends.codex_cloud]
+environment = "decoy-local-env"
+""")
+
+            # Real override in ~/.auto-coder/owner/repo/llm_config.toml
+            real_dir = os.path.join(home_dir, ".auto-coder", "owner", "repo")
+            os.makedirs(real_dir, exist_ok=True)
+            with open(os.path.join(real_dir, "llm_config.toml"), "w", encoding="utf-8") as f:
+                f.write("""
+[backends.codex_cloud]
+environment = "real-home-env"
+""")
+
+            monkeypatch.chdir(project_dir)
+
+            cfg = get_llm_config(repo_name="owner/repo")
+            codex_cfg = cfg.get_backend_config("codex_cloud")
+            assert codex_cfg is not None
+            assert codex_cfg.model == "local-base-model"
+            assert codex_cfg.environment == "real-home-env"
+
+    def test_default_base_path_and_override(self, monkeypatch):
+        """Oracle test: Default base and override paths under ~/.auto-coder."""
+        with tempfile.TemporaryDirectory() as home_dir:
+            monkeypatch.setenv("HOME", home_dir)
+            monkeypatch.delenv("AUTO_CODER_CONFIG_PATH", raising=False)
+            monkeypatch.delenv("AUTO_CODER_LLM_CONFIG_PATH", raising=False)
+
+            home_auto_coder = os.path.join(home_dir, ".auto-coder")
+            os.makedirs(home_auto_coder, exist_ok=True)
+            with open(os.path.join(home_auto_coder, "llm_config.toml"), "w", encoding="utf-8") as f:
+                f.write("""
+[backends.codex_cloud]
+model = "home-base-model"
+environment = "home-base-env"
+""")
+
+            repo_dir = os.path.join(home_auto_coder, "owner", "repo")
+            os.makedirs(repo_dir, exist_ok=True)
+            with open(os.path.join(repo_dir, "llm_config.toml"), "w", encoding="utf-8") as f:
+                f.write("""
+[backends.codex_cloud]
+environment = "home-override-env"
+""")
+
+            cfg = get_llm_config(repo_name="owner/repo")
+            codex_cfg = cfg.get_backend_config("codex_cloud")
+            assert codex_cfg is not None
+            assert codex_cfg.model == "home-base-model"
+            assert codex_cfg.environment == "home-override-env"
+
+    def test_load_from_file_invalid_toml_override_raises_value_error(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            monkeypatch.setenv("HOME", tmpdir)
+
+            base_config_path = os.path.join(tmpdir, "base_llm_config.toml")
+            repo_override_dir = os.path.join(tmpdir, ".auto-coder", "owner", "bad-repo")
+            os.makedirs(repo_override_dir, exist_ok=True)
+            repo_override_path = os.path.join(repo_override_dir, "llm_config.toml")
+
+            with open(base_config_path, "w", encoding="utf-8") as f:
+                f.write('[backend]\ndefault = "codex"\n')
+
+            with open(repo_override_path, "w", encoding="utf-8") as f:
+                f.write("INVALID TOML CONTENT [[[")
+
+            with pytest.raises(ValueError, match="Error loading repository configuration override"):
+                LLMBackendConfiguration.load_from_file(
+                    config_path=base_config_path,
+                    repo_name="owner/bad-repo",
+                )
+
+    def test_backend_config_extra_args_and_environment_properties(self):
+        cfg = BackendConfig(name="custom_backend")
+        assert cfg.environment is None
+        cfg.environment = "env-xyz"
+        assert cfg.environment_id == "env-xyz"
+        assert cfg.environment == "env-xyz"
+
+        # Extra args attribute fallback
+        cfg.extra_args["max_tasks"] = 10
+        assert cfg.max_tasks == 10
+
+        with pytest.raises(AttributeError):
+            _ = cfg.non_existent_key
+
+
+class TestGetLLMConfigAndIsolation:
+    """Test get_llm_config with active_repo_context and multi-repo isolation."""
+
+    @pytest.fixture(autouse=True)
+    def setup_configs(self):
+        reset_llm_config()
+        set_active_repo_name(None)
+        yield
+        reset_llm_config()
+        set_active_repo_name(None)
+
+    def test_repo_isolation_sequential(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            monkeypatch.setenv("HOME", tmpdir)
+
+            base_config_path = os.path.join(tmpdir, "base_dir", "llm_config.toml")
+            os.makedirs(os.path.dirname(base_config_path), exist_ok=True)
+
+            repo_a_dir = os.path.join(tmpdir, ".auto-coder", "org", "repo-a")
+            repo_b_dir = os.path.join(tmpdir, ".auto-coder", "org", "repo-b")
+            os.makedirs(repo_a_dir, exist_ok=True)
+            os.makedirs(repo_b_dir, exist_ok=True)
+
+            with open(base_config_path, "w", encoding="utf-8") as f:
+                f.write("""
+[backend]
+default = "codex"
+
+[backends.codex_cloud]
+environment = "base-env"
+model = "base-model"
+""")
+
+            with open(os.path.join(repo_a_dir, "llm_config.toml"), "w", encoding="utf-8") as f:
+                f.write("""
+[backends.codex_cloud]
+environment = "repo-a-env"
+""")
+
+            with open(os.path.join(repo_b_dir, "llm_config.toml"), "w", encoding="utf-8") as f:
+                f.write("""
+[backends.codex_cloud]
+environment = "repo-b-env"
+""")
+
+            # Global base lookup
+            base_cfg = get_llm_config(config_path=base_config_path)
+            assert base_cfg.get_backend_config("codex_cloud").environment == "base-env"
+
+            # Context A
+            with active_repo_context("org/repo-a"):
+                assert get_active_repo_name() == "org/repo-a"
+                cfg_a = get_llm_config(config_path=base_config_path)
+                assert cfg_a.get_backend_config("codex_cloud").environment == "repo-a-env"
+
+            # Context B
+            with active_repo_context("org/repo-b"):
+                assert get_active_repo_name() == "org/repo-b"
+                cfg_b = get_llm_config(config_path=base_config_path)
+                assert cfg_b.get_backend_config("codex_cloud").environment == "repo-b-env"
+
+            # Back to base
+            assert get_active_repo_name() is None
+            base_cfg_after = get_llm_config(config_path=base_config_path)
+            assert base_cfg_after.get_backend_config("codex_cloud").environment == "base-env"
+
+            # Direct param A
+            cfg_a_direct = get_llm_config(repo_name="org/repo-a", config_path=base_config_path)
+            assert cfg_a_direct.get_backend_config("codex_cloud").environment == "repo-a-env"
+
+
+class TestCloudClientsRepoScoping:
+    """Test CodexCloudClient and ClaudeRoutineClient repo-scoped configuration loading."""
+
+    @pytest.fixture(autouse=True)
+    def setup_configs(self):
+        reset_llm_config()
+        set_active_repo_name(None)
+        yield
+        reset_llm_config()
+        set_active_repo_name(None)
+
+    def test_codex_cloud_client_repo_scoped_environment(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            monkeypatch.setenv("HOME", tmpdir)
+
+            base_config_path = os.path.join(tmpdir, "custom_base", "llm_config.toml")
+            os.makedirs(os.path.dirname(base_config_path), exist_ok=True)
+            repo_dir = os.path.join(tmpdir, ".auto-coder", "kitamura-tetsuo", "auto-coder")
+            os.makedirs(repo_dir, exist_ok=True)
+
+            with open(base_config_path, "w", encoding="utf-8") as f:
+                f.write("""
+[backends.codex_cloud]
+environment = "env-outliner"
+attempts = 1
+""")
+
+            with open(os.path.join(repo_dir, "llm_config.toml"), "w", encoding="utf-8") as f:
+                f.write("""
+[backends.codex_cloud]
+environment = "env-autocoder"
+attempts = 3
+""")
+
+            monkeypatch.setenv("AUTO_CODER_CONFIG_PATH", base_config_path)
+
+            # 1. Base client
+            client_base = CodexCloudClient(backend_name="codex_cloud")
+            assert client_base.environment_id == "env-outliner"
+            assert client_base.attempts == 1
+
+            # 2. Repo-scoped client
+            client_repo = CodexCloudClient(backend_name="codex_cloud", repo_name="kitamura-tetsuo/auto-coder")
+            assert client_repo.environment_id == "env-autocoder"
+            assert client_repo.attempts == 3
+
+    def test_claude_routine_client_repo_scoped(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            monkeypatch.setenv("HOME", tmpdir)
+
+            base_config_path = os.path.join(tmpdir, "custom_base", "llm_config.toml")
+            os.makedirs(os.path.dirname(base_config_path), exist_ok=True)
+            repo_dir = os.path.join(tmpdir, ".auto-coder", "kitamura-tetsuo", "auto-coder")
+            os.makedirs(repo_dir, exist_ok=True)
+
+            with open(base_config_path, "w", encoding="utf-8") as f:
+                f.write("""
+[backends.claude_routine]
+claude_code_routine_token = "token-base"
+url = "https://base.url"
+""")
+
+            with open(os.path.join(repo_dir, "llm_config.toml"), "w", encoding="utf-8") as f:
+                f.write("""
+[backends.claude_routine]
+claude_code_routine_token = "token-autocoder"
+url = "https://autocoder.url"
+""")
+
+            monkeypatch.setenv("AUTO_CODER_CONFIG_PATH", base_config_path)
+
+            client_base = ClaudeRoutineClient(backend_name="claude_routine")
+            assert client_base.token == "token-base"
+            assert client_base.url == "https://base.url"
+
+            client_repo = ClaudeRoutineClient(backend_name="claude_routine", repo_name="kitamura-tetsuo/auto-coder")
+            assert client_repo.token == "token-autocoder"
+            assert client_repo.url == "https://autocoder.url"
+
+    def test_codex_cloud_start_task_initial_request_receives_repo_override_env(self, monkeypatch):
+        """Boundary test: assert that start_task initial CLI execution uses the repository override environment."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            monkeypatch.setenv("HOME", tmpdir)
+
+            base_config_path = os.path.join(tmpdir, "custom_base", "llm_config.toml")
+            os.makedirs(os.path.dirname(base_config_path), exist_ok=True)
+            repo_dir = os.path.join(tmpdir, ".auto-coder", "kitamura-tetsuo", "auto-coder")
+            os.makedirs(repo_dir, exist_ok=True)
+
+            with open(base_config_path, "w", encoding="utf-8") as f:
+                f.write("""
+[backends.codex_cloud]
+environment = "env-outliner-base"
+attempts = 1
+""")
+
+            with open(os.path.join(repo_dir, "llm_config.toml"), "w", encoding="utf-8") as f:
+                f.write("""
+[backends.codex_cloud]
+environment = "env-autocoder-override"
+attempts = 3
+""")
+
+            monkeypatch.setenv("AUTO_CODER_CONFIG_PATH", base_config_path)
+
+            fake_output = "Task created successfully. Task ID: task_e_6a26c19ac8a88326af83ebfb44b89fe2"
+            mock_result = CommandResult(returncode=0, stdout=fake_output, stderr="", success=True)
+
+            with patch("auto_coder.codex_cloud_client.codex_cloud_quota_allows_task", return_value=True):
+                with patch("auto_coder.codex_cloud_client.CommandExecutor.run_command", return_value=mock_result) as mock_run:
+                    # 1. Initial request from repo-scoped client
+                    client = CodexCloudClient(backend_name="codex_cloud", repo_name="kitamura-tetsuo/auto-coder")
+                    task_id = client.start_task("Implement feature", title="Test Task")
+
+                    assert task_id == "task_e_6a26c19ac8a88326af83ebfb44b89fe2"
+                    assert mock_run.call_count == 1
+                    cmd_args = mock_run.call_args[0][0]
+
+                    # Assert that the initial command contains the override environment
+                    assert "--env" in cmd_args
+                    env_idx = cmd_args.index("--env")
+                    assert cmd_args[env_idx + 1] == "env-autocoder-override"
+                    assert "--attempts" in cmd_args
+                    attempts_idx = cmd_args.index("--attempts")
+                    assert cmd_args[attempts_idx + 1] == "3"
+
+                with patch("auto_coder.codex_cloud_client.CommandExecutor.run_command", return_value=mock_result) as mock_run_2:
+                    # 2. Initial request from base client with repo_name passed to start_task
+                    client_base = CodexCloudClient(backend_name="codex_cloud")
+                    task_id_2 = client_base.start_task("Implement feature", repo_name="kitamura-tetsuo/auto-coder", title="Test Task 2")
+
+                    assert task_id_2 == "task_e_6a26c19ac8a88326af83ebfb44b89fe2"
+                    assert mock_run_2.call_count == 1
+                    cmd_args_2 = mock_run_2.call_args[0][0]
+
+                    # Assert that the initial create-task command receives the repository override
+                    assert "--env" in cmd_args_2
+                    env_idx_2 = cmd_args_2.index("--env")
+                    assert cmd_args_2[env_idx_2 + 1] == "env-autocoder-override"

@@ -1,0 +1,579 @@
+"""Capacity-bounded execution lane for durable local model jobs."""
+
+from __future__ import annotations
+
+import os
+import threading
+import time
+import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import nullcontext
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Optional, Protocol
+
+from loguru import logger
+
+from .exceptions import AutoCoderRetryableBackendError, AutoCoderTimeoutError, AutoCoderUsageLimitError
+from .execution_trace import EventKind, Outcome, current_scope, get_trace_collector, run_with_scope
+from .invocation_admission import InvocationAdmissionGate, InvocationHandle, install_invocation_gate, reset_invocation_gate
+from .local_job_handoff import ContinuationState, InvocationOutcome, LocalJobClaim, LocalJobContinuation, LocalJobKind, LocalJobRecord, LocalJobState, LocalJobStore
+from .security_utils import redact_string
+
+
+@dataclass(frozen=True)
+class LocalJobExecutionResult:
+    """The actual outcome returned by one registered domain adapter."""
+
+    outcome: InvocationOutcome
+    output: str
+    diagnostic: str = ""
+    definitely_not_started: bool = False
+
+
+class LocalJobProviderEntryRefused(RuntimeError):
+    """Authoritative permission disappeared before actual provider entry."""
+
+
+class LocalJobDomainAdapter(Protocol):
+    """Domain-owned authority and invocation boundary used by the runner."""
+
+    def authorize_provider_entry(self, job: LocalJobRecord) -> bool:
+        """Return current authoritative permission for this exact incarnation."""
+
+    def invoke(self, job: LocalJobRecord) -> LocalJobExecutionResult:
+        """Invoke the captured backend in the captured repository context."""
+
+
+class LocalJobContinuationRecoveryAdapter(Protocol):
+    """Optional adapter boundary for reattaching a retained provider session."""
+
+    def authorize_recovery(self, job: LocalJobRecord) -> bool:
+        """Confirm authority for the already-entered attempt, not fresh entry."""
+
+    def recover_continuation(self, job: LocalJobRecord, provider_session: str, remaining_seconds: float) -> LocalJobExecutionResult | None:
+        """Observe or resume the retained session without a fresh implementation."""
+
+
+CompletionWake = Callable[[LocalJobRecord], None]
+
+
+def _process_start_token(pid: int) -> Optional[str]:
+    """Return Linux's immutable process start tick, or no liveness authority."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        # The parenthesized process name may contain spaces. Fields following
+        # its closing parenthesis start at field 3; starttime is field 22.
+        fields_after_name = stat[stat.rindex(")") + 2 :].split()
+        return fields_after_name[19]
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def current_runner_owner() -> str:
+    """Create restart-reconcilable evidence for this process lifetime."""
+    return process_owner(os.getpid())
+
+
+def process_owner(pid: int) -> str:
+    """Bind a process identity to its immutable Linux start tick."""
+    start = _process_start_token(pid)
+    return f"process:{pid}:{start}" if start else f"ambiguous:{pid}"
+
+
+def runner_owner_alive(owner: str) -> Optional[bool]:
+    """Return authoritative liveness; None means replay must stay suppressed."""
+    parts = owner.split(":")
+    if len(parts) != 3 or parts[0] != "process" or not parts[1].isdigit():
+        return None
+    pid = int(parts[1])
+    observed = _process_start_token(pid)
+    if observed is None:
+        return False if not os.path.exists(f"/proc/{pid}") else None
+    return observed == parts[2]
+
+
+def writer_group_settled(owner: str) -> bool:
+    """Prove the recorded host lifetime and all its descendant writers ended."""
+    if runner_owner_alive(owner) is not False:
+        return False
+    group = owner.split(":")[1]
+    try:
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                stat = (entry / "stat").read_text()
+            except FileNotFoundError:
+                continue
+            fields = stat[stat.rindex(")") + 2 :].split()
+            if fields[2] == group and fields[0] != "Z":
+                return False
+    except (OSError, ValueError, IndexError):
+        return False
+    return True
+
+
+class LocalJobRunner:
+    """Run accepted jobs without borrowing Issue or PR worker capacity.
+
+    ``poll`` only schedules work and never awaits inference. The private executor
+    is the documented capacity boundary; pending envelopes remain durable when
+    every slot is occupied.
+    """
+
+    def __init__(
+        self,
+        store: LocalJobStore,
+        admission_gate: InvocationAdmissionGate,
+        *,
+        repository: str,
+        capacity: int,
+        adapters: dict[LocalJobKind, LocalJobDomainAdapter],
+        completion_wake: Optional[CompletionWake] = None,
+        runner_id: str = "",
+        job_ids: Optional[frozenset[str]] = None,
+    ) -> None:
+        if capacity < 1:
+            raise ValueError("local runner capacity must be at least one")
+        self.store = store
+        self.repository = repository
+        self.admission_gate = admission_gate
+        self.capacity = capacity
+        self.adapters = dict(adapters)
+        self.completion_wake = completion_wake
+        self.runner_id = runner_id or current_runner_owner()
+        self._job_ids = job_ids
+        self._executor = ThreadPoolExecutor(max_workers=capacity, thread_name_prefix="local-job-runner")
+        self._notification_executor = ThreadPoolExecutor(max_workers=capacity, thread_name_prefix="local-job-notification")
+        self._lock = threading.Lock()
+        self._active: dict[str, Future[None]] = {}
+        self._last_scheduled: dict[str, int] = {}
+        self._schedule_sequence = 0
+        self._checkpoint_handles: dict[str, InvocationHandle] = {}
+        self._notifying: set[str] = set()
+        self._recovering_start_notifications: set[int] = set()
+        self._closed = False
+
+    def _discover_unsettled(self, *, strict: bool = False) -> tuple[LocalJobRecord, ...]:
+        jobs = self.store.discover_unsettled_strict() if strict else self.store.discover_unsettled()
+        return tuple(job for job in jobs if job.repository == self.repository and job.kind in self.adapters and (self._job_ids is None or job.job_id in self._job_ids))
+
+    def resume(self, job_id: str) -> None:
+        """Run exactly one explicitly requested continuation, never a fresh job."""
+        job = self.store.get(job_id)
+        if job is None or job.repository != self.repository or job.kind not in self.adapters or (self._job_ids is not None and job_id not in self._job_ids):
+            raise RuntimeError("Retained job does not match the resume target")
+        if job.state not in {LocalJobState.RUNNING, LocalJobState.PAUSED} or not job.provider_entered:
+            raise RuntimeError("Retained job has no unfinished provider invocation")
+        if job.state is LocalJobState.RUNNING and runner_owner_alive(job.runner_owner) is not False:
+            raise RuntimeError("Previous runner is live or its liveness is unknown")
+        continuation = self.store.get_continuation(job_id)
+        if continuation is None or not continuation.provider_session:
+            raise RuntimeError("Retained job has no provider session")
+        adapter = self.adapters[job.kind]
+        resume = getattr(adapter, "resume_continuation", None)
+        authorize = getattr(adapter, "authorize_recovery", None)
+        if not callable(resume) or not callable(authorize) or not authorize(job):
+            raise RuntimeError("Retained continuation authority is unavailable or superseded")
+        recover_pending = getattr(adapter, "recover_pending_result", None)
+        if continuation.state is not ContinuationState.FINAL_CONFIRMED and callable(recover_pending):
+            result = recover_pending(job)
+            if result is not None:
+                if not self._checkpoint_continuation_result(job, result, continuation.executor_token):
+                    raise RuntimeError("Recovered retained result could not be checkpointed")
+                return
+        if continuation.state is ContinuationState.FINAL_CONFIRMED:
+            recover = getattr(adapter, "recover_resume_result", None)
+            if not callable(recover):
+                raise RuntimeError("Backend cannot recover its confirmed result")
+            result = recover(job)
+            if result is None or not self._checkpoint_continuation_result(job, result, continuation.executor_token):
+                raise RuntimeError("Confirmed result could not be recovered")
+            return
+        validate = getattr(adapter, "validate_resume", None)
+        if not callable(validate):
+            raise RuntimeError("Backend does not support explicit continuation")
+        validate(job, continuation)
+        handle = self.admission_gate.try_admit(repository=job.repository, target=f"{job.kind.value}#{job.target_number}", stage="explicit_local_resume")
+        if handle is None:
+            raise RuntimeError("Invocation admission is draining")
+        token = f"{self.runner_id}:resume:{uuid.uuid4().hex}"
+        if not self.store.claim_explicit_resume(job, continuation, self.runner_id, token):
+            handle.begin_checkpointing("resume_claim_lost")
+            handle.confirm_settled(f"resume-claim-lost:{job_id}")
+            raise RuntimeError("Retained continuation was claimed by another controller")
+        current = self.store.get(job_id)
+        assert current is not None
+        try:
+            result = resume(current, continuation.provider_session, token)
+            if not self._checkpoint_continuation_result(current, result, token):
+                raise RuntimeError("Resumed result could not be durably checkpointed")
+            handle.begin_checkpointing("resumed_result")
+            handle.confirm_settled(f"resumed-result:{job_id}")
+        except BaseException as exc:
+            if self._pause_interrupted_continuation(current, token, exc, handle):
+                return
+            retained = self.store.retain_reconciliation_reason(job_id, token, redact_string(f"Explicit resume failed: {type(exc).__name__}: {exc}")[:2000])
+            handle.begin_checkpointing("resume_failed")
+            failed = self.store.get_continuation(job_id)
+            if retained and failed is not None and failed.executor_token == token and writer_group_settled(failed.writer_owner):
+                handle.confirm_settled(f"resume-failed:{job_id}:{token}")
+            raise
+
+    def _pause_interrupted_continuation(self, job: LocalJobRecord, token: str, error: BaseException, handle: InvocationHandle) -> bool:
+        if job.kind is not LocalJobKind.ISSUE_IMPLEMENTATION or (isinstance(error, Exception) and not isinstance(error, (AutoCoderTimeoutError, AutoCoderUsageLimitError, AutoCoderRetryableBackendError))):
+            return False
+        continuation = self.store.get_continuation(job.job_id)
+        if continuation is None or continuation.executor_token != token or not Path(continuation.provider_workspace).is_dir() or not writer_group_settled(continuation.writer_owner):
+            return False
+        reason = redact_string(f"{type(error).__name__}: {error}; resume with --only {job.target_number} --resume")[:2000]
+        if not self.store.pause_continuation(job, token, reason):
+            return False
+        handle.begin_checkpointing("paused")
+        handle.confirm_settled(f"paused:{job.job_id}:{token}")
+        with self._lock:
+            self._checkpoint_handles.pop(job.execution_incarnation, None)
+        collector = get_trace_collector()
+        scope = current_scope()
+        same_target = scope is not None and (scope.repository, scope.item_type, scope.item_number) == (job.repository, "issue", job.target_number)
+        with nullcontext() if same_target else collector.start_execution(job.repository, "issue", job.target_number, origin="local-backend", stage_id="issue.local-session-pause", label="Implementation session paused") as execution:
+            collector.record_event(
+                EventKind.STAGE_RESULT, stage_id="issue.local-session-pause", origin="local-backend", label="Implementation session paused", outcome=Outcome.DEFERRED, facts={"job_id": job.job_id, "backend": job.backend_name, "provider_session": continuation.provider_session, "reason": reason}
+            )
+            if execution is not None:
+                execution.set_outcome(Outcome.DEFERRED)
+        return True
+
+    def _checkpoint_continuation_result(self, job: LocalJobRecord, result: LocalJobExecutionResult, token: str) -> bool:
+        claim = LocalJobClaim(job, True)
+        artifact = self.store.persist_result_artifact(claim, result.outcome, result.output, executor_token=token)
+        return artifact is not None and self.store.record_result(claim, result.outcome, artifact.artifact_id, result.diagnostic, executor_token=token) and self.store.mark_downstream_pending(claim, executor_token=token)
+
+    def poll(self) -> int:
+        """Schedule as many pending envelopes as free runner slots permit."""
+        for adapter in self.adapters.values():
+            recover_notifications = getattr(adapter, "recover_start_notifications", None)
+            if callable(recover_notifications):
+                adapter_identity = id(adapter)
+                with self._lock:
+                    if adapter_identity not in self._recovering_start_notifications and not self._closed:
+                        self._recovering_start_notifications.add(adapter_identity)
+                        self._notification_executor.submit(self._recover_start_notifications, adapter_identity, recover_notifications)
+        self.recover_unsettled()
+        self.wake_downstream()
+        with self._lock:
+            self._reap_locked()
+            if self._closed:
+                return 0
+            free = self.capacity - len(self._active)
+            if free <= 0:
+                return 0
+            unsettled = self._discover_unsettled()
+            unsettled_ids = {job.job_id for job in unsettled}
+            self._last_scheduled = {job_id: sequence for job_id, sequence in self._last_scheduled.items() if job_id in unsettled_ids}
+            pending = [job for job in unsettled if job.state is LocalJobState.PENDING and job.job_id not in self._active]
+            # A refused entry returns to pending. Give other jobs a turn before
+            # retrying it, even when it is the oldest durable envelope.
+            pending.sort(key=lambda job: self._last_scheduled.get(job.job_id, 0))
+            scheduled = 0
+            for job in pending[:free]:
+                # Admission happens before claiming. A draining daemon leaves the
+                # definitely-not-started envelope pending for a later lifetime.
+                handle = self.admission_gate.try_admit(
+                    repository=job.repository,
+                    target=f"{job.kind.value}#{job.target_number}",
+                    stage="durable_local_job",
+                )
+                if handle is None:
+                    break
+                claim = self.store.claim(job.job_id, self.runner_id)
+                if claim is None or not claim.acquired:
+                    handle.begin_checkpointing("claim_lost")
+                    handle.confirm_settled(f"claim-lost:{job.job_id}")
+                    continue
+                self._checkpoint_handles[claim.record.execution_incarnation] = handle
+                self._schedule_sequence += 1
+                self._last_scheduled[job.job_id] = self._schedule_sequence
+                future = self._executor.submit(run_with_scope, current_scope(), self._execute, claim, handle)
+                self._active[job.job_id] = future
+                scheduled += 1
+            return scheduled
+
+    def wake_downstream(self) -> int:
+        """Schedule durable notifications without running callbacks on the caller."""
+        with self._lock:
+            if self._closed:
+                return 0
+            eligible = [job for job in self._discover_unsettled() if job.state is LocalJobState.DOWNSTREAM_EFFECTS_PENDING and job.kind in self.adapters and job.job_id not in self._notifying]
+            for job in eligible:
+                self._notifying.add(job.job_id)
+                self._notification_executor.submit(self._notify_downstream, job)
+            return len(eligible)
+
+    def active_count(self) -> int:
+        with self._lock:
+            self._reap_locked()
+            return len(self._active)
+
+    def close(self, *, wait: bool = False) -> None:
+        """Stop scheduling; waiting is optional and never delegated to a worker."""
+        with self._lock:
+            self._closed = True
+        self._executor.shutdown(wait=wait, cancel_futures=False)
+        self._notification_executor.shutdown(wait=wait, cancel_futures=False)
+
+    def _reap_locked(self) -> None:
+        self._active = {job_id: future for job_id, future in self._active.items() if not future.done()}
+
+    def recover_unsettled(self, *, strict: bool = False) -> None:
+        """Reconcile retained checkpoints without scheduling a new invocation."""
+        for job in self._discover_unsettled(strict=strict):
+            with self._lock:
+                active = self._active.get(job.job_id)
+                if active is not None and not active.done():
+                    continue
+            if job.state is LocalJobState.RUNNING and job.provider_entered:
+                continuation = self.store.get_continuation(job.job_id)
+                token = continuation.executor_token if continuation is not None else job.runner_owner
+                if self.store.recover_recorded_result(job, executor_token=token):
+                    refreshed = self.store.get(job.job_id)
+                    if refreshed is None:
+                        continue
+                    job = refreshed
+                elif runner_owner_alive(job.runner_owner) is False and self._recover_continuation(job):
+                    refreshed = self.store.get(job.job_id)
+                    if refreshed is None:
+                        continue
+                    job = refreshed
+                elif runner_owner_alive(job.runner_owner) is False and self._recover_domain_checkpoint(job):
+                    refreshed = self.store.get(job.job_id)
+                    if refreshed is None:
+                        continue
+                    job = refreshed
+                else:
+                    continue
+            if job.state is LocalJobState.RESULT_RECORDED:
+                continuation = self.store.get_continuation(job.job_id)
+                self._confirm_unsuccessful_continuation(job, continuation)
+                token = continuation.executor_token if continuation is not None else job.runner_owner
+                if self.store.recover_downstream_pending(job, executor_token=token):
+                    self._settle_recovered_handle(job)
+            elif job.state is LocalJobState.RUNNING and not job.provider_entered:
+                alive = runner_owner_alive(job.runner_owner)
+                if alive is False:
+                    try:
+                        artifact = self.store.get_execution_result_artifact(job.job_id, job.execution_incarnation)
+                    except RuntimeError:
+                        # An unavailable read is not evidence that no checkpoint exists.
+                        continue
+                    adapter = self.adapters.get(job.kind)
+                    validate = getattr(adapter, "validate_controller_completion", None) if adapter is not None else None
+                    if artifact is not None:
+                        try:
+                            valid = callable(validate) and bool(validate(job, artifact))
+                        except Exception:
+                            valid = False
+                        if valid and self.store.adopt_controller_result(job, artifact):
+                            refreshed = self.store.get(job.job_id)
+                            if refreshed is not None and self.store.recover_downstream_pending(refreshed, executor_token=job.runner_owner):
+                                self._settle_recovered_handle(refreshed)
+                        # Present but invalid evidence remains retained for diagnosis.
+                        continue
+                    if self.store.release_dead_owner_claim(job, "previous runner owner is authoritatively dead"):
+                        self._cleanup_released_workspaces(job.kind)
+
+    def _confirm_unsuccessful_continuation(self, job: LocalJobRecord, continuation: LocalJobContinuation | None) -> None:
+        if (
+            continuation is not None
+            and continuation.execution_incarnation == job.execution_incarnation
+            and job.invocation_outcome in {InvocationOutcome.FAILED, InvocationOutcome.INTERRUPTED}
+            and continuation.state is not ContinuationState.FINAL_CONFIRMED
+            and writer_group_settled(continuation.writer_owner)
+        ):
+            self.store.confirm_unsuccessful_continuation(job, continuation)
+
+    def _recover_continuation(self, job: LocalJobRecord) -> bool:
+        continuation = self.store.get_continuation(job.job_id)
+        if continuation is None:
+            return False
+        adapter = self.adapters.get(job.kind)
+        recover = getattr(adapter, "recover_continuation", None) if adapter is not None else None
+        authorize = getattr(adapter, "authorize_recovery", None) if adapter is not None else None
+        if not callable(recover) or not callable(authorize):
+            self.store.retain_reconciliation_reason(
+                job.job_id,
+                continuation.executor_token,
+                "domain adapter does not support retained continuation recovery",
+            )
+            return False
+        if not job.workspace_path or not Path(job.workspace_path).is_dir():
+            self.store.retain_reconciliation_reason(job.job_id, continuation.executor_token, "retained workspace is unavailable")
+            return False
+        if continuation.deadline_at is None:
+            self.store.retain_reconciliation_reason(job.job_id, continuation.executor_token, "legacy continuation has no trustworthy invocation deadline")
+            return False
+        remaining = continuation.deadline_at - time.time()
+        if remaining <= 0:
+            self.store.retain_reconciliation_reason(job.job_id, continuation.executor_token, "logical invocation deadline expired")
+            return False
+        if not authorize(job):
+            self.store.retain_reconciliation_reason(job.job_id, continuation.executor_token, "retained upstream authority is unavailable or superseded")
+            return False
+        new_token = f"{self.runner_id}:recovery:{job.execution_incarnation}"
+        if not self.store.take_over_continuation(job.job_id, continuation.executor_token, new_token, expected_runner_owner=job.runner_owner):
+            return False
+        claimed = self.store.get_continuation(job.job_id)
+        if claimed is None or claimed.executor_token != new_token:
+            return False
+        try:
+            result = recover(job, claimed.provider_session, remaining)
+        except Exception as exc:
+            self.store.retain_reconciliation_reason(job.job_id, new_token, f"provider reconciliation failed: {type(exc).__name__}: {exc}")
+            return False
+        if result is None or result.definitely_not_started:
+            self.store.retain_reconciliation_reason(job.job_id, new_token, "provider session remains unresolved")
+            return False
+        return self._checkpoint_continuation_result(job, result, new_token)
+
+    def _settle_recovered_handle(self, job: LocalJobRecord) -> None:
+        with self._lock:
+            handle = self._checkpoint_handles.pop(job.execution_incarnation, None)
+        if handle is not None:
+            handle.confirm_settled(job.result_reference)
+
+    def _notify_downstream(self, job: LocalJobRecord) -> None:
+        try:
+            if self.completion_wake is not None:
+                self.completion_wake(job)
+        except Exception as exc:
+            logger.warning("Local job completion wake failed for {}: {}", job.job_id, exc)
+        finally:
+            with self._lock:
+                self._notifying.discard(job.job_id)
+
+    def _recover_start_notifications(self, adapter_identity: int, recover: Callable[[str, Optional[frozenset[str]]], None]) -> None:
+        try:
+            recover(self.repository, self._job_ids)
+        except Exception as exc:
+            logger.warning("Local start notification recovery failed: {}", type(exc).__name__)
+        finally:
+            with self._lock:
+                self._recovering_start_notifications.discard(adapter_identity)
+
+    def _cleanup_released_workspaces(self, kind: LocalJobKind) -> None:
+        cleanup = getattr(self.adapters.get(kind), "cleanup_released_workspaces", None)
+        if callable(cleanup):
+            try:
+                cleanup()
+            except Exception as exc:
+                logger.warning("Released local job workspace cleanup failed: {}", exc)
+
+    def _execute(self, claim: LocalJobClaim, handle: InvocationHandle) -> None:
+        # Keep the same daemon admission gate visible at provider boundaries in
+        # this independently owned thread.
+        gate_token = install_invocation_gate(self.admission_gate)
+        try:
+            adapter = self.adapters.get(claim.record.kind)
+            if adapter is None:
+                self.store.release_unentered_claim(claim, "no registered domain adapter")
+                self._checkpoint_without_provider(handle, claim, "adapter_unavailable")
+                return
+            try:
+                authorized = adapter.authorize_provider_entry(claim.record)
+            except Exception as exc:
+                self.store.release_unentered_claim(claim, f"authorization unavailable: {exc}")
+                self._checkpoint_without_provider(handle, claim, "authorization_unavailable")
+                return
+            if not authorized:
+                self.store.release_unentered_claim(claim, "authoritative provider-entry permission denied")
+                self._checkpoint_without_provider(handle, claim, "authorization_denied")
+                return
+            try:
+                invoke_at_entry = getattr(adapter, "invoke_at_provider_entry", None)
+                if callable(invoke_at_entry):
+                    result = invoke_at_entry(claim.record, lambda: self.store.mark_provider_entered(claim))
+                else:
+                    if not self.store.mark_provider_entered(claim):
+                        self.store.record_runner_diagnostic(claim, "provider-entry checkpoint failed")
+                        self._checkpoint_without_provider(handle, claim, "entry_checkpoint_failed", settle=False)
+                        return
+                    result = adapter.invoke(claim.record)
+            except LocalJobProviderEntryRefused as exc:
+                self.store.release_unentered_claim(claim, str(exc))
+                self._checkpoint_without_provider(handle, claim, "authorization_denied")
+                return
+            except BaseException as exc:
+                if self._pause_interrupted_continuation(claim.record, claim.record.runner_owner, exc, handle):
+                    return
+                result = LocalJobExecutionResult(InvocationOutcome.FAILED if isinstance(exc, Exception) else InvocationOutcome.INTERRUPTED, f"{type(exc).__name__}: {exc}", "provider raised" if isinstance(exc, Exception) else "provider interrupted")
+
+            if result.definitely_not_started:
+                self.store.release_unentered_claim(claim, result.diagnostic or result.output)
+                self._checkpoint_without_provider(handle, claim, "definitely_not_started")
+                return
+
+            handle.begin_checkpointing(result.outcome.value)
+            artifact = self.store.persist_result_artifact(
+                claim,
+                result.outcome,
+                result.output,
+                executor_token=claim.record.runner_owner,
+            )
+            if artifact is None or not self.store.record_result(
+                claim,
+                result.outcome,
+                artifact.artifact_id,
+                result.diagnostic,
+                executor_token=claim.record.runner_owner,
+            ):
+                handle.record_checkpoint_attempt_failed("local job result checkpoint failed")
+                return
+            recorded = self.store.get(claim.record.job_id)
+            if recorded is not None:
+                self._confirm_unsuccessful_continuation(recorded, self.store.get_continuation(recorded.job_id))
+            if not self.store.mark_downstream_pending(claim, executor_token=claim.record.runner_owner):
+                handle.record_checkpoint_attempt_failed("downstream eligibility checkpoint failed")
+                return
+            handle.confirm_settled(artifact.artifact_id)
+            with self._lock:
+                self._checkpoint_handles.pop(claim.record.execution_incarnation, None)
+            current = self.store.get(claim.record.job_id)
+            if current is not None and self.completion_wake is not None:
+                self.wake_downstream()
+        finally:
+            self._cleanup_released_workspaces(claim.record.kind)
+            reset_invocation_gate(gate_token)
+
+    def _recover_domain_checkpoint(self, job: LocalJobRecord) -> bool:
+        """Let the owning adapter recover a post-entry domain checkpoint."""
+        adapter = self.adapters.get(job.kind)
+        recover = getattr(adapter, "recover_interrupted", None) if adapter is not None else None
+        if recover is None:
+            return False
+        try:
+            result = recover(job)
+        except Exception as exc:
+            logger.warning("Local job domain recovery failed for {}: {}", job.job_id, exc)
+            return False
+        if result is None or result.definitely_not_started:
+            return False
+        claim = LocalJobClaim(job, True)
+        artifact = self.store.persist_result_artifact(claim, result.outcome, result.output, executor_token=job.runner_owner)
+        if artifact is None or not self.store.record_result(
+            claim,
+            result.outcome,
+            artifact.artifact_id,
+            result.diagnostic,
+            executor_token=job.runner_owner,
+        ):
+            return False
+        return self.store.mark_downstream_pending(claim, executor_token=job.runner_owner)
+
+    @staticmethod
+    def _checkpoint_without_provider(handle: InvocationHandle, claim: LocalJobClaim, outcome: str, *, settle: bool = True) -> None:
+        handle.begin_checkpointing(outcome)
+        if settle:
+            handle.confirm_settled(f"runner-refusal:{claim.record.execution_incarnation}")
+        else:
+            handle.record_checkpoint_attempt_failed(outcome)

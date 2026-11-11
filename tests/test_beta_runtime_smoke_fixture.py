@@ -1,0 +1,107 @@
+"""Real Git regression for disposable beta smoke evidence isolation."""
+
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from auto_coder.beta_source_selection import BetaSourceSelector, MutationCertainty
+from tests.test_beta_runtime_smoke_container import _cleanup_smoke_docker, _owned_staging, _SourceService
+
+
+@pytest.mark.parametrize("detached", [False, True])
+def test_source_service_does_not_inherit_checkout_acceptance_tags(tmp_path: Path, _use_real_commands: None, detached: bool) -> None:
+    source = tmp_path / "source.git"
+    subprocess.run(["git", "init", "--bare", str(source)], check=True, capture_output=True)
+
+    def git(*args: str, input: str | None = None) -> str:
+        return subprocess.run(["git", f"--git-dir={source}", *args], input=input, check=True, capture_output=True, text=True).stdout.strip()
+
+    tree = git("mktree", input="")
+    prior = git("hash-object", "-w", "-t", "commit", "--stdin", input=f"tree {tree}\nauthor Fixture <fixture@example.com> 0 +0000\ncommitter Fixture <fixture@example.com> 0 +0000\n\nprior\n")
+    candidate = git("hash-object", "-w", "-t", "commit", "--stdin", input=f"tree {tree}\nparent {prior}\nauthor Fixture <fixture@example.com> 1 +0000\ncommitter Fixture <fixture@example.com> 1 +0000\n\ncandidate\n")
+    git("update-ref", "refs/heads/main", candidate)
+    git("symbolic-ref", "HEAD", "refs/heads/main")
+    if detached:
+        git("update-ref", "refs/heads/main", prior)
+        git("update-ref", "--no-deref", "HEAD", candidate)
+    inherited = ("auto-coder-beta-current", "auto-coder-beta-selection-current", "auto-coder-beta-selection-r77", f"auto-coder-tested-{candidate}", "auto-coder-beta-acceptance-existing")
+    for name in inherited:
+        git("update-ref", f"refs/tags/{name}", prior)
+    original_refs = git("show-ref")
+
+    remote = _SourceService(source, tmp_path / "isolated.git")
+    assert remote._git("rev-parse", "HEAD") == candidate
+    assert remote._git("cat-file", "-t", prior) == "commit"
+    assert remote._git("for-each-ref", "--format=%(refname)", "refs/tags") == ""
+    for name in inherited:
+        assert remote.request("GET", f"git/ref/tags/{name}").status == 404
+
+    remote.publish_proof({"source_sha": candidate, "distribution_version": f"1.0+g{candidate}", "lock_sha256": "e" * 64}, 101)
+    remote.executions[(11, 1)] = (candidate, "2026-10-01T01:00:00Z")
+    selected = BetaSourceSelector(remote, "owner/repo").advance("r77", None)
+    assert selected.certainty is MutationCertainty.CONFIRMED
+    assert selected.selected_sha == candidate
+    assert selected.observed_sha == candidate
+    assert git("show-ref") == original_refs
+
+
+def test_case_owned_docker_cleanup_preserves_failure_and_removes_every_owned_resource(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import tests.test_beta_runtime_smoke_container as smoke
+
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    calls: list[tuple[str, ...]] = []
+
+    def docker(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+        calls.append(arguments)
+        if arguments[:2] == ("logs", "worker"):
+            raise OSError("diagnostics unavailable")
+        return subprocess.CompletedProcess(arguments, 0, stdout="fixture log\n", stderr="")
+
+    monkeypatch.setattr(smoke, "_docker", docker)
+    with pytest.raises(AssertionError, match="original setup or assertion failure"):
+        try:
+            raise AssertionError("original setup or assertion failure")
+        finally:
+            _cleanup_smoke_docker("worker", "github", "network", "smoke-case")
+
+    assert ("logs", "worker") in calls
+    assert ("logs", "github") in calls
+    assert ("rm", "-f", "worker") in calls
+    assert ("rm", "-f", "github") in calls
+    assert ("network", "rm", "network") in calls
+    assert (tmp_path / "supervisor-integration-logs" / "smoke-case" / "github.log").read_text() == "fixture log\n"
+
+
+@pytest.mark.parametrize("missing_message", ["Error: No such object: stage", "error: no such object: stage", "Error: No such container: stage"])
+def test_staging_guard_owns_timeout_cleanup_before_temporary_roots_close(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, missing_message: str) -> None:
+    import tests.test_beta_runtime_smoke_container as smoke
+
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    (tmp_path / "runtime").mkdir()
+    (tmp_path / "runtime" / "staging.log").write_text("installer progress\n")
+    calls: list[tuple[str, ...]] = []
+    exists = True
+
+    def docker(*arguments: str, check: bool = True, timeout: int = 30) -> subprocess.CompletedProcess[str]:
+        nonlocal exists
+        calls.append(arguments)
+        if arguments[0] == "logs":
+            return subprocess.CompletedProcess(arguments, 0, stdout="real staging log\n", stderr="")
+        if arguments[:2] == ("rm", "-f"):
+            exists = False
+        if arguments[0] == "inspect":
+            return subprocess.CompletedProcess(arguments, 0 if exists else 1, stdout="", stderr="" if exists else missing_message)
+        return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(smoke, "_docker", docker)
+    with pytest.raises(subprocess.TimeoutExpired):
+        with _owned_staging("stage", "stage-timeout", tmp_path):
+            raise subprocess.TimeoutExpired(["docker", "run"], 8, output=b"captured CLI output\n")
+
+    assert not exists
+    assert calls == [("logs", "stage"), ("rm", "-f", "stage"), ("inspect", "stage")]
+    log_root = tmp_path / "supervisor-integration-logs" / "stage-timeout"
+    assert (log_root / "stage-container.log").read_text() == "real staging log\n"
+    assert (log_root / "stage-cli-timeout.log").read_text() == "captured CLI output\n"
+    assert (log_root / "stage-internal.log").read_text() == "installer progress\n"

@@ -1,0 +1,195 @@
+# Authenticated runtime diagnostics and single-target reevaluation
+
+The independent `auto-coder management serve --config PATH` process exposes
+fixed MCP diagnostics, single-target reevaluation, and worker lifecycle tools
+beside `auto_coder_whoami`. These tools share one durable management dispatcher.
+The separately opted-in management self-update tool is documented in
+[`management-mcp-self-update.md`](management-mcp-self-update.md). This process does
+**not** run an `AutomationEngine`, execute GitHub/provider jobs, control Docker, start or
+stop containers, or schedule a new retry system. Only the existing worker UDS
+producer can accept a single Issue/PR reevaluation.
+
+## Trusted deployment configuration
+
+Runtime tools use a retained operation store and a read-only operating policy.
+Worker source deployment also uses a configured source repository and read
+credential:
+
+```yaml
+state_root: /management-oauth
+operation_state_root: /management-operations
+operating_policy_path: /management-policy/operating-policy.yaml
+source_repository: kitamura-tetsuo/auto-coder
+source_evidence_token_file: /run/secrets/source_evidence_read
+```
+
+The remaining `public_origin`, Firebase project, bind and statically registered
+OAuth-client fields follow `management-mcp-authentication.md`. The
+`operation_state_root` and `operating_policy_path` fields are optional for
+deployments that use only `auto_coder_whoami`; runtime tools then return
+`UNAVAILABLE` and never grant mutation authority. Operators should
+provision `operating_policy_path` **read-only** from the controller, not inside a
+worker filesystem, workspace, or manager-writable operation store. An absent,
+malformed, duplicate-key or unreadable policy is not interpreted as `beta`.
+
+`compose.management.yml` mounts `./runtime/management/policy` read-only at
+`/management-policy` and the separate durable operations directory at
+`/management-operations`. The operator must create the actual policy file and
+configure its path before enabling runtime controls. For example:
+
+```yaml
+profile: beta
+targets:
+  beta-worker:
+    channel: beta
+    repositories: [example/beta-repo]
+  beta-agent-table-worker:
+    channel: beta
+    repositories: [example/agent-table-repo]
+  release-worker:
+    channel: release
+    repositories: [example/release-repo]
+```
+
+Use the exact `RELEASE_REPOSITORY`, `BETA_REPOSITORY`, and
+`kitamura-tetsuo/agent-table` provisioned in Compose, not the example names.
+Each logical target must name **one** configured channel
+and its **one** exact repository. The physical instance IDs, endpoint addresses,
+ports and independent machine credentials come only from the validated
+`AUTO_CODER_WORKER_REGISTRY` described in
+[`management-multi-worker-registry.md`](management-multi-worker-registry.md);
+no MCP argument selects them. All configured Supervisor bridges must be
+provisioned on the private Docker network.
+The OAuth access bearer is never forwarded to a Supervisor. The policy's
+`observe`/`beta`/`full` profile is reread for each new action and immediately
+before the first unsent worker effect. A later downgrade does not authorize a
+new effect, and it does not erase a previously committed receipt.
+
+## Fixed MCP tool schemas
+
+| Tool | Required scopes | Arguments | Meaning |
+| --- | --- | --- | --- |
+| `auto_coder_status` | `auto-coder.read` | `target_id`, optional `limit` (1–500) | Bounded `/api/status` plus nonce-bound worker lifecycle, heartbeat and installed runtime evidence |
+| `auto_coder_logs` | `auto-coder.read` | `target_id`, optional `limit`, `item_type`, `item_number`, `execution_id`, `process_run_id`, `after_sequence`, `cursor` | Existing source-redacted, bounded log projection and retention-gap outcomes |
+| `auto_coder_validation_attempt` | `auto-coder.read` | `target_id`, required positive `pr_number`, and exactly one of `attempt_id` or `attempt_sequence` | Existing exact validation-attempt projection and no-match/unavailable outcomes |
+| `auto_coder_pr_diagnostics` | `auto-coder.read` | `target_id`, positive `pr_number`, optional `limit` (1–100) and `cursor` | Independent retained review-cycle, effective-decision, effect and pending-work evidence; see [`retained-pr-publication-diagnostics.md`](retained-pr-publication-diagnostics.md) |
+| `auto_coder_operation_get` | `auto-coder.read` | `operation_id`, plus `target_id` for worker operations | Original operation reconciliation; may submit or enqueue already-admitted unsettled effects, so callers must not use it as a side-effect-free diagnostic |
+| `auto_coder_operation_inspect` | `auto-coder.read` | `operation_id`, plus `target_id` for worker operations | Owner-scoped immutable intent, journal state and prior verified receipts without dispatcher submission, enqueueing or worker effects; it never settles an unresolved send |
+| `auto_coder_reevaluate_target` | `auto-coder.read` and `auto-coder.operate` | `target_id`, `target_type` (`issue`/`pr`), positive `number`, `idempotency_key` (1–128 characters), `expected_process_run_id`, `expected_deployment_generation` | One journaled reevaluation request for the current live worker incarnation |
+| `auto_coder_deployment_status` | `auto-coder.read` | `target_id` | Signed Supervisor state and actual installed worker observation where available |
+| `auto_coder_start_worker` | `auto-coder.read` and `auto-coder.deploy` | `target_id`, `idempotency_key`, `expected_supervisor_generation`, optional `expected_runtime_id` | Start the existing selected runtime only after a genuine stop |
+| `auto_coder_stop_worker` | `auto-coder.read` and `auto-coder.deploy` | `target_id`, `idempotency_key`, `expected_supervisor_generation`, `expected_process_run_id`, `expected_deployment_generation`, `expected_runtime_id` | Request graceful stop and await terminal receipt plus OS exit |
+| `auto_coder_restart_worker` | `auto-coder.read` and `auto-coder.deploy` | The same generation-fenced arguments as `stop_worker` | Gracefully stop and start the selected runtime using separate journaled effects |
+| `auto_coder_deploy_beta_source` | `auto-coder.read` and `auto-coder.deploy` | `target_id`, `selected_git_sha`, `idempotency_key`, `expected_supervisor_generation`, optional `expected_process_run_id`, `expected_deployment_generation`, `expected_runtime_id` | Stage and activate only the exactly selected tested beta source |
+| `auto_coder_deploy_release_source` | `auto-coder.read` and `auto-coder.deploy` | `target_id`, `selected_git_sha`, original `promotion_operation_id`, `catalog_ref`, `catalog_oid`, `acceptance_ref`, `acceptance_oid`, `idempotency_key`, `expected_supervisor_generation`, optional `expected_process_run_id`, `expected_deployment_generation`, `expected_runtime_id` | Stage and activate only an exactly selected accepted Git-source release under the configured full release policy; real-host acceptance remains required |
+
+See [`in-container-worker-source-updates.md`](in-container-worker-source-updates.md)
+for deployment evidence, credentials, operation progress and recovery limitations.
+For the distinct release authority and current operation-selection evidence,
+see [`release-worker-source-deployment.md`](release-worker-source-deployment.md).
+
+The MCP tool schema rejects unknown arguments. The service also rejects Boolean
+or nonpositive item numbers, invalid identity/key characters and out-of-range
+limits. It accepts no `force`, `retry`, `resume`, `emergency`, `backend`, model,
+permission, command, arbitrary URL, path, repository, channel or machine key.
+`auto_coder_reevaluate_target` is an explicitly mutating, idempotent tool;
+`auto_coder_operation_inspect` is the non-dispatching operation reader. The legacy
+`auto_coder_operation_get` may advance existing operations and is explicitly
+marked non-read-only; tool annotations do not confer an absence of effects.
+The normal OAuth resource authentication still yields HTTP **401** for invalid
+credentials, **403** for missing original scope/current permission, and **503**
+when the grant authority is unavailable *before any MCP tool executes*.
+
+## What is authoritative
+
+The signed bridge query binds one fresh nonce to the actual UDS producer's
+repository, channel, process run, deployment generation, lifecycle,
+startup reconciliation, daemon-serving state, invocation gate and heartbeat.
+The selected installed runtime binding is `VERIFIED` only with the exact
+Supervisor-selected runtime ID, READY content identity and locked-input digest,
+joined to the same worker incarnation and the worker's actually installed
+source revision/distribution version. A bootstrap worker without verified READY
+evidence is reported as `UNAVAILABLE` for installed-runtime readiness;
+matching source SHAs alone are insufficient. A responsive Supervisor with a
+dead child is never a healthy worker observation. Diagnostics always come from
+the worker's existing source-projected, redacted and bounded UDS routes; the
+manager does not read worker files or synthesize missing history.
+
+Log pages have one complete private-response budget. The Supervisor reserves
+the compact authenticated-envelope bytes from the existing 256 KiB limit and
+asks the UDS producer to fit its source page into the remainder. Recent-tail
+pages still select the newest fitting events, while incremental pages keep the
+oldest unread fitting prefix and a checkpoint that cannot skip an event removed
+for envelope fitting. This private composition does not change the public
+`/api/logs` limit or the network client's bounded-response validation.
+The negotiation changes neither trace emission nor its schema, origins, or
+dashboard projection, so it is observability-neutral.
+
+`auto_coder_reevaluate_target` first checks the current `RUNNING`, reconciled,
+daemon-serving and invocation-open facts, and the exact expected run/generation.
+Before the first effect it checks the **original**, durable bearer acceptance
+against the current unexpired grant, original consent, UID eligibility, current
+service/client scope configuration, target map and operating profile. A later
+token refresh cannot expand that authority. Access-token expiry alone does not
+cancel an already admitted operation, while grant expiry, revocation, removed
+consent, missing operator policy or a profile downgrade prevent the new effect.
+The operation journal (`management-operation-journal.md`) commits intent and
+non-secret authenticated authority before the worker request. Reevaluation,
+worker lifecycle, and management self-update handlers share one dispatcher
+with per-target journal exclusion; unknown actions remain `NEEDS_ATTENTION`.
+Its queue is only a delivery mechanism for already accepted management
+operations, never an alternate Issue/PR scheduler. Worker lifecycle and
+management self-update use their documented bound effect sequences and recovery
+rules within this same dispatcher.
+
+The response `accepted_for_reevaluation` is returned only after validating the
+actual worker's durable invalidation receipt: same operation ID, target,
+channel, repository and accepting/requested worker incarnation. This proves
+only an **ordinary reevaluation obligation** was accepted—not implementation,
+review, merge, publication or provider completion. Identical idempotency
+replay returns the original operation and original acceptance, not a new effect.
+`CONFLICT` (changed request/key), `BUSY` (another live target operation),
+`NOT_FOUND`, `UNAVAILABLE`, `NEEDS_ATTENTION` and `RECONCILING`/`sent_unknown`
+are distinct. Lost responses, manager restarts, network failures or replaced
+workers never release a possibly-sent operation's lane by timeout.
+
+For a reevaluation attempt recorded as `sent_unknown`, the dispatcher may
+**only read** the receipt for that exact operation ID from the fixed worker
+endpoint. It must never forward the same action again, issue a substitute key or infer success
+from a missing result. Auth/policy downgrades do not forbid this exact read-only
+reconciliation. A durable confirmed receipt can finish the journal operation
+after a crash without repeating the worker command.
+
+Operators should retain the SQLite management journal and the worker's own
+durable reevaluation receipts across restarts. Keep service logs in the
+configured rotating Loguru file **and** stdout sink. Runtime results contain
+only bounded identity, redacted diagnostic and safe-effect projections; they
+are not cacheable and never include access, Firebase or machine credentials.
+
+## Installed specification-consumer measurements
+
+`auto_coder_consumer_identity` is a read-scoped diagnostic for one configured
+worker target. The worker hashes a fixed set of package files: the requirements
+contract, specification analyzer, validation lifecycle, Issue review service,
+and package-default prompts. The response identifies the target, repository,
+worker process run, deployment and supervisor generations and separately reports
+worker artifact metadata and staged runtime binding. A bootstrap worker may
+return measured files while its runtime binding remains `UNAVAILABLE`.
+
+The origin is worker package disk bytes, not Docker inspection. Two measurements
+at bridge initialization and two at collection must agree, and each file must
+remain metadata-stable during its read. Missing or unreadable files are
+`UNAVAILABLE`; files must be regular, non-symlink files no larger than 16 MiB.
+Differing samples are `CONFLICT`. Agreement does not prove files
+were unchanged between samples, that already-imported Python code matches disk,
+or that a particular operation used the default prompts (which may be cached or
+explicitly selected). Declared artifact and source metadata are not hash proofs.
+The API accepts no file paths and does not expose file contents.
+
+## Retained prior-instance evidence
+
+Reads and original-key replays from a protected prior journal carry
+`history_origin: retained_prior_instance`, including worker lifecycle and
+reevaluation responses and missing or unsettled lifecycle snapshots. Current
+journal projections do not acquire this marker. Historical outcome, identities
+and uncertainty remain unchanged; replay does not dispatch an effect.

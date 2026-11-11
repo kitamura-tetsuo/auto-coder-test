@@ -1,0 +1,144 @@
+{
+  "schema_version": 1,
+  "targets": [
+    {
+      "id": "task-scoped-test-execution",
+      "prompt_dependencies": [
+        {
+          "path": "src/auto_coder/prompts.yaml",
+          "keys": [
+            "policies.task_scoped_test_execution"
+          ]
+        }
+      ],
+      "config": "prompt-evals/targets/task-scoped-test-execution/promptfooconfig.yaml",
+      "cases": [
+        "prompt-evals/targets/task-scoped-test-execution/cases/*.yaml"
+      ]
+    },
+    {
+      "id": "chatgpt-review-adjudication",
+      "prompt_dependencies": [
+        {
+          "path": "docs/prompts/review-adjudication-chatgpt.md"
+        }
+      ],
+      "config": "prompt-evals/targets/chatgpt-review-adjudication/promptfooconfig.yaml",
+      "cases": [
+        "prompt-evals/targets/chatgpt-review-adjudication/cases/*.yaml"
+      ]
+    },
+    {
+      "id": "individual-objective-scope",
+      "prompt_dependencies": [
+        {
+          "path": "src/auto_coder/prompts.yaml",
+          "keys": [
+            "issue.adversarial_specification_analysis"
+          ]
+        }
+      ],
+      "config": "prompt-evals/targets/individual-objective-scope/promptfooconfig.yaml",
+      "cases": [
+        "prompt-evals/targets/individual-objective-scope/cases/*.yaml"
+      ]
+    },
+    {
+      "id": "decomposition-objective-scope",
+      "prompt_dependencies": [
+        {
+          "path": "src/auto_coder/prompts.yaml",
+          "keys": [
+            "issue.adversarial_decomposition_analysis"
+          ]
+        }
+      ],
+      "config": "prompt-evals/targets/decomposition-objective-scope/promptfooconfig.yaml",
+      "cases": [
+        "prompt-evals/targets/decomposition-objective-scope/cases/*.yaml"
+      ]
+    },
+    {
+      "id": "short-objective-contract",
+      "prompt_dependencies": [
+        {
+          "path": "src/auto_coder/prompts.yaml",
+          "keys": [
+            "policies.short_objective_authoring",
+            "policies.objective_requirements_boundary"
+          ]
+        }
+      ],
+      "config": "prompt-evals/targets/short-objective-contract/promptfooconfig.yaml",
+      "cases": [
+        "prompt-evals/targets/short-objective-contract/cases/*.yaml"
+      ]
+    },
+    {
+      "id": "parent-child-contract-boundary",
+      "prompt_dependencies": [
+        {
+          "path": "src/auto_coder/prompts.yaml",
+          "keys": [
+            "policies.parent_child_contract_boundary"
+          ]
+        }
+      ],
+      "config": "prompt-evals/targets/parent-child-contract-boundary/promptfooconfig.yaml",
+      "cases": [
+        "prompt-evals/targets/parent-child-contract-boundary/cases/*.yaml"
+      ]
+    },
+    {
+      "id": "jules-autonomy-checkpoint-recovery",
+      "prompt_dependencies": [
+        {
+          "path": "src/auto_coder/prompts.yaml",
+          "keys": [
+            "cloud_provider_instructions.jules.initial"
+          ]
+        }
+      ],
+      "config": "prompt-evals/targets/jules-autonomy-checkpoint-recovery/promptfooconfig.yaml",
+      "cases": [
+        "prompt-evals/targets/jules-autonomy-checkpoint-recovery/cases/*.yaml"
+      ]
+    },
+    {
+      "id": "test-oracle-gap-completion",
+      "prompt_dependencies": [
+        {
+          "path": "src/auto_coder/prompts.yaml",
+          "keys": [
+            "pr.adversarial_validation_gap_completion"
+          ]
+        }
+      ],
+      "config": "prompt-evals/targets/test-oracle-gap-completion/promptfooconfig.yaml",
+      "cases": [
+        "prompt-evals/targets/test-oracle-gap-completion/cases/*.yaml"
+      ]
+    },
+    {
+      "id": "incremental-pr-rereview",
+      "prompt_dependencies": [
+        {
+          "path": "src/auto_coder/prompts.yaml",
+          "keys": [
+            "pr.adversarial_validation",
+            "pr.adversarial_validation_rereview",
+            "policies.objective_requirements_boundary",
+            "policies.parent_child_contract_boundary",
+            "policies.pr_validation_contract_boundary",
+            "policies.bounded_correction_contract",
+            "policies.task_scoped_test_execution"
+          ]
+        }
+      ],
+      "config": "prompt-evals/targets/incremental-pr-rereview/promptfooconfig.yaml",
+      "cases": [
+        "prompt-evals/targets/incremental-pr-rereview/cases/*.yaml"
+      ]
+    }
+  ]
+}

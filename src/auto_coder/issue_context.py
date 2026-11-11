@@ -1,0 +1,343 @@
+import re
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
+from .logger_config import get_logger
+
+logger = get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class VerifiedIssueOracle:
+    number: int
+    title: str = "Unknown"
+    body: str = ""
+    # Observed only when the retrieval actually supplied them; ``None`` means unknown.
+    updated_at: Optional[str] = None
+    retrieval_mode: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class IssueOracleResolution:
+    candidates: Tuple[int, ...] = ()
+    issues: Tuple[VerifiedIssueOracle, ...] = ()
+    error: Optional[str] = None
+
+    @property
+    def has_verified_issue(self) -> bool:
+        return bool(self.issues)
+
+
+def extract_linked_issues_from_pr_body(pr_body: str) -> List[int]:
+    """Extract issue numbers from PR body using GitHub's linking keywords.
+
+    Supports keywords: close, closes, closed, fix, fixes, fixed, resolve, resolves, resolved
+    Formats: #123, owner/repo#123
+
+    Args:
+        pr_body: PR description/body text
+
+    Returns:
+        List of issue numbers found in the PR body
+    """
+    if not pr_body:
+        return []
+
+    # GitHub's supported keywords for linking issues
+    # Added "Related issue(s)", "Relates to", "Related to"
+    keywords = r"(?:close|closes|closed|closing|fix|fixes|fixed|resolve|resolves|resolved|resolving|related issue|related issues|relates to|related to|relate to)"
+
+    # Pattern to match: keyword #123 or keyword owner/repo#123
+    # We allow an optional colon after the keyword (e.g. "Related issue: #123")
+    pattern = rf"{keywords}:?\s+(?:[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+)?#(\d+)"
+
+    matches = re.finditer(pattern, pr_body, re.IGNORECASE)
+    issue_numbers = [int(m.group(1)) for m in matches]
+
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_issues = []
+    for num in issue_numbers:
+        if num not in seen:
+            seen.add(num)
+            unique_issues.append(num)
+
+    return unique_issues
+
+
+# Restricted to GitHub's own closing keywords. Unlike the broader review-context
+# extraction above, "related issue", "relates to" and similar prose are never
+# lifecycle-ownership evidence (see resolve_owner in implementation_slots.py).
+_LIFECYCLE_DIRECTIVE_KEYWORDS = r"(?:close|closes|closed|closing|fix|fixes|fixed|resolve|resolves|resolved|resolving)"
+_LIFECYCLE_DIRECTIVE_PATTERN = rf"\b{_LIFECYCLE_DIRECTIVE_KEYWORDS}\b:?\s+([a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+)?#(\d+)"
+
+
+def extract_lifecycle_directive_issue_references(pr_body: str) -> List[Tuple[Optional[str], int]]:
+    """Extract repository-local implementation-directive Issue references.
+
+    Returns ``(qualifier, number)`` pairs in body order, where ``qualifier`` is
+    the optional ``owner/repo`` prefix (``None`` for a bare ``#N`` token). Only
+    GitHub's own closing keywords count; an ordinary mention or "related"/
+    "relates to" prose is not extracted here.
+    """
+    if not pr_body:
+        return []
+    return [(match.group(1), int(match.group(2))) for match in re.finditer(_LIFECYCLE_DIRECTIVE_PATTERN, pr_body, re.IGNORECASE)]
+
+
+def extract_lifecycle_branch_issue_number(branch_name: str) -> Optional[int]:
+    """Extract an Issue number from an Issue-bearing PR head-branch marker.
+
+    Recognizes ``(issue|feat|fix)[-_/]<digits>`` and a leading ``<digits>[-_]``
+    prefix, matching the branch conventions Auto-Coder itself creates.
+    """
+    if not branch_name:
+        return None
+    match = re.search(r"(?:issue|feat|fix)[-_/](\d+)", branch_name, re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    match = re.match(r"^(\d+)[-_]", branch_name)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def validate_issue_references(pr_body: str, github_client: Any, repo_name: str) -> None:
+    """Validate that issue references in PR body point to Issues, not PRs.
+
+    Args:
+        pr_body: The body text of the PR or comment.
+        github_client: GitHubClient instance.
+        repo_name: Repository name (owner/repo).
+
+    Raises:
+        ValueError: If a referenced number points to a Pull Request instead of an Issue.
+    """
+    if not pr_body or not github_client:
+        return
+
+    issue_numbers = extract_linked_issues_from_pr_body(pr_body)
+
+    for issue_number in issue_numbers:
+        try:
+            # Fetch the issue/PR object
+            # In GitHub API, PRs are Issues, so get_issue works for both.
+            # If it's a PR, it will have a 'pull_request' key.
+            issue = github_client.get_issue(repo_name, issue_number)
+
+            if issue and "pull_request" in issue:
+                raise ValueError(f"Reference #{issue_number} points to a Pull Request, but should refer to an Issue.")
+
+        except ValueError:
+            raise
+        except Exception as e:
+            # Log warning but don't block if API fails?
+            # The prompt says "output an error" if it IS a PR.
+            # If we can't verify, maybe we should warn but allow proceed?
+            # For now, let's assume we proceed unless we DEFINITELY know it's a PR.
+            logger.warning(f"Failed to validate reference #{issue_number}: {e}")
+
+
+def extract_associated_issue_numbers(
+    pr_data: Optional[Dict[str, Any]] = None,
+    pr_body: str = "",
+    pr_title: str = "",
+    branch_name: str = "",
+) -> List[int]:
+    """Extract associated issue numbers hierarchically from PR body, title, branch, or metadata.
+
+    Hierarchical selection priority:
+    1. Explicit linking keywords in PR body (Fixes #123, Closes #123, etc.)
+    2. Explicit issue references in PR title (e.g. 'feat: implement #123')
+    3. Branch name issue pattern (e.g. 'issue-123-fix', 'feat/issue-123')
+    4. General issue references in PR body (e.g. 'Issue #123')
+
+    Args:
+        pr_data: Optional PR data dictionary
+        pr_body: PR description/body text
+        pr_title: PR title text
+        branch_name: Branch name
+
+    Returns:
+        List of authoritative candidate issue numbers
+    """
+    body_text = pr_body
+    title_text = pr_title
+    branch_text = branch_name
+    current_pr_number = None
+
+    if pr_data:
+        body_text = body_text or (pr_data.get("body") or "")
+        title_text = title_text or (pr_data.get("title") or "")
+        branch_text = branch_text or (pr_data.get("head", {}).get("ref") or "")
+        current_pr_number = pr_data.get("number")
+
+    # Tier 1: Explicit linking keywords in body (authoritative)
+    if body_text:
+        explicit_issues = extract_linked_issues_from_pr_body(body_text)
+        filtered_explicit = [n for n in explicit_issues if n != current_pr_number]
+        if filtered_explicit:
+            return filtered_explicit
+
+    # Tier 2: Issue reference in PR title
+    if title_text:
+        title_matches = re.finditer(r"(?:issue|fix|fixes|close|closes|resolve|resolves)?[-_:\s]*#(\d+)", title_text, re.IGNORECASE)
+        title_numbers = [int(m.group(1)) for m in title_matches]
+        title_issue_matches = re.finditer(r"\bissue[-_\s]+(\d+)\b", title_text, re.IGNORECASE)
+        for m in title_issue_matches:
+            title_numbers.append(int(m.group(1)))
+
+        filtered_title = []
+        seen_title = set()
+        for num in title_numbers:
+            if num != current_pr_number and num not in seen_title:
+                seen_title.add(num)
+                filtered_title.append(num)
+        if filtered_title:
+            return filtered_title
+
+    # Tier 3: Issue reference in branch name
+    if branch_text:
+        branch_numbers = []
+        branch_matches = re.finditer(r"(?:issue|feat|fix)[-_/](\d+)", branch_text, re.IGNORECASE)
+        for m in branch_matches:
+            branch_numbers.append(int(m.group(1)))
+
+        direct_branch_match = re.match(r"^(\d+)[-_]", branch_text)
+        if direct_branch_match:
+            branch_numbers.append(int(direct_branch_match.group(1)))
+
+        filtered_branch = []
+        seen_branch = set()
+        for num in branch_numbers:
+            if num != current_pr_number and num not in seen_branch:
+                seen_branch.add(num)
+                filtered_branch.append(num)
+        if filtered_branch:
+            return filtered_branch
+
+    # Tier 4: General issue reference fallback in body
+    if body_text:
+        body_matches = re.finditer(r"(?:issue|task)[-_:\s]+#?(\d+)", body_text, re.IGNORECASE)
+        body_fallback_numbers = []
+        seen_fallback = set()
+        for m in body_matches:
+            num = int(m.group(1))
+            if num != current_pr_number and num not in seen_fallback:
+                seen_fallback.add(num)
+                body_fallback_numbers.append(num)
+        if body_fallback_numbers:
+            return body_fallback_numbers
+
+    return []
+
+
+def resolve_issue_oracles(
+    github_client: Any,
+    repo_name: str,
+    pr_data: Optional[Dict[str, Any]] = None,
+    pr_body: str = "",
+    bypass_cache: bool = False,
+) -> IssueOracleResolution:
+    """Resolve all inferred candidates through GitHub and reject invalid oracles.
+
+    ``bypass_cache`` forces a genuinely cache-bypassing Issue fetch instead of
+    the ordinary cached lookup. Use it only when re-confirming a validation
+    snapshot is still current: the general path stays cached for performance.
+    """
+    candidates = tuple(extract_associated_issue_numbers(pr_data=pr_data, pr_body=pr_body))
+    if not candidates:
+        return IssueOracleResolution()
+    if not github_client:
+        return IssueOracleResolution(candidates=candidates, error="GitHub client unavailable while resolving linked Issue oracle")
+
+    strict_snapshot_getter = getattr(type(github_client), "get_issue_dispatch_snapshot_strict", None)
+    strict_getter = getattr(type(github_client), "get_issue_strict", None)
+    verified_issues = []
+    for issue_number in candidates:
+        try:
+            if bypass_cache and callable(strict_snapshot_getter):
+                retrieval_mode = "strict_snapshot"
+                issue = github_client.get_issue_dispatch_snapshot_strict(repo_name, issue_number)
+            elif callable(strict_getter):
+                retrieval_mode = "strict"
+                issue = github_client.get_issue_strict(repo_name, issue_number)
+            else:
+                retrieval_mode = "default"
+                issue = github_client.get_issue(repo_name, issue_number)
+        except Exception as e:
+            return IssueOracleResolution(candidates=candidates, error=f"Failed to retrieve referenced Issue #{issue_number}: {e}")
+
+        if not issue:
+            return IssueOracleResolution(candidates=candidates, error=f"Referenced Issue #{issue_number} was not found")
+
+        if isinstance(issue, dict):
+            if issue.get("pull_request") is not None:
+                return IssueOracleResolution(candidates=candidates, error=f"Reference #{issue_number} resolves to a pull request, not an Issue")
+            title = issue.get("title") or "Unknown"
+            body = issue.get("body") or ""
+            observed_updated_at = issue.get("updated_at")
+        else:
+            raw_data = getattr(issue, "_rawData", None)
+            if isinstance(raw_data, dict) and raw_data.get("pull_request") is not None:
+                return IssueOracleResolution(candidates=candidates, error=f"Reference #{issue_number} resolves to a pull request, not an Issue")
+            title = getattr(issue, "title", "Unknown") or "Unknown"
+            body = getattr(issue, "body", "") or ""
+            observed_updated_at = raw_data.get("updated_at") if isinstance(raw_data, dict) else None
+
+        updated_at = observed_updated_at if isinstance(observed_updated_at, str) and observed_updated_at else None
+        verified_issues.append(VerifiedIssueOracle(number=issue_number, title=str(title), body=str(body), updated_at=updated_at, retrieval_mode=retrieval_mode))
+
+    return IssueOracleResolution(candidates=candidates, issues=tuple(verified_issues))
+
+
+def get_linked_issues_context(
+    github_client: Any,
+    repo_name: str,
+    pr_body: str = "",
+    pr_data: Optional[Dict[str, Any]] = None,
+    resolution: Optional[IssueOracleResolution] = None,
+) -> str:
+    """Extract linked issues from PR body/metadata and fetch their details (including parent issues)."""
+    if not github_client:
+        return ""
+
+    linked_issues_context = ""
+    try:
+        resolution = resolution or resolve_issue_oracles(github_client, repo_name, pr_data=pr_data, pr_body=pr_body)
+        if resolution.error:
+            logger.warning(f"Failed to resolve linked issue oracle: {resolution.error}")
+            return ""
+        context_parts = []
+
+        for verified_issue in resolution.issues:
+            issue_number = verified_issue.number
+            try:
+                context_parts.append(f"Linked Issue #{issue_number}: {verified_issue.title}")
+                context_parts.append(f"Issue Description:\n{verified_issue.body}")
+
+                try:
+                    parent_details = github_client.get_parent_issue_details(repo_name, issue_number)
+                    if parent_details:
+                        parent_number = parent_details.get("number")
+                        parent_body = github_client.get_parent_issue_body(repo_name, issue_number)
+                        if parent_body:
+                            context_parts.append(
+                                f"Parent Issue #{parent_number} (CONTEXT ONLY - Parent of #{issue_number}): {parent_details.get('title', 'Unknown')}\n"
+                                f"[SCOPE BOUNDARY NOTICE: The following parent issue description is provided for background context only. "
+                                f"The implementation scope and acceptance criteria for this PR are defined strictly by the child issue #{issue_number}. "
+                                f"Do NOT require parent requirements outside the child issue scope.]\n"
+                                f"Parent Issue Description:\n{parent_body}"
+                            )
+                except Exception as e:
+                    logger.warning(f"Failed to fetch parent issue for #{issue_number}: {e}")
+            except Exception as e:
+                logger.warning(f"Failed to fetch details for linked issue #{issue_number}: {e}")
+
+        if context_parts:
+            linked_issues_context = "Linked Issues Context:\n" + "\n\n".join(context_parts)
+
+    except Exception as e:
+        logger.warning(f"Failed to fetch linked issues context: {e}")
+
+    return linked_issues_context

@@ -1,0 +1,30 @@
+# Include documentation
+include README.md
+include LICENSE
+include AGENTS.md
+
+# Include configuration files
+include src/auto_coder/prompts.yaml
+include src/auto_coder/*.yaml
+include src/auto_coder/*.yml
+
+# Include MCP servers (bundled custom fork)
+recursive-include src/auto_coder/mcp_servers *.py
+recursive-include src/auto_coder/mcp_servers *.md
+recursive-include src/auto_coder/mcp_servers *.toml
+recursive-include src/auto_coder/mcp_servers *.sh
+
+# Exclude unnecessary files
+global-exclude __pycache__
+global-exclude *.py[co]
+global-exclude .DS_Store
+global-exclude *.swp
+global-exclude *~
+global-exclude node_modules
+prune */node_modules
+prune */test-output
+prune */test-output-ts
+prune */sample-repo
+prune */__pycache__
+include .auto-coder-build-identity.json
+recursive-include build_backend *.py

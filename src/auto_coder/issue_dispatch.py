@@ -1,0 +1,730 @@
+"""Provider-neutral, durable admission for one logical Issue implementation attempt.
+
+The guard deliberately stops at the adapter boundary: provider adapters classify
+their observations into :class:`DispatchOutcome`; this module only makes that
+classification durable and prevents another local or remote implementation from
+starting while ownership is uncertain.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+import threading
+import time
+import uuid
+from dataclasses import dataclass, replace
+from enum import Enum
+from pathlib import Path
+from typing import Callable, Iterable, Optional
+
+from .cloud_manager import CloudManager, CloudTaskBinding
+from .cloud_run import CloudRun, CloudRunRepository
+from .logger_config import get_logger
+
+logger = get_logger(__name__)
+
+
+class DispatchOutcome(str, Enum):
+    """Machine-readable outcomes at the implementation dispatch boundary."""
+
+    NOT_STARTED = "not_started"
+    LOCAL_COMPLETED = "local_completed"
+    LOCAL_ACCEPTED = "local_accepted"
+    REMOTE_ACCEPTED = "remote_accepted"
+    INDETERMINATE = "indeterminate"
+    FAILED = "failed"
+    DEFERRED = "deferred"
+
+
+@dataclass(frozen=True)
+class IssueAttemptIdentity:
+    """Stable logical identity shared by every candidate for an Issue attempt."""
+
+    repository_owner: str
+    repository_name: str
+    issue_number: int
+    implementation_attempt_id: str
+
+    def __post_init__(self) -> None:
+        if not self.repository_owner or not self.repository_name:
+            raise ValueError("Repository owner and name are required")
+        if self.issue_number <= 0:
+            raise ValueError("Issue number must be positive")
+        if not self.implementation_attempt_id:
+            raise ValueError("Implementation attempt identifier is required")
+
+    @property
+    def full_repository_name(self) -> str:
+        return f"{self.repository_owner}/{self.repository_name}"
+
+
+@dataclass(frozen=True)
+class CandidateHandoff:
+    """Configuration and provider selected for a candidate handoff."""
+
+    backend_name: str
+    provider: str
+    transfer_before_invocation: bool = False
+
+
+@dataclass(frozen=True)
+class AdapterOutcome:
+    """An adapter's classified observation of its one implementation call."""
+
+    outcome: DispatchOutcome
+    provider_reference: str = ""
+    diagnostic: str = ""
+    tracking_complete: bool = True
+
+
+@dataclass(frozen=True)
+class DispatchResult:
+    """Complete, machine-readable result returned to dispatch consumers."""
+
+    identity: IssueAttemptIdentity
+    outcome: DispatchOutcome
+    backend_name: str = ""
+    provider: str = ""
+    provider_reference: str = ""
+    diagnostic: str = ""
+    tracking_complete: bool = True
+    claim_incarnation: str = ""
+    admitted: bool = False
+
+
+@dataclass(frozen=True)
+class LegacyIssueOwnership:
+    """Attempt-unassociated ownership retained from ``cloud.csv``."""
+
+    repository_owner: str
+    repository_name: str
+    issue_number: int
+    backend_name: str
+    provider: str
+    provider_reference: str
+    diagnostic: str
+
+
+@dataclass(frozen=True)
+class OtherAttemptProviderOwnership:
+    """A ``cloud.csv`` binding uniquely attributed to a different logical attempt.
+
+    This is diagnostic-only evidence: it neither suppresses nor authorizes the
+    requesting attempt. It exists so callers can distinguish "known ownership
+    by a different attempt" from genuinely unassociated legacy ownership.
+    """
+
+    repository_owner: str
+    repository_name: str
+    issue_number: int
+    requested_attempt_id: str
+    attributed_attempt_id: str
+    backend_name: str
+    provider: str
+    provider_reference: str
+
+
+@dataclass(frozen=True)
+class _LegacyEvidence:
+    """Internal classification of retained legacy production-writer state."""
+
+    run: Optional[CloudRun]
+    binding: Optional[CloudTaskBinding]
+    conflict: str = ""
+    other_attempt_id: str = ""
+
+
+def default_issue_dispatch_db_path() -> Path:
+    return Path.home() / ".auto-coder" / "issue_dispatch_handoffs.sqlite3"
+
+
+class IssueDispatchGuard:
+    """Fail-closed durable authority for local and remote Issue handoffs."""
+
+    _process_lock = threading.Lock()
+
+    def __init__(
+        self,
+        db_path: Optional[Path] = None,
+        cloud_run_repository_factory: Callable[[str], CloudRunRepository] = CloudRunRepository,
+        cloud_manager_factory: Callable[[str], CloudManager] = CloudManager,
+    ) -> None:
+        self._db_path = Path(db_path) if db_path is not None else default_issue_dispatch_db_path()
+        self._cloud_run_repository_factory = cloud_run_repository_factory
+        self._cloud_manager_factory = cloud_manager_factory
+
+    @property
+    def database_path(self) -> Path:
+        """Return the durable database path for transactional handoff peers."""
+        return self._db_path
+
+    def _connect(self) -> sqlite3.Connection:
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(str(self._db_path), timeout=30, isolation_level=None)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA busy_timeout=30000")
+        self._ensure_schema(connection)
+        return connection
+
+    @staticmethod
+    def _ensure_schema(connection: sqlite3.Connection) -> None:
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS issue_dispatch_handoffs (
+                repository_owner TEXT NOT NULL,
+                repository_name TEXT NOT NULL,
+                issue_number INTEGER NOT NULL,
+                attempt_id TEXT NOT NULL,
+                incarnation TEXT NOT NULL,
+                state TEXT NOT NULL,
+                backend_name TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                provider_reference TEXT NOT NULL,
+                diagnostic TEXT NOT NULL,
+                tracking_complete INTEGER NOT NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY (repository_owner, repository_name, issue_number, attempt_id)
+            )
+            """)
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS legacy_issue_dispatch_ownership (
+                repository_owner TEXT NOT NULL,
+                repository_name TEXT NOT NULL,
+                issue_number INTEGER NOT NULL,
+                provider TEXT NOT NULL,
+                backend_name TEXT NOT NULL,
+                provider_reference TEXT NOT NULL,
+                diagnostic TEXT NOT NULL,
+                observed_at REAL NOT NULL,
+                PRIMARY KEY (repository_owner, repository_name, issue_number)
+            )
+            """)
+
+    @staticmethod
+    def _key(identity: IssueAttemptIdentity) -> tuple[object, ...]:
+        return (
+            identity.repository_owner,
+            identity.repository_name,
+            identity.issue_number,
+            identity.implementation_attempt_id,
+        )
+
+    @staticmethod
+    def _result_from_row(identity: IssueAttemptIdentity, row: sqlite3.Row, diagnostic: str = "") -> DispatchResult:
+        stored_state = str(row["state"])
+        outcome = DispatchOutcome.INDETERMINATE if stored_state in {"pending", "invoking", "local_job_handoff"} else DispatchOutcome(stored_state)
+        return DispatchResult(
+            identity=identity,
+            outcome=outcome,
+            backend_name=str(row["backend_name"]),
+            provider=str(row["provider"]),
+            provider_reference=str(row["provider_reference"]),
+            diagnostic=diagnostic or str(row["diagnostic"]),
+            tracking_complete=bool(row["tracking_complete"]),
+            claim_incarnation=str(row["incarnation"]),
+        )
+
+    def _resolve_other_attempt_attribution(
+        self,
+        connection: sqlite3.Connection,
+        identity: IssueAttemptIdentity,
+        binding: CloudTaskBinding,
+    ) -> tuple[str, str]:
+        """Attribute an issue-level binding to another attempt's accepted handoff.
+
+        Returns ``(other_attempt_id, conflict_diagnostic)``; at most one is
+        non-empty. A qualifying handoff is a durable ``REMOTE_ACCEPTED`` record
+        for the exact repository/Issue matching the binding's provider family
+        and case-sensitive task/session id; a missing/empty legacy backend does
+        not defeat that match, but an incompatible populated backend does.
+        """
+        rows = connection.execute(
+            "SELECT * FROM issue_dispatch_handoffs WHERE repository_owner=? AND repository_name=? " "AND issue_number=? AND state=?",
+            (
+                identity.repository_owner,
+                identity.repository_name,
+                identity.issue_number,
+                DispatchOutcome.REMOTE_ACCEPTED.value,
+            ),
+        ).fetchall()
+        matches: dict[str, sqlite3.Row] = {}
+        backend_conflict = False
+        for row in rows:
+            if str(row["provider"]) != binding.provider or str(row["provider_reference"]) != binding.task_id:
+                continue
+            row_backend = str(row["backend_name"])
+            if binding.backend_name and row_backend and binding.backend_name != row_backend:
+                backend_conflict = True
+                continue
+            matches[str(row["attempt_id"])] = row
+        other_matches = {attempt_id: row for attempt_id, row in matches.items() if attempt_id != identity.implementation_attempt_id}
+        if len(other_matches) > 1:
+            return "", "legacy provider binding matches multiple accepted attempts"
+        if backend_conflict:
+            return "", "legacy provider binding backend identity conflicts with an accepted attempt record"
+        if len(other_matches) == 1:
+            return next(iter(other_matches)), ""
+        return "", ""
+
+    def _legacy_evidence(self, connection: sqlite3.Connection, identity: IssueAttemptIdentity) -> _LegacyEvidence:
+        """Read old production writers strictly; any ambiguity remains suppressing."""
+        repository = self._cloud_run_repository_factory(identity.full_repository_name)
+        manager = self._cloud_manager_factory(identity.full_repository_name)
+        runs = repository.list_for_issue(identity.issue_number)
+        bindings = manager.read_bindings_strict()
+        binding = bindings.get(str(identity.issue_number))
+        exact_runs = [run for run in runs if str(run.attempt) == identity.implementation_attempt_id]
+        if len(exact_runs) > 1:
+            return _LegacyEvidence(None, binding, "multiple legacy runs match the logical attempt")
+        run = exact_runs[0] if exact_runs else None
+        if run is not None and binding is not None:
+            if binding.task_id != run.task_id or (binding.provider and binding.provider != run.provider):
+                return _LegacyEvidence(run, binding, "legacy CloudRun and provider binding contradict each other")
+        if run is None and binding is not None:
+            other_attempt_id, conflict = self._resolve_other_attempt_attribution(connection, identity, binding)
+            if conflict:
+                return _LegacyEvidence(None, binding, conflict)
+            if other_attempt_id:
+                return _LegacyEvidence(None, binding, other_attempt_id=other_attempt_id)
+            return _LegacyEvidence(None, binding, "legacy provider binding has no unambiguous attempt association")
+        return _LegacyEvidence(run, binding)
+
+    def _materialize_legacy(
+        self,
+        connection: sqlite3.Connection,
+        identity: IssueAttemptIdentity,
+        allow_unassociated_binding: bool = False,
+    ) -> Optional[DispatchResult]:
+        evidence = self._legacy_evidence(connection, identity)
+        run, binding, conflict = evidence.run, evidence.binding, evidence.conflict
+        if run is None and binding is None and not conflict:
+            return None
+        if evidence.other_attempt_id:
+            # This binding is known, durable ownership of a different logical
+            # attempt. It is not this identity's concern: an otherwise
+            # independently authorized reservation for `identity` must reach
+            # its own candidate rather than being refused for the other
+            # attempt's sake, and its history/ownership must stay untouched.
+            return None
+        now = time.time()
+        provider = run.provider if run is not None else (binding.provider if binding is not None else "")
+        backend = run.backend_name if run is not None else (binding.backend_name if binding is not None else "")
+        reference = run.task_id if run is not None else (binding.task_id if binding is not None else "")
+        if run is None and binding is not None:
+            connection.execute(
+                "INSERT OR IGNORE INTO legacy_issue_dispatch_ownership VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    identity.repository_owner,
+                    identity.repository_name,
+                    identity.issue_number,
+                    provider,
+                    backend,
+                    reference,
+                    conflict,
+                    now,
+                ),
+            )
+            if allow_unassociated_binding:
+                return None
+            return DispatchResult(
+                identity,
+                DispatchOutcome.DEFERRED,
+                backend,
+                provider,
+                reference,
+                conflict,
+                tracking_complete=False,
+            )
+        if conflict:
+            state = DispatchOutcome.DEFERRED.value
+            diagnostic = conflict
+        elif run is not None and run.task_id and run.submission_outcome == "accepted":
+            state = DispatchOutcome.REMOTE_ACCEPTED.value
+            diagnostic = "imported legacy CloudRun ownership"
+        else:
+            state = DispatchOutcome.INDETERMINATE.value
+            diagnostic = "imported unresolved legacy CloudRun ownership"
+        # A migrated legacy record is a newly acquired claim. Its incarnation
+        # must therefore never be derived only from the logical attempt: after
+        # a confirmed release, unchanged legacy evidence may be observed and
+        # acquired again, and a deterministic value would give that successor
+        # the released predecessor's authority token.
+        incarnation = f"legacy-{uuid.uuid4()}"
+        connection.execute(
+            "INSERT INTO issue_dispatch_handoffs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (*self._key(identity), incarnation, state, backend, provider, reference, diagnostic, 1, now, now),
+        )
+        row = connection.execute(
+            "SELECT * FROM issue_dispatch_handoffs WHERE repository_owner=? AND repository_name=? AND issue_number=? AND attempt_id=?",
+            self._key(identity),
+        ).fetchone()
+        return self._result_from_row(identity, row)
+
+    def inspect(self, identity: IssueAttemptIdentity) -> Optional[DispatchResult]:
+        """Return current ownership, importing legacy evidence before reporting empty."""
+        try:
+            with self._process_lock, self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT * FROM issue_dispatch_handoffs WHERE repository_owner=? AND repository_name=? AND issue_number=? AND attempt_id=?",
+                    self._key(identity),
+                ).fetchone()
+                result = self._result_from_row(identity, row) if row is not None else self._materialize_legacy(connection, identity)
+                connection.execute("COMMIT")
+                return result
+        except Exception as exc:
+            logger.error(f"Issue dispatch ownership read failed for {identity}: {exc}")
+            return DispatchResult(identity, DispatchOutcome.DEFERRED, diagnostic=f"ownership read failed: {exc}", tracking_complete=False)
+
+    def inspect_pending_claim(self, identity: IssueAttemptIdentity) -> Optional[DispatchResult]:
+        """Return only the exact pre-adapter claim for ``identity``.
+
+        ``inspect`` intentionally presents both the internal ``pending`` state
+        and a finalized indeterminate adapter observation as
+        :class:`DispatchOutcome.INDETERMINATE`.  A durable local-job producer
+        must not confuse those states: only the former proves that the model
+        invocation has not yet crossed the adapter boundary.
+        """
+        try:
+            with self._process_lock, self._connect() as connection:
+                row = connection.execute(
+                    "SELECT * FROM issue_dispatch_handoffs WHERE repository_owner=? AND repository_name=? AND issue_number=? AND attempt_id=? AND state='pending'",
+                    self._key(identity),
+                ).fetchone()
+            if row is None:
+                return None
+            return replace(self._result_from_row(identity, row), admitted=True)
+        except Exception as exc:
+            logger.error(f"Pending Issue dispatch ownership read failed for {identity}: {exc}")
+            return None
+
+    def inspect_local_job_authority(self, identity: IssueAttemptIdentity) -> Optional[DispatchResult]:
+        """Return a transferable claim or its already-transferred incarnation."""
+        try:
+            with self._process_lock, self._connect() as connection:
+                row = connection.execute(
+                    "SELECT * FROM issue_dispatch_handoffs WHERE repository_owner=? AND repository_name=? " "AND issue_number=? AND attempt_id=? AND state IN ('pending', 'local_job_handoff')",
+                    self._key(identity),
+                ).fetchone()
+            if row is None:
+                return None
+            return replace(self._result_from_row(identity, row), admitted=str(row["state"]) == "pending")
+        except Exception as exc:
+            logger.error(f"Local-job Issue ownership read failed for {identity}: {exc}")
+            return None
+
+    def mark_invocation_started(self, claim: DispatchResult) -> bool:
+        """Fence adapter entry against a concurrent durable local-job transfer."""
+        if not claim.admitted or not claim.claim_incarnation:
+            return False
+        try:
+            with self._process_lock, self._connect() as connection:
+                cursor = connection.execute(
+                    "UPDATE issue_dispatch_handoffs SET state='invoking', updated_at=? " "WHERE repository_owner=? AND repository_name=? AND issue_number=? " "AND attempt_id=? AND incarnation=? AND state='pending'",
+                    (time.time(), *self._key(claim.identity), claim.claim_incarnation),
+                )
+            return cursor.rowcount == 1
+        except Exception as exc:
+            logger.error(f"Issue dispatch invocation-entry checkpoint failed for {claim.identity}: {exc}")
+            return False
+
+    def get_legacy_issue_ownership(self, repository_owner: str, repository_name: str, issue_number: int) -> Optional[LegacyIssueOwnership]:
+        """Return preserved attempt-unassociated legacy ownership evidence."""
+        try:
+            with self._connect() as connection:
+                row = connection.execute(
+                    "SELECT * FROM legacy_issue_dispatch_ownership WHERE repository_owner=? AND repository_name=? AND issue_number=?",
+                    (repository_owner, repository_name, issue_number),
+                ).fetchone()
+            if row is None:
+                return None
+            return LegacyIssueOwnership(
+                repository_owner,
+                repository_name,
+                issue_number,
+                str(row["backend_name"]),
+                str(row["provider"]),
+                str(row["provider_reference"]),
+                str(row["diagnostic"]),
+            )
+        except Exception as exc:
+            logger.error(f"Legacy Issue ownership read failed for {repository_owner}/{repository_name}#{issue_number}: {exc}")
+            return None
+
+    def get_other_attempt_ownership(self, identity: IssueAttemptIdentity) -> Optional[OtherAttemptProviderOwnership]:
+        """Return diagnostic-only evidence that `identity`'s binding belongs elsewhere.
+
+        This never suppresses or authorizes `identity`; it exists so callers can
+        report that a retained ``cloud.csv`` binding is known, durable ownership
+        of a different logical attempt rather than genuinely unassociated
+        legacy ownership.
+        """
+        try:
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                evidence = self._legacy_evidence(connection, identity)
+                connection.execute("COMMIT")
+            if not evidence.other_attempt_id or evidence.binding is None:
+                return None
+            return OtherAttemptProviderOwnership(
+                identity.repository_owner,
+                identity.repository_name,
+                identity.issue_number,
+                identity.implementation_attempt_id,
+                evidence.other_attempt_id,
+                evidence.binding.backend_name,
+                evidence.binding.provider,
+                evidence.binding.task_id,
+            )
+        except Exception as exc:
+            logger.error(f"Other-attempt ownership read failed for {identity}: {exc}")
+            return None
+
+    def reserve(
+        self,
+        identity: IssueAttemptIdentity,
+        candidate: CandidateHandoff,
+        *,
+        authorize_new_attempt: bool = False,
+    ) -> DispatchResult:
+        """Atomically acquire a new incarnation, or expose the suppressing owner."""
+        try:
+            with self._process_lock, self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT * FROM issue_dispatch_handoffs WHERE repository_owner=? AND repository_name=? AND issue_number=? AND attempt_id=?",
+                    self._key(identity),
+                ).fetchone()
+                if row is not None:
+                    connection.execute("COMMIT")
+                    return self._result_from_row(identity, row, "logical attempt already has suppressing ownership")
+                legacy = self._materialize_legacy(connection, identity, allow_unassociated_binding=authorize_new_attempt)
+                if legacy is not None:
+                    connection.execute("COMMIT")
+                    return legacy
+                incarnation = str(uuid.uuid4())
+                now = time.time()
+                connection.execute(
+                    "INSERT INTO issue_dispatch_handoffs VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, '', '', 0, ?, ?)",
+                    (*self._key(identity), incarnation, candidate.backend_name, candidate.provider, now, now),
+                )
+                connection.execute("COMMIT")
+                return DispatchResult(
+                    identity,
+                    DispatchOutcome.INDETERMINATE,
+                    candidate.backend_name,
+                    candidate.provider,
+                    diagnostic="handoff reserved; adapter outcome pending",
+                    tracking_complete=False,
+                    claim_incarnation=incarnation,
+                    admitted=True,
+                )
+        except Exception as exc:
+            logger.error(f"Issue dispatch reservation failed for {identity}: {exc}")
+            return DispatchResult(identity, DispatchOutcome.DEFERRED, candidate.backend_name, candidate.provider, diagnostic=f"reservation failed: {exc}", tracking_complete=False)
+
+    def finalize(self, claim: DispatchResult, observation: AdapterOutcome) -> DispatchResult:
+        """Finalize only the current incarnation; NOT_STARTED durably releases it."""
+        allowed = {
+            DispatchOutcome.NOT_STARTED,
+            DispatchOutcome.LOCAL_COMPLETED,
+            DispatchOutcome.LOCAL_ACCEPTED,
+            DispatchOutcome.REMOTE_ACCEPTED,
+            DispatchOutcome.INDETERMINATE,
+            DispatchOutcome.FAILED,
+            DispatchOutcome.DEFERRED,
+        }
+        if observation.outcome not in allowed:
+            return replace(claim, outcome=DispatchOutcome.DEFERRED, diagnostic="unsupported adapter outcome", tracking_complete=False, admitted=False)
+        if observation.outcome == DispatchOutcome.REMOTE_ACCEPTED and not observation.provider_reference:
+            observation = AdapterOutcome(DispatchOutcome.INDETERMINATE, diagnostic="provider acceptance lacked a task/session reference")
+        try:
+            with self._process_lock, self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT * FROM issue_dispatch_handoffs WHERE repository_owner=? AND repository_name=? AND issue_number=? AND attempt_id=?",
+                    self._key(claim.identity),
+                ).fetchone()
+                if row is None or str(row["incarnation"]) != claim.claim_incarnation:
+                    connection.execute("COMMIT")
+                    return replace(claim, outcome=DispatchOutcome.DEFERRED, diagnostic="claim incarnation is stale", tracking_complete=False, admitted=False)
+                if str(row["state"]) == "local_job_handoff":
+                    connection.execute("COMMIT")
+                    if observation.outcome is DispatchOutcome.LOCAL_ACCEPTED:
+                        return replace(
+                            claim,
+                            outcome=DispatchOutcome.LOCAL_ACCEPTED,
+                            provider_reference=observation.provider_reference,
+                            diagnostic=observation.diagnostic,
+                            tracking_complete=observation.tracking_complete,
+                            admitted=False,
+                        )
+                    return replace(claim, outcome=DispatchOutcome.DEFERRED, diagnostic="claim ownership transferred to durable local job", tracking_complete=False, admitted=False)
+                current_reference = str(row["provider_reference"])
+                if current_reference and observation.provider_reference and current_reference != observation.provider_reference:
+                    connection.execute("COMMIT")
+                    return replace(
+                        self._result_from_row(claim.identity, row),
+                        outcome=DispatchOutcome.DEFERRED,
+                        diagnostic="contradictory provider task/session reference",
+                        tracking_complete=False,
+                    )
+                if observation.outcome == DispatchOutcome.NOT_STARTED:
+                    cursor = connection.execute(
+                        "DELETE FROM issue_dispatch_handoffs WHERE repository_owner=? AND repository_name=? AND issue_number=? AND attempt_id=? AND incarnation=?",
+                        (*self._key(claim.identity), claim.claim_incarnation),
+                    )
+                    if cursor.rowcount != 1:
+                        raise OSError("confirmed release did not remove the current claim")
+                    connection.execute("COMMIT")
+                    return replace(
+                        claim,
+                        outcome=DispatchOutcome.NOT_STARTED,
+                        diagnostic=observation.diagnostic,
+                        tracking_complete=True,
+                        admitted=False,
+                    )
+                connection.execute(
+                    "UPDATE issue_dispatch_handoffs SET state=?, provider_reference=?, diagnostic=?, tracking_complete=?, updated_at=? WHERE repository_owner=? AND repository_name=? AND issue_number=? AND attempt_id=? AND incarnation=?",
+                    (
+                        observation.outcome.value,
+                        observation.provider_reference or current_reference,
+                        observation.diagnostic,
+                        int(observation.tracking_complete),
+                        time.time(),
+                        *self._key(claim.identity),
+                        claim.claim_incarnation,
+                    ),
+                )
+                connection.execute("COMMIT")
+                return replace(
+                    claim,
+                    outcome=observation.outcome,
+                    provider_reference=observation.provider_reference or current_reference,
+                    diagnostic=observation.diagnostic,
+                    tracking_complete=observation.tracking_complete,
+                    admitted=False,
+                )
+        except Exception as exc:
+            logger.error(f"Issue dispatch finalization failed for {claim.identity}: {exc}")
+            # The reserved claim remains suppressing (or its durable disposition is
+            # unknown), so callers must never interpret this as safe fallback.
+            return replace(claim, outcome=DispatchOutcome.DEFERRED, diagnostic=f"ownership finalization failed: {exc}", tracking_complete=False, admitted=False)
+
+    def _mark_tracking_incomplete(self, result: DispatchResult, diagnostic: str) -> DispatchResult:
+        """Retain accepted ownership while durably recording projection failure."""
+        try:
+            with self._process_lock, self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                cursor = connection.execute(
+                    "UPDATE issue_dispatch_handoffs SET tracking_complete=0, diagnostic=?, updated_at=? " "WHERE repository_owner=? AND repository_name=? AND issue_number=? AND attempt_id=? " "AND incarnation=? AND state=? AND provider_reference=?",
+                    (
+                        diagnostic,
+                        time.time(),
+                        *self._key(result.identity),
+                        result.claim_incarnation,
+                        DispatchOutcome.REMOTE_ACCEPTED.value,
+                        result.provider_reference,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise OSError("accepted ownership changed before tracking update")
+                connection.execute("COMMIT")
+            return replace(result, diagnostic=diagnostic, tracking_complete=False)
+        except Exception as exc:
+            return replace(
+                result,
+                diagnostic=f"{diagnostic}; tracking-state persistence failed: {exc}",
+                tracking_complete=False,
+            )
+
+    def dispatch_remote(
+        self,
+        identity: IssueAttemptIdentity,
+        candidate: CandidateHandoff,
+        submit: Callable[[], AdapterOutcome],
+        publish_tracking: Optional[Callable[[DispatchResult], bool]] = None,
+    ) -> DispatchResult:
+        """Reserve, invoke one remote adapter callback, and persist its outcome."""
+        claim = self.reserve(identity, candidate)
+        if not claim.admitted:
+            return claim
+        if not self.mark_invocation_started(claim):
+            return replace(claim, outcome=DispatchOutcome.DEFERRED, diagnostic="dispatch claim changed before adapter entry", tracking_complete=False, admitted=False)
+        try:
+            observation = submit()
+        except Exception as exc:
+            observation = AdapterOutcome(DispatchOutcome.INDETERMINATE, diagnostic=f"submission raised after reservation: {exc}")
+        result = self.finalize(claim, observation)
+        if result.outcome == DispatchOutcome.REMOTE_ACCEPTED and publish_tracking is not None:
+            try:
+                tracking_complete = bool(publish_tracking(result))
+            except Exception as exc:
+                return self._mark_tracking_incomplete(result, f"{result.diagnostic}; secondary tracking failed: {exc}".strip("; "))
+            if not tracking_complete:
+                return self._mark_tracking_incomplete(result, f"{result.diagnostic}; secondary tracking incomplete".strip("; "))
+        return result
+
+    def dispatch_candidates(
+        self,
+        identity: IssueAttemptIdentity,
+        candidates: Iterable[CandidateHandoff],
+        invoke: Callable[[CandidateHandoff], AdapterOutcome],
+        *,
+        authorize_new_attempt: bool = False,
+    ) -> DispatchResult:
+        """Invoke one ranked candidate sequence through the shared claim boundary.
+
+        Candidate mode is deliberately irrelevant here.  Both synchronous local
+        invocations and asynchronous remote submissions acquire the same logical
+        Issue-attempt claim before their real execution boundary.  An adapter may
+        permit fallback only by returning ``NOT_STARTED``; every other observation
+        is suppressing and ends this pass.
+        """
+        seen: set[tuple[str, str]] = set()
+        last: Optional[DispatchResult] = None
+        for candidate in candidates:
+            key = (candidate.backend_name, candidate.provider)
+            if key in seen:
+                continue
+            seen.add(key)
+            claim = self.reserve(
+                identity,
+                candidate,
+                authorize_new_attempt=authorize_new_attempt,
+            )
+            # New-attempt authority belongs to the pass, not an individual
+            # fallback.  It is safe to present on each reservation because only
+            # a confirmed NOT_STARTED result can have released the predecessor.
+            if not claim.admitted:
+                return claim
+            if not candidate.transfer_before_invocation and not self.mark_invocation_started(claim):
+                return replace(claim, outcome=DispatchOutcome.DEFERRED, diagnostic="dispatch claim changed before adapter entry", tracking_complete=False, admitted=False)
+            try:
+                observation = invoke(candidate)
+            except Exception as exc:
+                observation = AdapterOutcome(
+                    DispatchOutcome.INDETERMINATE,
+                    diagnostic=f"adapter raised after admission: {exc}",
+                )
+            last = self.finalize(claim, observation)
+            if last.outcome != DispatchOutcome.NOT_STARTED:
+                return last
+
+        if last is not None:
+            return replace(
+                last,
+                outcome=DispatchOutcome.DEFERRED,
+                backend_name="",
+                provider="",
+                diagnostic="all ranked candidates were confirmed not started",
+                tracking_complete=True,
+                claim_incarnation="",
+                admitted=False,
+            )
+        return DispatchResult(
+            identity,
+            DispatchOutcome.DEFERRED,
+            diagnostic="no ranked dispatch candidates were supplied",
+        )

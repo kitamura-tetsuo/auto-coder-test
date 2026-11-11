@@ -1,0 +1,1770 @@
+"""Tests for durable logical implementation ownership."""
+
+import json
+import os
+import select
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import httpx
+import pytest
+
+from auto_coder.implementation_slots import (
+    ImplementationHierarchyConflict,
+    ImplementationHierarchyUnavailable,
+    ImplementationOwner,
+    ImplementationOwnerResolutionError,
+    ImplementationSlotRepository,
+    ImplementationSlotSnapshot,
+    ImplementationSlotSnapshotUnavailable,
+    ImplementationSlotUnavailable,
+)
+from auto_coder.llm_backend_config import get_max_concurrent_implementations_from_config
+from auto_coder.util.gh_cache import GitHubClient
+
+
+@pytest.mark.parametrize("retained_work", ["none", "execution", "session", "pr"])
+def test_failed_submission_cleanup_preserves_other_work(tmp_path, retained_work):
+    slots = ImplementationSlotRepository("owner/repo", 1, tmp_path / "slots.json")
+    owner = ImplementationOwner("issue", 1982)
+    execution = slots.start_execution(owner)
+    assert execution is not None
+    assert slots.record_validation_identity(owner, "validated-generation") is True
+    if retained_work == "session":
+        assert slots.record_provider_session(owner, "existing-task") is True
+    if retained_work == "pr":
+        assert slots.record_implementation_pr(owner, 2005) is True
+    if retained_work != "execution":
+        slots.finish_execution(owner, execution)
+    assert slots.release_unbound_idle_owner(owner) is (retained_work == "none")
+    assert slots.active_owners() == (() if retained_work == "none" else (owner,))
+
+
+class GitHubState:
+    def __init__(self, issues=None, prs=None, linked_prs=None, open_prs=None):
+        self.issues = issues or {}
+        self.prs = prs or {}
+        self.linked_prs = linked_prs or {}
+        self.open_prs = open_prs or []
+
+    def get_issue(self, _repo, number):
+        value = self.issues[number]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    def get_issue_details(self, issue):
+        return issue
+
+    def get_pull_request(self, _repo, number):
+        return self.prs[number]
+
+    def get_pr_details(self, pr):
+        return pr
+
+    def get_connected_prs(self, _repo, issue_number, strict=False):
+        return self.linked_prs.get(issue_number, [])
+
+    def get_open_pull_requests(self, _repo):
+        return self.open_prs
+
+
+def repository(tmp_path, limit=1):
+    return ImplementationSlotRepository("owner/repo", limit, tmp_path / "slots.json")
+
+
+def test_snapshot_projects_one_detached_complete_owner_image(tmp_path):
+    slots = repository(tmp_path, limit=1)
+    issue = ImplementationOwner("issue", 10)
+    first_execution = slots.start_execution(issue)
+    assert first_execution is not None
+    assert slots.record_implementation_pr(issue, 11)
+    assert slots.record_provider_session(issue, "session-a")
+    second_execution = slots.start_execution(issue, bypass_active_execution=True)
+    assert second_execution is not None
+    assert slots.start_execution(ImplementationOwner("pr", 20), bypass_capacity=True)
+    assert slots.start_execution(ImplementationOwner("issue", 30), allow_urgent_emergency=True)
+
+    snapshot = slots.snapshot()
+    assert isinstance(snapshot, ImplementationSlotSnapshot)
+    assert snapshot.repository == "owner/repo"
+    assert snapshot.storage_path == str((tmp_path / "slots.json").resolve())
+    assert snapshot.normal_limit == 1
+    assert (snapshot.normal_usage, snapshot.normal_available, snapshot.emergency_usage) == (2, 0, 1)
+    assert tuple(row.owner.key for row in snapshot.owners) == ("issue:10", "issue:30", "pr:20")
+    issue_row = snapshot.owners[0]
+    assert tuple(item.execution_id for item in issue_row.executions) == (first_execution, second_execution)
+    assert issue_row.implementation_prs == (11,)
+    assert issue_row.provider_sessions == ("session-a",)
+    assert issue_row.admission_pending is None
+    assert issue_row.admission_established is None
+
+    slots.finish_execution(issue, first_execution)
+    later = slots.snapshot()
+    assert isinstance(later, ImplementationSlotSnapshot)
+    assert tuple(item.execution_id for item in issue_row.executions) == (first_execution, second_execution)
+    assert tuple(item.execution_id for item in later.owners[0].executions) == (second_execution,)
+
+
+def test_snapshot_absent_store_is_known_empty_and_creates_nothing(tmp_path):
+    path = tmp_path / "missing" / "slots.json"
+    slots = ImplementationSlotRepository("owner/repo", 4, path)
+
+    snapshot = slots.snapshot()
+
+    assert isinstance(snapshot, ImplementationSlotSnapshot)
+    assert snapshot.owners == ()
+    assert (snapshot.normal_usage, snapshot.normal_available, snapshot.emergency_usage) == (0, 4, 0)
+    assert not path.exists()
+    assert not path.parent.exists()
+    assert not slots.lock_path.exists()
+
+
+@pytest.mark.parametrize(
+    "record,diagnostic",
+    [
+        ({"kind": "other", "number": 1}, ".kind"),
+        ({"kind": "issue", "number": True}, ".number"),
+        ({"kind": "issue", "number": 1, "implementation_prs": None}, ".implementation_prs"),
+        ({"kind": "issue", "number": 1, "provider_sessions": [1]}, ".provider_sessions"),
+        ({"kind": "issue", "number": 1, "emergency": None}, ".emergency"),
+        ({"kind": "issue", "number": 1, "admission_pending": "false"}, ".admission_pending"),
+        ({"kind": "issue", "number": 1, "executions": [{"id": ""}]}, ".id"),
+        ({"kind": "issue", "number": 1, "executions": [{"id": "x", "pid": 0}]}, ".pid"),
+        ({"kind": "issue", "number": 1, "executions": [{"id": "x", "started_at": float("inf")}]}, ".started_at"),
+    ],
+)
+def test_snapshot_rejects_invalid_present_projected_fields(tmp_path, record, diagnostic):
+    slots = repository(tmp_path)
+    slots.storage_path.write_text(json.dumps({"issue:1": record}), encoding="utf-8")
+
+    snapshot = slots.snapshot()
+
+    assert isinstance(snapshot, ImplementationSlotSnapshotUnavailable)
+    assert diagnostic in snapshot.diagnostic
+    assert not hasattr(snapshot, "normal_usage")
+    assert not hasattr(snapshot, "observed_at")
+
+
+def test_snapshot_rejects_corrupt_root_key_and_multiple_emergency_owners(tmp_path):
+    slots = repository(tmp_path, limit=2)
+    invalid_images = (
+        "not-json",
+        "[]",
+        json.dumps({"issue:2": {"kind": "issue", "number": 1}}),
+        json.dumps(
+            {
+                "issue:1": {"kind": "issue", "number": 1, "emergency": True},
+                "pr:2": {"kind": "pr", "number": 2, "emergency": True},
+            }
+        ),
+    )
+    for image in invalid_images:
+        slots.storage_path.write_text(image, encoding="utf-8")
+        before = slots.storage_path.read_bytes()
+        snapshot = slots.snapshot()
+        assert isinstance(snapshot, ImplementationSlotSnapshotUnavailable)
+        assert snapshot.diagnostic
+        assert slots.storage_path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("replacement", "diagnostic"),
+    [
+        ({"kind": [], "number": 1}, ".kind"),
+        ({"kind": {}, "number": 1}, ".kind"),
+        (
+            {
+                "kind": "issue",
+                "number": 1,
+                "executions": [{"id": "execution-1", "started_at": -(10**400)}],
+            },
+            ".started_at",
+        ),
+    ],
+)
+def test_snapshot_contains_projection_failures_and_recovers_after_store_repair(tmp_path, replacement, diagnostic):
+    slots = repository(tmp_path)
+    owner = ImplementationOwner("issue", 1)
+    assert slots.reserve_new(owner)
+    original = slots.storage_path.read_bytes()
+    corrupted = json.dumps({owner.key: replacement}).encode()
+    slots.storage_path.write_bytes(corrupted)
+
+    unavailable = slots.snapshot()
+
+    assert isinstance(unavailable, ImplementationSlotSnapshotUnavailable)
+    assert diagnostic in unavailable.diagnostic
+    assert slots.storage_path.read_bytes() == corrupted
+
+    slots.storage_path.write_bytes(original)
+    recovered = slots.snapshot()
+    assert isinstance(recovered, ImplementationSlotSnapshot)
+    assert tuple(row.owner_key for row in recovered.owners) == (owner.key,)
+
+
+def test_snapshot_reads_published_image_while_local_writer_holds_lock(tmp_path):
+    slots = repository(tmp_path)
+    assert slots.reserve_new(ImplementationOwner("issue", 1))
+    entered = threading.Event()
+    release = threading.Event()
+
+    def hold_writer_lock():
+        with slots._state_lock():
+            entered.set()
+            assert release.wait(timeout=5)
+
+    thread = threading.Thread(target=hold_writer_lock)
+    thread.start()
+    assert entered.wait(timeout=5)
+    started = time.monotonic()
+    snapshot = slots.snapshot()
+    elapsed = time.monotonic() - started
+    release.set()
+    thread.join(timeout=5)
+
+    assert isinstance(snapshot, ImplementationSlotSnapshot)
+    assert tuple(row.owner_key for row in snapshot.owners) == ("issue:1",)
+    assert (snapshot.normal_usage, snapshot.normal_available) == (1, 0)
+    assert elapsed < 1
+    known = slots.snapshot()
+    assert isinstance(known, ImplementationSlotSnapshot)
+    assert known.normal_usage == 1
+
+
+def test_snapshot_does_not_wait_for_another_process_store_lock(tmp_path):
+    slots = repository(tmp_path)
+    owner = ImplementationOwner("issue", 1)
+    assert slots.reserve_new(owner)
+    child_code = """
+import sys
+from pathlib import Path
+from auto_coder.implementation_slots import ImplementationSlotRepository
+
+repository = ImplementationSlotRepository("owner/repo", 1, Path(sys.argv[1]))
+with repository._state_lock():
+    print("locked", flush=True)
+    sys.stdin.readline()
+"""
+    child = subprocess.Popen(
+        [sys.executable, "-c", child_code, str(slots.storage_path)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout is not None
+        assert child.stdout.readline().strip() == "locked"
+        observer = repository(tmp_path)
+
+        started = time.monotonic()
+        observed = observer.snapshot()
+        elapsed = time.monotonic() - started
+
+        assert isinstance(observed, ImplementationSlotSnapshot)
+        assert tuple(row.owner_key for row in observed.owners) == (owner.key,)
+        assert (observed.normal_usage, observed.normal_available) == (1, 0)
+        assert elapsed < 1
+        assert child.poll() is None
+    finally:
+        stdout, stderr = child.communicate("release\n", timeout=5)
+        assert child.returncode == 0, (stdout, stderr)
+
+    recovered = observer.snapshot()
+    assert isinstance(recovered, ImplementationSlotSnapshot)
+    assert tuple(row.owner_key for row in recovered.owners) == (owner.key,)
+
+
+@pytest.mark.parametrize("read_number", [1, 2, 3])
+def test_snapshot_remains_available_during_slow_hierarchy_admission(tmp_path, read_number):
+    slots = repository(tmp_path, limit=2)
+    entered = threading.Event()
+    release = threading.Event()
+
+    class SlowHierarchy(AuthoritativeHierarchy):
+        reads = 0
+
+        def get_parent_issue_number_strict(self, repo, number):
+            self.reads += 1
+            if self.reads == read_number:
+                entered.set()
+                assert release.wait(timeout=5)
+            return super().get_parent_issue_number_strict(repo, number)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        admission = executor.submit(slots.start_execution, ImplementationOwner("issue", 1), github_client=SlowHierarchy())
+        try:
+            assert entered.wait(timeout=5)
+            snapshot = slots.snapshot()
+            assert isinstance(snapshot, ImplementationSlotSnapshot)
+            expected_usage = 1 if read_number == 3 else 0
+            assert (snapshot.normal_usage, snapshot.normal_available) == (expected_usage, 2 - expected_usage)
+            if expected_usage:
+                assert snapshot.owners[0].admission_pending is True
+        finally:
+            release.set()
+        assert admission.result(timeout=5) is not None
+    assert slots.snapshot().normal_usage == 1
+
+
+def test_snapshot_ignores_partial_unpublished_writer_image(tmp_path):
+    slots = repository(tmp_path, limit=2)
+    assert slots.reserve_new(ImplementationOwner("issue", 1))
+    with slots._state_lock():
+        temporary = slots.storage_path.with_suffix(".tmp")
+        temporary.write_text('{"issue:2":', encoding="utf-8")
+        snapshot = slots.snapshot()
+        assert isinstance(snapshot, ImplementationSlotSnapshot)
+        assert tuple(row.owner_key for row in snapshot.owners) == ("issue:1",)
+        slots._write({"issue:2": {"kind": "issue", "number": 2}})
+        published = slots.snapshot()
+        assert isinstance(published, ImplementationSlotSnapshot)
+        assert tuple(row.owner_key for row in published.owners) == ("issue:2",)
+        assert (published.normal_usage, published.normal_available) == (1, 1)
+        assert tuple(row.owner_key for row in snapshot.owners) == ("issue:1",)
+
+
+class AuthoritativeHierarchy:
+    """Minimal cache-bypassing hierarchy API used by production admission."""
+
+    def __init__(self, parents=None, children=None):
+        self.parents = parents or {}
+        self.children = children or {}
+
+    def get_parent_issue_number_strict(self, _repo, number):
+        value = self.parents.get(number)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    def get_direct_sub_issues_strict(self, _repo, number):
+        return [{"number": child} for child in self.children.get(number, [])]
+
+    def get_issue_hierarchy_generation_strict(self, _repo, _number):
+        return "generation-1"
+
+
+def test_durable_admission_excludes_both_direct_parent_child_directions_and_restart(tmp_path):
+    """AC-001, AC-002, AC-004, AC-009: the owner record is the sole active oracle."""
+    path = tmp_path / "hierarchy-slots.json"
+    hierarchy = AuthoritativeHierarchy(parents={2: 1}, children={1: [2]})
+    slots = ImplementationSlotRepository("owner/repo", 3, path)
+    child_execution = slots.start_execution(ImplementationOwner("issue", 2), github_client=hierarchy)
+    assert child_execution is not None
+    slots.finish_execution(ImplementationOwner("issue", 2), child_execution)
+
+    restarted = ImplementationSlotRepository("owner/repo", 3, path)
+    with pytest.raises(ImplementationHierarchyConflict, match="issue:2"):
+        restarted.start_execution(ImplementationOwner("issue", 1), bypass_capacity=True, allow_urgent_emergency=True, github_client=hierarchy)
+    assert restarted.active_owners() == (ImplementationOwner("issue", 2),)
+
+    restarted.release(ImplementationOwner("issue", 2))
+    assert restarted.start_execution(ImplementationOwner("issue", 1), github_client=hierarchy) is not None
+    with pytest.raises(ImplementationHierarchyConflict, match="issue:1"):
+        restarted.start_execution(ImplementationOwner("issue", 2), github_client=hierarchy)
+
+
+def test_durable_admission_preserves_unrelated_and_sibling_concurrency(tmp_path):
+    """AC-007, AC-008: only the direct relation to the candidate conflicts."""
+    hierarchy = AuthoritativeHierarchy(parents={2: 1, 3: 1}, children={1: [2, 3]})
+    slots = repository(tmp_path, limit=4)
+    assert slots.start_execution(ImplementationOwner("issue", 2), github_client=hierarchy)
+    assert slots.start_execution(ImplementationOwner("issue", 3), github_client=hierarchy)
+    assert slots.start_execution(ImplementationOwner("issue", 99), github_client=hierarchy)
+
+
+def test_durable_admission_hierarchy_failure_and_change_fail_closed(tmp_path):
+    """AC-005, AC-006: operational and stale evidence cannot create ownership."""
+    slots = repository(tmp_path, limit=3)
+    unavailable = AuthoritativeHierarchy(parents={2: RuntimeError("offline")})
+    with pytest.raises(ImplementationHierarchyUnavailable, match="offline"):
+        slots.start_execution(ImplementationOwner("issue", 2), github_client=unavailable)
+
+    class ReparentingHierarchy(AuthoritativeHierarchy):
+        def __init__(self):
+            super().__init__()
+            self.reads = 0
+
+        def get_parent_issue_number_strict(self, _repo, _number):
+            self.reads += 1
+            return None if self.reads == 1 else 1
+
+    with pytest.raises(ImplementationHierarchyUnavailable, match="changed"):
+        slots.start_execution(ImplementationOwner("issue", 2), github_client=ReparentingHierarchy())
+    assert slots.active_owners() == ()
+
+
+def test_concurrent_opposite_side_admission_serializes_hierarchy_and_owner_commit(tmp_path):
+    """AC-003: separate repositories sharing storage cannot race in both owners."""
+    path = tmp_path / "race-slots.json"
+    hierarchy = AuthoritativeHierarchy(parents={2: 1}, children={1: [2]})
+    barrier = threading.Barrier(2)
+
+    def admit(number):
+        barrier.wait()
+        slots = ImplementationSlotRepository("owner/repo", 3, path)
+        try:
+            return slots.start_execution(ImplementationOwner("issue", number), github_client=hierarchy)
+        except ImplementationHierarchyConflict:
+            return None
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(admit, (1, 2)))
+    assert sum(result is not None for result in results) == 1
+    assert len(ImplementationSlotRepository("owner/repo", 3, path).active_owners()) == 1
+
+
+class HierarchyHttpResponse:
+    def __init__(self, status_code, payload):
+        self.status_code = status_code
+        self._payload = payload
+        self.links = {}
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+    def json(self):
+        return self._payload
+
+
+def test_production_reader_preserves_self_child_as_operational_failure(tmp_path):
+    """REQ-006: the HTTP parser must not erase contradictory self-membership."""
+    client_context = MagicMock()
+    client_context.side_effect = lambda _client, _method, url, **_kwargs: (HierarchyHttpResponse(200, {"number": 2, "updated_at": "generation-1"}) if url.endswith("/issues/2") else (HierarchyHttpResponse(404, {}) if url.endswith("/parent") else HierarchyHttpResponse(200, [{"number": 2}])))
+    github = GitHubClient("token")
+    slots = repository(tmp_path)
+
+    with patch("auto_coder.util.gh_cache._caching_request", client_context):
+        with pytest.raises(ImplementationHierarchyUnavailable, match="self-referential"):
+            slots.start_execution(ImplementationOwner("issue", 2), github_client=github)
+
+    assert slots.active_owners() == ()
+
+
+def test_production_readers_detect_reparenting_during_final_child_lookup(tmp_path):
+    """REQ-007: a relationship mutation during child I/O cannot commit stale evidence."""
+    authoritative_parent = {"number": None}
+    child_reads = {"count": 0}
+
+    def get(url, **_kwargs):
+        if url.endswith("/issues/2"):
+            return HierarchyHttpResponse(200, {"number": 2, "updated_at": f"parent-{authoritative_parent['number']}"})
+        if url.endswith("/parent"):
+            number = authoritative_parent["number"]
+            return HierarchyHttpResponse(404, {}) if number is None else HierarchyHttpResponse(200, {"number": number})
+        child_reads["count"] += 1
+        if child_reads["count"] == 2:
+            authoritative_parent["number"] = 1
+        return HierarchyHttpResponse(200, [])
+
+    client_context = MagicMock()
+    client_context.side_effect = lambda _client, _method, url, **kwargs: get(url, **kwargs)
+    github = GitHubClient("token")
+    slots = repository(tmp_path, limit=3)
+    slots.reserve(ImplementationOwner("issue", 1))
+
+    with patch("auto_coder.util.gh_cache._caching_request", client_context):
+        with pytest.raises(ImplementationHierarchyUnavailable, match="changed"):
+            slots.start_execution(ImplementationOwner("issue", 2), github_client=github)
+
+    assert slots.active_owners() == (ImplementationOwner("issue", 1),)
+
+
+def test_production_readers_detect_child_attachment_during_final_parent_confirmation(tmp_path):
+    """REQ-007: refreshing after the provisional write catches stale children."""
+    children = []
+    parent_reads = 0
+
+    def get(url, **_kwargs):
+        nonlocal parent_reads
+        if url.endswith("/issues/2"):
+            return HierarchyHttpResponse(200, {"number": 2, "updated_at": f"children-{children}"})
+        if url.endswith("/parent"):
+            parent_reads += 1
+            response = HierarchyHttpResponse(404, {})
+            if parent_reads == 2:
+                children.append(1)
+            return response
+        return HierarchyHttpResponse(200, [{"number": number} for number in children])
+
+    client_context = MagicMock()
+    client_context.side_effect = lambda _client, _method, url, **kwargs: get(url, **kwargs)
+    github = GitHubClient("token")
+    slots = repository(tmp_path, limit=3)
+    slots.reserve(ImplementationOwner("issue", 1))
+
+    with patch("auto_coder.util.gh_cache._caching_request", client_context):
+        with pytest.raises(ImplementationHierarchyUnavailable, match="changed"):
+            slots.start_execution(ImplementationOwner("issue", 2), github_client=github)
+
+    assert slots.active_owners() == (ImplementationOwner("issue", 1),)
+
+
+def test_production_readers_rollback_reparenting_after_provisional_owner_write(tmp_path):
+    """REQ-007: a relationship changed at the write boundary cannot dispatch."""
+    path = tmp_path / "post-write-slots.json"
+    ImplementationSlotRepository("owner/repo", 3, path).reserve(ImplementationOwner("issue", 1))
+    authoritative_parent = {"number": None}
+
+    class ReparentAfterWriteRepository(ImplementationSlotRepository):
+        def _write(self, owners):
+            super()._write(owners)
+            if "issue:2" in owners and authoritative_parent["number"] is None:
+                authoritative_parent["number"] = 1
+
+    def get(url, **_kwargs):
+        if url.endswith("/issues/2"):
+            return HierarchyHttpResponse(200, {"number": 2, "updated_at": f"parent-{authoritative_parent['number']}"})
+        if url.endswith("/parent"):
+            number = authoritative_parent["number"]
+            return HierarchyHttpResponse(404, {}) if number is None else HierarchyHttpResponse(200, {"number": number})
+        return HierarchyHttpResponse(200, [])
+
+    client_context = MagicMock()
+    client_context.side_effect = lambda _client, _method, url, **kwargs: get(url, **kwargs)
+    github = GitHubClient("token")
+    slots = ReparentAfterWriteRepository("owner/repo", 3, path)
+
+    with patch("auto_coder.util.gh_cache._caching_request", client_context):
+        with pytest.raises(ImplementationHierarchyConflict, match="issue:1"):
+            slots.start_execution(ImplementationOwner("issue", 2), github_client=github)
+
+    assert slots.active_owners() == (ImplementationOwner("issue", 1),)
+
+
+def test_production_parent_reader_rejects_boolean_confirmation_identity(tmp_path):
+    """REQ-006: bool must not compare as an authoritative integer parent."""
+    parent_payloads = iter(({"number": 1}, {"number": True}))
+
+    def get(url, **_kwargs):
+        if url.endswith("/issues/2"):
+            return HierarchyHttpResponse(200, {"number": 2, "updated_at": "generation-1"})
+        if url.endswith("/parent"):
+            return HierarchyHttpResponse(200, next(parent_payloads))
+        return HierarchyHttpResponse(200, [])
+
+    client_context = MagicMock()
+    client_context.side_effect = lambda _client, _method, url, **kwargs: get(url, **kwargs)
+    github = GitHubClient("token")
+    slots = repository(tmp_path)
+
+    with patch("auto_coder.util.gh_cache._caching_request", client_context):
+        with pytest.raises(ImplementationHierarchyUnavailable, match="ambiguous"):
+            slots.start_execution(ImplementationOwner("issue", 2), github_client=github)
+
+    assert slots.active_owners() == ()
+
+
+def execution_process(storage_path, owner_kind="issue", owner_number=100, force=False, lifetime=60):
+    """Start an execution through the production repository API in another process."""
+    script = """
+import os
+import time
+from pathlib import Path
+from auto_coder.implementation_slots import ImplementationOwner, ImplementationSlotRepository, ImplementationSlotUnavailable
+
+slots = ImplementationSlotRepository("owner/repo", 1, Path(os.environ["SLOT_PATH"]))
+execution_id = slots.start_execution(
+    ImplementationOwner(os.environ["OWNER_KIND"], int(os.environ["OWNER_NUMBER"])),
+    bypass_capacity=True,
+    bypass_active_execution=os.environ["FORCE"] == "1",
+)
+print(execution_id, flush=True)
+time.sleep(float(os.environ["LIFETIME"]))
+"""
+    environment = os.environ.copy()
+    environment.update(
+        SLOT_PATH=str(storage_path),
+        OWNER_KIND=owner_kind,
+        OWNER_NUMBER=str(owner_number),
+        FORCE="1" if force else "0",
+        LIFETIME=str(lifetime),
+    )
+    process = subprocess.Popen([sys.executable, "-c", script], env=environment, stdout=subprocess.PIPE, text=True)
+    assert process.stdout is not None
+    execution_id = process.stdout.readline().strip()
+    assert execution_id and execution_id != "None"
+    return process, execution_id
+
+
+def wait_for_zombie(process, timeout=5):
+    """Wait for a child to terminate without reaping its procfs record."""
+    deadline = time.monotonic() + timeout
+    stat_path = f"/proc/{process.pid}/stat"
+    while time.monotonic() < deadline:
+        stat = open(stat_path, encoding="ascii").read()
+        state = stat[stat.rfind(")") + 2 :].split()[0]
+        if state == "Z":
+            return
+        time.sleep(0.01)
+    pytest.fail(f"process {process.pid} did not enter zombie state")
+
+
+def unix_identity_command(uid, gid):
+    identity = ["setpriv", f"--reuid={uid}", f"--regid={gid}", "--clear-groups"]
+    # sudo's default environment reset would discard the per-test runtime root
+    # and make the child try to coordinate through the invoking user's home.
+    return identity if os.geteuid() == 0 else ["sudo", "-n", "--preserve-env=AUTO_CODER_RUNTIME_ROOT", *identity]
+
+
+def run_slot_writer_as(uid, gid, storage_path, owner_number, action="reserve"):
+    """Run one production repository update under a selected Unix identity."""
+    script = """
+import json
+import sys
+from pathlib import Path
+from auto_coder.implementation_slots import ImplementationOwner, ImplementationSlotRepository, ImplementationSlotUnavailable
+
+slots = ImplementationSlotRepository("owner/repo", 10, Path(sys.argv[1]))
+owner = ImplementationOwner("issue", int(sys.argv[2]))
+action = sys.argv[3]
+serialization_attempts = []
+if action == "serialize-retries":
+    for _attempt in range(2):
+        entered = False
+        try:
+            with slots.serialize(owner):
+                entered = True
+        except ImplementationSlotUnavailable as exc:
+            serialization_attempts.append({"entered": entered, "error": str(exc)})
+        else:
+            serialization_attempts.append({"entered": entered, "error": None})
+elif action == "serialize-cycle":
+    execution_id = slots.start_execution(owner, bypass_capacity=True)
+    assert execution_id
+    with slots.serialize(owner):
+        pass
+    slots.finish_execution(owner, execution_id)
+elif action == "update":
+    assert slots.record_provider_session(owner, "cross-identity-update")
+else:
+    assert slots.reserve(owner)
+print(json.dumps({
+    "owners": [item.number for item in slots.active_owners()],
+    "executions": list(slots.active_execution_ids(owner)),
+    "serialization_attempts": serialization_attempts,
+}))
+"""
+    environment = os.environ.copy()
+    environment["AUTO_CODER_RUNTIME_ROOT"] = str(storage_path.parent / "runtime")
+    return subprocess.run(
+        [*unix_identity_command(uid, gid), sys.executable, "-c", script, str(storage_path), str(owner_number), action],
+        cwd=Path(__file__).parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+
+def test_alternating_unix_identities_retain_shared_permissions_and_state():
+    """REQ-001/REQ-002/REQ-003: atomic writes remain usable across OS identities."""
+    shared_directory = Path(tempfile.mkdtemp(prefix="auto-coder-shared-slots-", dir="/tmp"))
+    storage_path = shared_directory / "implementation_slots.json"
+    inaccessible_path = shared_directory / "inaccessible.json"
+    inaccessible_path.write_text('{"issue:9": {"kind": "issue", "number": 9}}', encoding="utf-8")
+    first_uid, second_uid, shared_gid = 65532, 65533, os.getgid()
+    ownership_command = ["chown", f"{os.getuid()}:{shared_gid}", str(shared_directory)]
+    if os.geteuid() != 0:
+        ownership_command = ["sudo", "-n", *ownership_command]
+    try:
+        subprocess.run(ownership_command, check=True)
+        mode_command = ["chmod", "2770", str(shared_directory)]
+        if os.geteuid() != 0:
+            mode_command = ["sudo", "-n", *mode_command]
+        subprocess.run(mode_command, check=True)
+
+        assert json.loads(run_slot_writer_as(first_uid, shared_gid, storage_path, 101).stdout)["owners"] == [101]
+        assert json.loads(run_slot_writer_as(second_uid, shared_gid, storage_path, 202).stdout)["owners"] == [101, 202]
+        assert json.loads(run_slot_writer_as(first_uid, shared_gid, storage_path, 303).stdout)["owners"] == [101, 202, 303]
+        assert json.loads(run_slot_writer_as(second_uid, shared_gid, storage_path, 404).stdout)["owners"] == [101, 202, 303, 404]
+
+        for uid in (first_uid, second_uid, first_uid):
+            result = json.loads(run_slot_writer_as(uid, shared_gid, storage_path, 505, "serialize-cycle").stdout)
+            assert result["executions"] == []
+
+        state = json.loads(storage_path.read_text(encoding="utf-8"))
+        assert set(state) == {"issue:101", "issue:202", "issue:303", "issue:404", "issue:505"}
+        lock_directory = shared_directory / "runtime/locks/owner/repo"
+        store_lock_path = next(lock_directory.glob("implementation-store-*.lock"))
+        owner_lock_path = next(lock_directory.glob("implementation-owner-*.lock"))
+        for path in (storage_path, store_lock_path, owner_lock_path):
+            metadata = path.stat()
+            assert metadata.st_gid == shared_gid
+            assert metadata.st_mode & 0o777 == 0o660
+
+        live_script = """
+import sys
+import time
+from pathlib import Path
+from auto_coder.implementation_slots import ImplementationOwner, ImplementationSlotRepository
+
+slots = ImplementationSlotRepository("owner/repo", 10, Path(sys.argv[1]))
+execution_id = slots.start_execution(ImplementationOwner("issue", 606))
+assert execution_id
+print(execution_id, flush=True)
+time.sleep(30)
+"""
+        live_process = subprocess.Popen(
+            [*unix_identity_command(first_uid, shared_gid), sys.executable, "-c", live_script, str(storage_path)],
+            cwd=Path(__file__).parents[1],
+            stdout=subprocess.PIPE,
+            text=True,
+            env={**os.environ, "AUTO_CODER_RUNTIME_ROOT": str(shared_directory / "runtime")},
+        )
+        assert live_process.stdout is not None
+        legacy_execution_id = live_process.stdout.readline().strip()
+        assert legacy_execution_id
+        try:
+            legacy_mode_command = ["chmod", "640", str(storage_path)]
+            if os.geteuid() != 0:
+                legacy_mode_command = ["sudo", "-n", *legacy_mode_command]
+            subprocess.run(legacy_mode_command, check=True)
+
+            migrated = json.loads(run_slot_writer_as(second_uid, shared_gid, storage_path, 606, "update").stdout)
+            assert migrated["executions"] == [legacy_execution_id]
+            migrated_state = json.loads(storage_path.read_text(encoding="utf-8"))
+            assert migrated_state["issue:606"]["executions"][0]["id"] == legacy_execution_id
+            assert migrated_state["issue:606"]["provider_sessions"] == ["cross-identity-update"]
+            assert storage_path.stat().st_mode & 0o777 == 0o660
+        finally:
+            live_process.terminate()
+            live_process.wait(timeout=5)
+
+        for owner_number, legacy_mode in ((808, "600"), (809, "664")):
+            legacy_owner_lock = shared_directory / f"implementation-issue-{owner_number}.lock"
+            legacy_owner_lock.touch()
+            ownership_command = ["chown", f"{first_uid}:{shared_gid}", str(legacy_owner_lock)]
+            mode_command = ["chmod", legacy_mode, str(legacy_owner_lock)]
+            if os.geteuid() != 0:
+                ownership_command = ["sudo", "-n", *ownership_command]
+                mode_command = ["sudo", "-n", *mode_command]
+            subprocess.run(ownership_command, check=True)
+            subprocess.run(mode_command, check=True)
+
+            retry_result = json.loads(run_slot_writer_as(second_uid, shared_gid, storage_path, owner_number, "serialize-retries").stdout)
+
+            assert len(retry_result["serialization_attempts"]) == 2
+            assert [attempt["entered"] for attempt in retry_result["serialization_attempts"]] == [True, True]
+            assert all(attempt["error"] is None for attempt in retry_result["serialization_attempts"])
+            assert legacy_owner_lock.stat().st_mode & 0o777 == int(legacy_mode, 8)
+
+        restrict_command = ["chown", f"{first_uid}:{shared_gid}", str(inaccessible_path)]
+        if os.geteuid() != 0:
+            restrict_command = ["sudo", "-n", *restrict_command]
+        subprocess.run(restrict_command, check=True)
+        restrict_command = ["chmod", "600", str(inaccessible_path)]
+        if os.geteuid() != 0:
+            restrict_command = ["sudo", "-n", *restrict_command]
+        subprocess.run(restrict_command, check=True)
+        with pytest.raises(subprocess.CalledProcessError) as failure:
+            run_slot_writer_as(second_uid, shared_gid, inaccessible_path, 10)
+        assert "Cannot safely establish or use implementation slot shared-state permissions" in failure.value.stderr
+        assert str(inaccessible_path) in failure.value.stderr
+        read_command = ["cat", str(inaccessible_path)]
+        if os.geteuid() != 0:
+            read_command = ["sudo", "-n", *read_command]
+        preserved_state = subprocess.run(read_command, check=True, capture_output=True, text=True).stdout
+        assert json.loads(preserved_state) == {"issue:9": {"kind": "issue", "number": 9}}
+    finally:
+        cleanup_command = ["rm", "-rf", str(shared_directory)]
+        if os.geteuid() != 0:
+            cleanup_command = ["sudo", "-n", *cleanup_command]
+        subprocess.run(cleanup_command, check=True)
+
+
+def test_readable_legacy_state_is_migrated_without_semantic_reset(tmp_path):
+    owner = ImplementationOwner("issue", 1749)
+    storage_path = tmp_path / "slots.json"
+    storage_path.write_text(json.dumps({owner.key: {"kind": owner.kind, "number": owner.number}}), encoding="utf-8")
+    os.chmod(storage_path, 0o600)
+
+    slots = ImplementationSlotRepository("owner/repo", 2, storage_path)
+
+    assert slots.active_owners() == (owner,)
+    assert slots.reserve(ImplementationOwner("issue", 1750)) is True
+    assert storage_path.stat().st_mode & 0o777 == 0o660
+    assert slots.lock_path.stat().st_mode & 0o777 == 0o660
+    assert not storage_path.with_suffix(".lock").exists()
+
+
+def test_corrupt_state_error_is_distinct_from_permission_failures(tmp_path):
+    slots = repository(tmp_path)
+    slots.storage_path.write_text("not-json", encoding="utf-8")
+
+    with pytest.raises(ImplementationSlotUnavailable, match="Cannot safely parse implementation slot state"):
+        slots.active_owners()
+
+
+@pytest.mark.parametrize("crash_after_persist", [False, True], ids=["admission", "post-persist-crash"])
+def test_cross_identity_processes_racing_final_slot_admit_exactly_one(crash_after_persist):
+    """REQ-001/REQ-002/REQ-004: a published namespace is not consumed early."""
+    shared_directory = Path(tempfile.mkdtemp(prefix="auto-coder-slot-race-", dir="/tmp"))
+    storage_path = shared_directory / "implementation_slots.json"
+    gate_path = shared_directory / "start"
+    published_path = shared_directory / "published"
+    encountered_path = shared_directory / "encountered"
+    release_path = shared_directory / "release"
+    first_uid, second_uid, shared_gid = 65532, 65533, os.getgid()
+    setup_commands = [
+        ["mkdir", str(shared_directory / "runtime")],
+        ["chown", f"{os.getuid()}:{shared_gid}", str(shared_directory)],
+        ["chown", f"{os.getuid()}:{shared_gid}", str(shared_directory / "runtime")],
+        ["chmod", "2770", str(shared_directory)],
+        ["chmod", "2770", str(shared_directory / "runtime")],
+    ]
+    race_script = """
+import os
+import sys
+import time
+from pathlib import Path
+import auto_coder.runtime_locks as runtime_locks
+from auto_coder.implementation_slots import ImplementationOwner, ImplementationSlotRepository
+
+storage_path, gate_path, owner_number = Path(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3])
+published_path, encountered_path, release_path = map(Path, sys.argv[4:7])
+role = sys.argv[7]
+crash_after_persist = sys.argv[8] == "1"
+if role == "creator":
+    original_chown = runtime_locks.os.chown
+    def controlled_chown(path, uid, gid):
+        if Path(path).name == "locks":
+            published_path.touch()
+            while not release_path.exists():
+                time.sleep(0.005)
+        return original_chown(path, uid, gid)
+    runtime_locks.os.chown = controlled_chown
+else:
+    original_access = runtime_locks.os.access
+    def observed_access(path, mode):
+        accessible = original_access(path, mode)
+        if Path(path).name == "locks" and not accessible:
+            encountered_path.touch()
+        return accessible
+    runtime_locks.os.access = observed_access
+os.umask(0o022)
+print(f"READY {os.getpid()}", flush=True)
+while not gate_path.exists():
+    time.sleep(0.005)
+if role == "contender":
+    while not published_path.exists():
+        time.sleep(0.005)
+execution_id = ImplementationSlotRepository("owner/repo", 1, storage_path).start_execution(
+    ImplementationOwner("issue", owner_number)
+)
+if crash_after_persist and execution_id is not None:
+    # Reproduce a winner exiting after persisting its owner but before reporting.
+    os._exit(77)
+print(execution_id or "DENIED", flush=True)
+time.sleep(30)
+"""
+    processes = []
+
+    def participant_diagnostics():
+        details = []
+        for process in processes:
+            exit_code = process.poll()
+            stderr = process.stderr.read().strip() if exit_code is not None and process.stderr is not None else "<still running>"
+            details.append({"pid": process.pid, "exit": exit_code, "stderr": stderr})
+        return details
+
+    def read_participant_line(process):
+        assert process.stdout is not None
+        readable, _, _ = select.select([process.stdout], [], [], 15)
+        assert readable, f"Participant {process.pid} did not report within 15 seconds: {participant_diagnostics()}"
+        return process.stdout.readline().strip()
+
+    try:
+        for command in setup_commands:
+            if os.geteuid() != 0:
+                command = ["sudo", "-n", *command]
+            subprocess.run(command, check=True)
+        for uid, owner_number, role in ((first_uid, 701, "creator"), (second_uid, 702, "contender")):
+            environment = os.environ.copy()
+            environment["AUTO_CODER_RUNTIME_ROOT"] = str(shared_directory / "runtime")
+            process = subprocess.Popen(
+                [
+                    *unix_identity_command(uid, shared_gid),
+                    sys.executable,
+                    "-c",
+                    race_script,
+                    str(storage_path),
+                    str(gate_path),
+                    str(owner_number),
+                    str(published_path),
+                    str(encountered_path),
+                    str(release_path),
+                    role,
+                    "1" if crash_after_persist else "0",
+                ],
+                cwd=Path(__file__).parents[1],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=environment,
+            )
+            assert process.stdout is not None
+            processes.append(process)
+        ready = [read_participant_line(process) for process in processes]
+        assert all(len(line.split()) == 2 and line.split()[0] == "READY" and line.split()[1].isdigit() for line in ready), f"Unexpected startup output {ready!r}: {participant_diagnostics()}"
+        participant_pids = [int(line.split()[1]) for line in ready]
+        assert len(set(participant_pids)) == 2
+
+        gate_path.touch()
+        deadline = time.monotonic() + 5
+        while not encountered_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert encountered_path.exists()
+        release_path.touch()
+        outcomes = [read_participant_line(process) for process in processes]
+        state = json.loads(storage_path.read_text(encoding="utf-8"))
+
+        def assert_successful_admission():
+            assert all(outcomes), f"Empty admission outcome: {outcomes!r}; {participant_diagnostics()}"
+            assert outcomes.count("DENIED") == 1
+            assert sum(outcome != "DENIED" for outcome in outcomes) == 1
+            winner_index = next(index for index, outcome in enumerate(outcomes) if outcome != "DENIED")
+            winner_key = f"issue:{(701, 702)[winner_index]}"
+            assert set(state) == {winner_key}
+            executions = state[winner_key]["executions"]
+            assert len(executions) == 1
+            assert executions[0]["id"] == outcomes[winner_index]
+            # Under sudo, Popen.pid names the wrapper, not the Python child.
+            assert executions[0]["pid"] == participant_pids[winner_index]
+            assert all(process.poll() is None for process in processes), f"Participant exited during durable-state observation: {participant_diagnostics()}"
+
+        if crash_after_persist:
+            # The state write happened, but the admitting participant never
+            # reported its execution ID. The normal success oracle must fail.
+            assert sum(process.poll() == 77 for process in processes) == 1, participant_diagnostics()
+            with pytest.raises(AssertionError, match="Empty admission outcome"):
+                assert_successful_admission()
+        else:
+            assert all(process.poll() is None for process in processes), f"Participant exited before state read: {participant_diagnostics()}"
+            assert_successful_admission()
+    finally:
+        release_path.touch(exist_ok=True)
+        for process in processes:
+            process.terminate()
+            process.wait(timeout=5)
+        cleanup_command = ["rm", "-rf", str(shared_directory)]
+        if os.geteuid() != 0:
+            cleanup_command = ["sudo", "-n", *cleanup_command]
+        subprocess.run(cleanup_command, check=True)
+
+
+def test_reservation_is_durable_and_independent_owners_obey_limit(tmp_path):
+    first = repository(tmp_path)
+    assert first.reserve(ImplementationOwner("issue", 100)) is True
+
+    after_restart = repository(tmp_path)
+    assert after_restart.active_owners() == (ImplementationOwner("issue", 100),)
+    assert after_restart.reserve(ImplementationOwner("issue", 200)) is False
+
+
+def test_related_pr_reuses_issue_owner_and_multiple_prs_count_once(tmp_path):
+    github = GitHubState(issues={100: {"number": 100, "state": "open"}})
+    slots = repository(tmp_path)
+    issue = slots.resolve_owner("issue", {"number": 100}, github)
+    first_pr = slots.resolve_owner("pr", {"number": 105, "body": "Closes #100"}, github)
+    second_pr = slots.resolve_owner("pr", {"number": 108, "body": "Fixes #100"}, github)
+
+    assert issue == first_pr == second_pr == ImplementationOwner("issue", 100)
+    assert slots.reserve(issue) is True
+    assert slots.reserve(first_pr) is True
+    assert slots.active_owners() == (issue,)
+
+
+def test_standalone_pr_has_independent_owner(tmp_path):
+    slots = repository(tmp_path)
+    github = GitHubState()
+    assert slots.reserve(ImplementationOwner("issue", 100)) is True
+    owner = slots.resolve_owner("pr", {"number": 200, "body": "No linked issue"}, github)
+    assert owner == ImplementationOwner("pr", 200)
+    assert slots.reserve(owner) is False
+
+
+def test_source_less_provider_pr_reuses_durable_recurrent_owner(tmp_path):
+    slots = repository(tmp_path)
+    recurrent_owner = ImplementationOwner("recurrent", 12345)
+    assert slots.reserve_new(recurrent_owner) is True
+    assert slots.record_provider_session(recurrent_owner, "session-abc") is True
+
+    github = GitHubState()
+    owner_from_session = slots.resolve_owner(
+        "pr",
+        {"number": 123, "body": "Created by https://jules.google.com/session/session-abc"},
+        github,
+    )
+    assert owner_from_session == recurrent_owner
+    assert slots.reserve(owner_from_session) is True
+
+    assert slots.record_implementation_pr(recurrent_owner, 123) is True
+    owner_after_restart = repository(tmp_path).resolve_owner(
+        "pr",
+        {"number": 123, "body": "No source Issue or session metadata"},
+        github,
+    )
+    assert owner_after_restart == recurrent_owner
+
+
+def test_startup_records_open_provider_pr_membership(tmp_path):
+    slots = repository(tmp_path)
+    recurrent_owner = ImplementationOwner("recurrent", 12345)
+    assert slots.reserve_new(recurrent_owner) is True
+    assert slots.record_provider_session(recurrent_owner, "session-abc") is True
+    github = GitHubState(
+        open_prs=[
+            {
+                "number": 123,
+                "body": "Created by https://jules.google.com/session/session-abc",
+            }
+        ]
+    )
+
+    slots.reconcile(github, discover_open_prs=True)
+
+    restarted = repository(tmp_path)
+    owner = restarted.resolve_owner(
+        "pr",
+        {"number": 123, "body": "No source Issue or provider metadata"},
+        GitHubState(),
+    )
+    assert owner == recurrent_owner
+    assert restarted.reserve(ImplementationOwner("issue", 200)) is False
+
+
+def test_reconciliation_releases_terminal_but_retains_uncertain_owner(tmp_path):
+    slots = repository(tmp_path, limit=2)
+    terminal = ImplementationOwner("issue", 100)
+    uncertain = ImplementationOwner("issue", 200)
+    slots.reserve(terminal)
+    slots.reserve(uncertain)
+    github = GitHubState(issues={100: {"state": "closed"}, 200: RuntimeError("offline")})
+
+    slots.reconcile(github)
+
+    assert slots.active_owners() == (uncertain,)
+
+
+def test_closed_issue_retains_slot_while_sibling_pr_is_open(tmp_path):
+    slots = repository(tmp_path)
+    issue_owner = ImplementationOwner("issue", 100)
+    assert slots.reserve(issue_owner) is True
+    github = GitHubState(
+        issues={100: {"number": 100, "state": "closed"}},
+        prs={
+            105: {"number": 105, "state": "closed", "merged": True, "body": "Closes #100"},
+            108: {"number": 108, "state": "open", "merged": False, "body": "Fixes #100"},
+        },
+        linked_prs={100: [105, 108]},
+    )
+
+    slots.reconcile(github)
+
+    assert slots.active_owners() == (issue_owner,)
+    assert slots.reserve(ImplementationOwner("issue", 200)) is False
+    sibling_owner = slots.resolve_owner("pr", github.prs[108], github)
+    assert sibling_owner == issue_owner
+    assert slots.reserve(sibling_owner) is True
+    assert slots.active_owners() == (issue_owner,)
+
+
+def test_reconciliation_retains_slot_when_production_timeline_is_unavailable(tmp_path, monkeypatch):
+    slots = repository(tmp_path)
+    issue_owner = ImplementationOwner("issue", 100)
+    assert slots.reserve(issue_owner) is True
+    github = GitHubClient("token")
+    monkeypatch.setattr(github, "get_issue", lambda _repo, _number: {"number": 100, "state": "closed"})
+    monkeypatch.setattr(github, "get_issue_details", lambda issue: issue)
+
+    class UnavailableTimeline:
+        def request(self, method, url, headers=None, extensions=None):
+            raise RuntimeError("timeline offline")
+
+    monkeypatch.setattr("auto_coder.util.gh_cache.get_caching_client", lambda: UnavailableTimeline())
+
+    slots.reconcile(github)
+
+    assert slots.active_owners() == (issue_owner,)
+    assert slots.reserve(ImplementationOwner("issue", 200)) is False
+
+
+def test_reconciliation_reads_all_connected_pr_pages_before_releasing_slot(tmp_path, monkeypatch):
+    """Reconciliation's strict connected-PR lookup must read every page, and a
+    same-repository mention (never returned by the native connection reader)
+    must not be mistaken for a genuine connection retaining the slot."""
+    slots = repository(tmp_path)
+    issue_owner = ImplementationOwner("issue", 100)
+    assert slots.reserve(issue_owner) is True
+    github = GitHubClient("token")
+    monkeypatch.setattr(github, "get_issue", lambda _repo, _number: {"number": 100, "state": "closed"})
+    monkeypatch.setattr(github, "get_issue_details", lambda issue: issue)
+    monkeypatch.setattr(
+        GitHubClient,
+        "get_issue_strict",
+        lambda _self, _repo, number: {"number": number, "state": "closed"},
+    )
+    monkeypatch.setattr(
+        github,
+        "get_pull_request",
+        lambda _repo, number: {"number": number, "state": "closed", "merged": True},
+    )
+    monkeypatch.setattr(github, "get_pr_details", lambda pr: pr)
+
+    def _page_response(nodes, has_next_page, end_cursor=None):
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "data": {
+                "repository": {
+                    "issue": {
+                        "closedByPullRequestsReferences": {
+                            "pageInfo": {"hasNextPage": has_next_page, "endCursor": end_cursor},
+                            "nodes": nodes,
+                        }
+                    }
+                }
+            }
+        }
+        return response
+
+    def _pr_node(number):
+        return {"number": number, "repository": {"owner": {"login": "owner"}, "name": "repo"}}
+
+    responses = [
+        _page_response([_pr_node(101)], has_next_page=True, end_cursor="cursor-1"),
+        _page_response([_pr_node(102)], has_next_page=False),
+    ]
+    requested = []
+
+    def _post(url, headers=None, json=None, timeout=None):
+        requested.append(json["variables"].get("cursor"))
+        return responses.pop(0)
+
+    with patch("httpx.Client") as mock_client_cls:
+        mock_client_cls.return_value.__enter__.return_value.post.side_effect = _post
+        slots.reconcile(github)
+
+    assert requested == [None, "cursor-1"]
+    # Both connected PRs (101, 102) are terminal, and no cross-reference or
+    # mention ever entered the result, so the closed source Issue releases.
+    assert slots.active_owners() == ()
+    assert slots.reserve(ImplementationOwner("issue", 200)) is True
+
+
+def test_reconciliation_retains_branch_linked_pr_absent_from_timeline(tmp_path, monkeypatch):
+    slots = repository(tmp_path)
+    github = GitHubClient("token")
+    monkeypatch.setattr(
+        GitHubClient,
+        "get_issue_strict",
+        lambda _self, _repo, number: {"number": number, "state": "closed"},
+    )
+    monkeypatch.setattr(github, "get_issue", lambda _repo, number: {"number": number, "state": "closed"})
+    monkeypatch.setattr(github, "get_issue_details", lambda issue: issue)
+    monkeypatch.setattr(
+        github,
+        "get_pull_request",
+        lambda _repo, number: {"number": number, "state": "open", "merged": False},
+    )
+    monkeypatch.setattr(github, "get_pr_details", lambda pr: pr)
+
+    def _empty_connected_prs_response(url, headers=None, json=None, timeout=None):
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "data": {
+                "repository": {
+                    "issue": {
+                        "closedByPullRequestsReferences": {
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                            "nodes": [],
+                        }
+                    }
+                }
+            }
+        }
+        return response
+
+    branch_linked_pr = {
+        "number": 108,
+        "title": "Implementation",
+        "body": "",
+        "head": {"ref": "issue-100-work"},
+    }
+    issue_owner = slots.resolve_owner("pr", branch_linked_pr, github)
+    assert issue_owner == ImplementationOwner("issue", 100)
+    assert slots.reserve(issue_owner, implementation_pr=108) is True
+
+    restarted_slots = repository(tmp_path)
+    with patch("httpx.Client") as mock_client_cls:
+        mock_client_cls.return_value.__enter__.return_value.post.side_effect = _empty_connected_prs_response
+        restarted_slots.reconcile(github)
+
+    assert restarted_slots.active_owners() == (issue_owner,)
+    assert restarted_slots.reserve(ImplementationOwner("issue", 200)) is False
+    assert restarted_slots.resolve_owner("pr", branch_linked_pr, github) == issue_owner
+    assert restarted_slots.reserve(issue_owner, implementation_pr=108) is True
+
+
+def test_startup_reconciliation_discovers_unrecorded_branch_linked_pr(tmp_path):
+    slots = repository(tmp_path)
+    issue_owner = ImplementationOwner("issue", 100)
+    assert slots.reserve(issue_owner) is True
+
+    class StartupGitHub(GitHubState):
+        def get_open_pull_requests(self, _repo):
+            return [
+                {
+                    "number": 108,
+                    "title": "Implementation",
+                    "body": "",
+                    "head": {"ref": "issue-100-work"},
+                }
+            ]
+
+    github = StartupGitHub(
+        issues={100: {"number": 100, "state": "closed", "title": "Source Issue"}},
+        prs={108: {"number": 108, "state": "open", "merged": False}},
+        linked_prs={100: []},
+    )
+
+    restarted_slots = repository(tmp_path)
+    restarted_slots.reconcile(github, discover_open_prs=True)
+
+    assert restarted_slots.active_owners() == (issue_owner,)
+    state = json.loads((tmp_path / "slots.json").read_text(encoding="utf-8"))
+    assert state["issue:100"]["implementation_prs"] == [108]
+    assert restarted_slots.reserve(ImplementationOwner("issue", 200)) is False
+    assert restarted_slots.reserve(issue_owner, implementation_pr=108) is True
+
+
+def test_pr_resolution_failure_is_not_treated_as_standalone(tmp_path):
+    slots = repository(tmp_path)
+    github = GitHubState(issues={100: RuntimeError("offline")})
+    with pytest.raises(ImplementationOwnerResolutionError, match="offline"):
+        slots.resolve_owner("pr", {"number": 105, "body": "Closes #100"}, github)
+
+
+def test_mention_only_pr_does_not_acquire_issue_ownership(tmp_path):
+    """REQ-001/AS-001: ordinary references never establish ownership, even for
+    a retained closed Issue owner with no real native connection."""
+    slots = repository(tmp_path, limit=2)
+    issue_owner = ImplementationOwner("issue", 100)
+    assert slots.reserve(issue_owner) is True
+    github = GitHubState(issues={100: {"number": 100, "state": "closed"}}, linked_prs={100: []})
+
+    for body in ("See #100 for context", "Related issue: #100", "Issue #100"):
+        owner = slots.resolve_owner("pr", {"number": 200, "title": "Implementation", "body": body}, github)
+        assert owner == ImplementationOwner("pr", 200)
+
+
+def test_foreign_qualified_directive_is_excluded_without_touching_local_issue(tmp_path):
+    """REQ-003/AS-003: a foreign owner/repo directive must not be rebound to a
+    same-numbered local Issue, and must be excluded without even attempting a
+    local Issue lookup for that number."""
+    slots = repository(tmp_path)
+    github = GitHubState()  # No local issue #100 registered; a lookup would raise.
+    owner = slots.resolve_owner("pr", {"number": 200, "body": "Fixes other/repo#100"}, github)
+    assert owner == ImplementationOwner("pr", 200)
+
+
+def test_native_connection_only_attributes_to_an_already_active_issue_owner(tmp_path):
+    """REQ-002/REQ-005/AS-002: a live native connection with no textual
+    directive still grants ownership when the Issue is already active, but
+    never authorizes discovering a brand-new Issue owner via unbounded scan."""
+    slots = repository(tmp_path, limit=2)
+    issue_owner = ImplementationOwner("issue", 100)
+    assert slots.reserve(issue_owner) is True
+
+    github = GitHubState(linked_prs={100: [200]})
+    owner = slots.resolve_owner("pr", {"number": 200, "body": "No directive here"}, github)
+    assert owner == issue_owner
+
+    # Issue #300 is not an active owner, so the same kind of live connection
+    # must not discover it as brand-new ownership.
+    other_github = GitHubState(linked_prs={300: [200]})
+    other = slots.resolve_owner("pr", {"number": 200, "body": "No directive here"}, other_github)
+    assert other == ImplementationOwner("pr", 200)
+
+
+def test_startup_discovery_cannot_launder_a_mention_into_durable_ownership(tmp_path):
+    """AS-001: a retained closed owner with a terminal recorded PR must still
+    release through the real startup-discovery + reconciliation path, and an
+    unrelated open PR that only mentions its number must resolve standalone
+    rather than being appended to the Issue's durable membership."""
+    slots = repository(tmp_path, limit=1)
+    issue_owner = ImplementationOwner("issue", 100)
+    assert slots.reserve(issue_owner, implementation_pr=105) is True
+
+    class StartupGitHub(GitHubState):
+        def get_open_pull_requests(self, _repo):
+            return [{"number": 200, "title": "Unrelated work", "body": "See #100 for background"}]
+
+    github = StartupGitHub(
+        issues={100: {"number": 100, "state": "closed"}},
+        prs={105: {"number": 105, "state": "closed", "merged": True}},
+        linked_prs={100: []},
+    )
+
+    slots.reconcile(github, discover_open_prs=True)
+
+    assert slots.active_owners() == ()
+    restarted = repository(tmp_path, limit=1)
+    assert restarted.active_owners() == ()
+    assert restarted.resolve_owner("pr", {"number": 200, "body": "See #100 for background"}, github) == ImplementationOwner("pr", 200)
+    assert restarted.reserve(ImplementationOwner("issue", 200)) is True
+
+
+def test_atomic_reservation_never_exceeds_limit(tmp_path):
+    owners = [ImplementationOwner("issue", number) for number in range(10)]
+
+    def reserve(owner):
+        return repository(tmp_path).reserve(owner)
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        outcomes = list(executor.map(reserve, owners))
+
+    assert outcomes.count(True) == 1
+    assert len(repository(tmp_path).active_owners()) == 1
+
+
+def test_reserve_new_rejects_existing_owner_and_occupied_capacity(tmp_path):
+    slots = repository(tmp_path, limit=1)
+    owner = ImplementationOwner("recurrent", 10)
+
+    assert slots.reserve_new(owner) is True
+    assert slots.reserve_new(owner) is False
+    assert slots.reserve_new(ImplementationOwner("issue", 200)) is False
+    assert slots.active_owners() == (owner,)
+
+
+def test_only_execution_bypasses_capacity_but_not_active_duplicate(tmp_path):
+    slots = repository(tmp_path)
+    first = ImplementationOwner("issue", 100)
+    second = ImplementationOwner("issue", 200)
+    first_execution = slots.start_execution(first)
+
+    assert first_execution is not None
+    second_execution = slots.start_execution(second, bypass_capacity=True)
+    assert second_execution is not None
+    assert slots.start_execution(second, bypass_capacity=True) is None
+    assert set(slots.active_owners()) == {first, second}
+
+    restarted = repository(tmp_path)
+    assert restarted.active_execution_ids(first) == (first_execution,)
+    assert restarted.active_execution_ids(second) == (second_execution,)
+    assert restarted.start_execution(ImplementationOwner("issue", 300)) is None
+
+
+def test_forced_execution_has_distinct_identity_and_scoped_cleanup(tmp_path):
+    slots = repository(tmp_path)
+    owner = ImplementationOwner("issue", 100)
+    execution_a = slots.start_execution(owner)
+    execution_b = slots.start_execution(owner, bypass_capacity=True, bypass_active_execution=True)
+
+    assert execution_a is not None
+    assert execution_b is not None
+    assert execution_a != execution_b
+    assert slots.active_execution_ids(owner) == (execution_a, execution_b)
+
+    slots.finish_execution(owner, execution_b)
+
+    assert repository(tmp_path).active_execution_ids(owner) == (execution_a,)
+
+
+def test_urgent_emergency_is_atomic_durable_and_does_not_consume_normal_capacity(tmp_path):
+    slots = repository(tmp_path, limit=3)
+    normal_owners = [ImplementationOwner("issue", number) for number in (1, 2, 3)]
+    for owner in normal_owners:
+        assert slots.start_execution(owner) is not None
+
+    urgent_owners = [ImplementationOwner("issue", 10), ImplementationOwner("issue", 11)]
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda owner: repository(tmp_path, limit=3).start_execution(owner, allow_urgent_emergency=True), urgent_owners))
+
+    assert sum(result is not None for result in results) == 1
+    restarted = repository(tmp_path, limit=3)
+    assert len(restarted.active_owners()) == 4
+    assert restarted.start_execution(ImplementationOwner("issue", 12), allow_urgent_emergency=True) is None
+    assert restarted.start_execution(ImplementationOwner("issue", 13)) is None
+
+
+def test_emergency_owner_leaves_normal_capacity_available_and_allowance_is_reusable(tmp_path):
+    slots = repository(tmp_path, limit=3)
+    normal_owners = [ImplementationOwner("issue", number) for number in (1, 2, 3)]
+    for owner in normal_owners:
+        assert slots.start_execution(owner) is not None
+    emergency = ImplementationOwner("issue", 10)
+    assert slots.start_execution(emergency, allow_urgent_emergency=True) is not None
+    slots.release(normal_owners[2])
+    assert slots.start_execution(ImplementationOwner("issue", 4)) is not None
+    assert slots.start_execution(ImplementationOwner("issue", 5)) is None
+
+    slots.release(emergency)
+    assert slots.start_execution(ImplementationOwner("issue", 12), allow_urgent_emergency=True) is not None
+
+
+def test_urgent_emergency_does_not_bypass_duplicate_execution_guard(tmp_path):
+    slots = repository(tmp_path)
+    owner = ImplementationOwner("issue", 1)
+    assert slots.start_execution(owner) is not None
+    assert slots.start_execution(owner, allow_urgent_emergency=True) is None
+
+
+def test_reconcile_does_not_release_owner_with_an_active_execution(tmp_path):
+    slots = repository(tmp_path)
+    owner = ImplementationOwner("issue", 100)
+    execution = slots.start_execution(owner)
+    github = GitHubState(issues={100: {"state": "closed"}}, linked_prs={100: []})
+
+    slots.reconcile(github)
+
+    assert slots.active_owners() == (owner,)
+    assert slots.active_execution_ids(owner) == (execution,)
+
+
+def test_crashed_execution_is_reclaimed_before_issue_lifecycle_reconciliation(tmp_path):
+    """AC-001: the production execution origin survives a crash, then startup cleanup releases a terminal owner."""
+    slots = repository(tmp_path)
+    owner = ImplementationOwner("issue", 100)
+    process, execution_id = execution_process(slots.storage_path)
+    process.terminate()
+    process.wait(timeout=5)
+    github = GitHubState(issues={100: {"state": "closed"}}, linked_prs={100: []}, open_prs=[])
+
+    repository(tmp_path).reconcile(github, discover_open_prs=True)
+
+    assert execution_id not in repository(tmp_path).active_execution_ids(owner)
+    assert repository(tmp_path).active_owners() == ()
+
+
+def test_crashed_execution_on_open_issue_is_retried_without_releasing_owner(tmp_path):
+    """AC-002: admission reclaims a dead duplicate while retaining its logical owner."""
+    slots = repository(tmp_path)
+    owner = ImplementationOwner("issue", 100)
+    process, stale_execution = execution_process(slots.storage_path)
+    process.terminate()
+    process.wait(timeout=5)
+
+    replacement = repository(tmp_path).start_execution(owner)
+
+    assert replacement is not None
+    assert replacement != stale_execution
+    assert repository(tmp_path).active_owners() == (owner,)
+    assert repository(tmp_path).active_execution_ids(owner) == (replacement,)
+
+
+def test_unreaped_zombie_execution_is_reclaimed_during_retry_admission(tmp_path):
+    """REQ-001/REQ-003/REQ-007: a terminated procfs identity cannot block retry."""
+    slots = repository(tmp_path)
+    owner = ImplementationOwner("issue", 100)
+    process, stale_execution = execution_process(slots.storage_path, lifetime=0)
+    try:
+        wait_for_zombie(process)
+
+        replacement = repository(tmp_path).start_execution(owner)
+
+        assert replacement is not None
+        assert replacement != stale_execution
+        assert repository(tmp_path).active_execution_ids(owner) == (replacement,)
+        assert repository(tmp_path).active_owners() == (owner,)
+    finally:
+        process.wait(timeout=5)
+
+
+@pytest.mark.parametrize("owner", [ImplementationOwner("issue", 100), ImplementationOwner("pr", 200)])
+def test_unreaped_zombie_execution_allows_terminal_owner_release(tmp_path, owner):
+    """REQ-005/REQ-006: reconciliation treats terminated zombie tasks as stale."""
+    slots = repository(tmp_path)
+    process, execution_id = execution_process(slots.storage_path, owner_kind=owner.kind, owner_number=owner.number, lifetime=0)
+    try:
+        wait_for_zombie(process)
+        github = GitHubState(
+            issues={owner.number: {"number": owner.number, "state": "closed"}},
+            prs={owner.number: {"number": owner.number, "state": "closed", "merged": False}},
+            linked_prs={owner.number: []},
+        )
+
+        repository(tmp_path).reconcile(github)
+
+        assert execution_id not in repository(tmp_path).active_execution_ids(owner)
+        assert repository(tmp_path).active_owners() == ()
+    finally:
+        process.wait(timeout=5)
+
+
+def test_live_execution_in_another_process_survives_startup_reconciliation(tmp_path):
+    """AC-003/AC-007: a restart cannot clear another process's live identity."""
+    slots = repository(tmp_path)
+    owner = ImplementationOwner("issue", 100)
+    process, execution_id = execution_process(slots.storage_path)
+    try:
+        github = GitHubState(issues={100: {"state": "closed"}}, linked_prs={100: []}, open_prs=[])
+        restarted = repository(tmp_path)
+
+        restarted.reconcile(github, discover_open_prs=True)
+
+        assert restarted.active_execution_ids(owner) == (execution_id,)
+        assert restarted.active_owners() == (owner,)
+        assert restarted.start_execution(owner) is None
+    finally:
+        process.terminate()
+        process.wait(timeout=5)
+
+
+@pytest.mark.parametrize("owner", [ImplementationOwner("issue", 100), ImplementationOwner("pr", 200)])
+def test_execution_admitted_during_terminal_lifecycle_lookup_is_not_released(tmp_path, owner):
+    """REQ-002/REQ-009: final owner release atomically rechecks execution state."""
+    reconciling = repository(tmp_path)
+    admitting = repository(tmp_path)
+    assert reconciling.reserve(owner) is True
+    lifecycle_lookup_started = threading.Event()
+    permit_lifecycle_result = threading.Event()
+
+    class PausedTerminalGitHub(GitHubState):
+        def _terminal_item(self, number):
+            assert number == owner.number
+            lifecycle_lookup_started.set()
+            assert permit_lifecycle_result.wait(timeout=5)
+            return {"number": number, "state": "closed", "merged": False}
+
+        def get_issue(self, _repo, number):
+            return self._terminal_item(number)
+
+        def get_pull_request(self, _repo, number):
+            return self._terminal_item(number)
+
+    github = PausedTerminalGitHub(linked_prs={owner.number: []})
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        reconciliation = executor.submit(reconciling.reconcile, github)
+        assert lifecycle_lookup_started.wait(timeout=5)
+        execution_id = admitting.start_execution(owner)
+        assert execution_id is not None
+        permit_lifecycle_result.set()
+        reconciliation.result(timeout=5)
+
+    assert repository(tmp_path).active_owners() == (owner,)
+    assert repository(tmp_path).active_execution_ids(owner) == (execution_id,)
+
+
+def test_pr_membership_recorded_during_reconciliation_prevents_owner_release(tmp_path):
+    """REQ-005/REQ-009: final release rejects a stale PR-membership snapshot."""
+    reconciling = repository(tmp_path)
+    discovering = repository(tmp_path)
+    owner = ImplementationOwner("issue", 100)
+    assert reconciling.reserve(owner) is True
+    linked_pr_lookup_started = threading.Event()
+    permit_linked_pr_result = threading.Event()
+
+    class PausedMembershipGitHub(GitHubState):
+        def __init__(self):
+            super().__init__(issues={100: {"number": 100, "state": "closed"}}, linked_prs={100: []})
+            self.requested_prs = []
+
+        def get_connected_prs(self, _repo, issue_number, strict=False):
+            assert issue_number == owner.number
+            assert strict is True
+            linked_pr_lookup_started.set()
+            assert permit_linked_pr_result.wait(timeout=5)
+            return []
+
+        def get_pull_request(self, _repo, number):
+            self.requested_prs.append(number)
+            return {"number": number, "state": "open", "merged": False}
+
+    github = PausedMembershipGitHub()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        reconciliation = executor.submit(reconciling.reconcile, github)
+        assert linked_pr_lookup_started.wait(timeout=5)
+        assert discovering.record_implementation_pr(owner, 101) is True
+        permit_linked_pr_result.set()
+        reconciliation.result(timeout=5)
+
+    state = json.loads(reconciling.storage_path.read_text(encoding="utf-8"))
+    assert reconciling.active_owners() == (owner,)
+    assert state[owner.key]["implementation_prs"] == [101]
+    assert github.requested_prs == []
+
+    # The next lifecycle pass consumes the newly durable membership and retains
+    # the owner based on the PR's authoritative open state.
+    reconciling.reconcile(github)
+
+    assert github.requested_prs == [101]
+    assert reconciling.active_owners() == (owner,)
+
+
+def test_crashed_execution_is_reclaimed_before_standalone_pr_release(tmp_path):
+    """AC-004: a terminal standalone PR releases capacity after its process crashes."""
+    slots = repository(tmp_path)
+    owner = ImplementationOwner("pr", 200)
+    process, _execution_id = execution_process(slots.storage_path, owner_kind="pr", owner_number=200)
+    process.terminate()
+    process.wait(timeout=5)
+
+    repository(tmp_path).reconcile(GitHubState(prs={200: {"state": "closed", "merged": False}}))
+
+    assert repository(tmp_path).active_owners() == ()
+    assert repository(tmp_path).start_execution(ImplementationOwner("issue", 300)) is not None
+
+
+def test_execution_with_uncertain_liveness_is_retained(tmp_path):
+    """AC-005: legacy or incomplete identities fail closed rather than assuming death."""
+    slots = repository(tmp_path)
+    owner = ImplementationOwner("issue", 100)
+    execution_id = slots.start_execution(owner)
+    state = json.loads(slots.storage_path.read_text(encoding="utf-8"))
+    state[owner.key]["executions"][0].pop("boot_id", None)
+    state[owner.key]["executions"][0].pop("process_start_ticks", None)
+    slots.storage_path.write_text(json.dumps(state), encoding="utf-8")
+
+    slots.reconcile(GitHubState(issues={100: {"state": "closed"}}, linked_prs={100: []}))
+
+    assert slots.active_execution_ids(owner) == (execution_id,)
+    assert slots.active_owners() == (owner,)
+
+
+def test_stale_cleanup_preserves_live_forced_sibling(tmp_path):
+    """AC-006: cleanup changes only the conclusively dead execution record."""
+    slots = repository(tmp_path)
+    owner = ImplementationOwner("issue", 100)
+    stale_process, stale_execution = execution_process(slots.storage_path)
+    live_process, live_execution = execution_process(slots.storage_path, force=True)
+    try:
+        stale_process.terminate()
+        stale_process.wait(timeout=5)
+        removed = repository(tmp_path).reclaim_stale_executions()
+
+        assert removed == (stale_execution,)
+        assert repository(tmp_path).active_execution_ids(owner) == (live_execution,)
+    finally:
+        if stale_process.poll() is None:
+            stale_process.terminate()
+            stale_process.wait(timeout=5)
+        live_process.terminate()
+        live_process.wait(timeout=5)
+
+
+def test_configuration_rejects_non_positive_limit(tmp_path):
+    with pytest.raises(ValueError, match="positive integer"):
+        repository(tmp_path, limit=0)
+
+
+@pytest.mark.parametrize("invalid_value", ["true", "1.5", '"1"'])
+def test_configuration_rejects_non_integer_toml_values(tmp_path, invalid_value):
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        f"[process_issues]\nmax_concurrent_implementations = {invalid_value}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="positive integer"):
+        get_max_concurrent_implementations_from_config(str(config_path))
+
+
+def test_same_owner_serialization_is_reentrant(tmp_path):
+    slots = repository(tmp_path)
+    owner = ImplementationOwner("issue", 100)
+    with slots.serialize(owner):
+        with slots.serialize(owner):
+            assert owner.key == "issue:100"
+
+
+@pytest.mark.timeout(5)
+def test_same_owner_serialization_is_reentrant_across_repository_instances(tmp_path):
+    first = repository(tmp_path)
+    second = repository(tmp_path)
+    owner = ImplementationOwner("issue", 2405)
+    assert first.reserve(owner)
+    with first.serialize(owner):
+        with second.serialize(owner, timeout=0):
+            assert second.record_provider_session(owner, "task_e_regression")
+        with first._state_lock():
+            assert second.active_owners() == (owner,)
+    assert first.snapshot().owners[0].provider_sessions == ("task_e_regression",)
+
+
+class UnavailablePullRequests(GitHubState):
+    """`GitHubClient.get_pull_request` reports an unavailable read as None."""
+
+    def get_pull_request(self, _repo, _number):
+        return None
+
+
+def test_unavailable_pr_read_retains_its_slot_under_its_own_cause(tmp_path):
+    """An unreadable PR is not terminal evidence and must not release capacity.
+
+    A refused or throttled read returns None, which previously reached the
+    lifecycle comparison as a PR with no state and surfaced as
+    "'NoneType' object has no attribute 'lower'" instead of naming the
+    unavailable read.
+    """
+    slots = repository(tmp_path, limit=2)
+    pr_owner = ImplementationOwner("pr", 200)
+    issue_owner = ImplementationOwner("issue", 100)
+    assert slots.reserve(pr_owner) is True
+    assert slots.reserve(issue_owner) is True
+    github = UnavailablePullRequests(issues={100: {"state": "closed"}}, linked_prs={100: [105]})
+
+    with patch("auto_coder.implementation_slots.logger") as slot_logger:
+        slots.reconcile(github)
+
+    assert set(slots.active_owners()) == {pr_owner, issue_owner}
+    retained = [str(call.args[0]) for call in slot_logger.warning.call_args_list]
+    assert len(retained) == 2
+    for message in retained:
+        assert "retaining its slot" in message
+        assert "Could not read pull request" in message
+        assert "NoneType" not in message
+
+
+@pytest.mark.parametrize(
+    "stored_session, session, known_session",
+    [
+        ("session_recorded", "session_recorded", True),
+        ("cse_recorded", "session_recorded", True),
+        ("session_recorded", "session_unknown", False),
+        ("cse_recorded", "session_unknown", False),
+        ("cse_Recorded", "session_recorded", False),
+        ("cse_", "session_recorded", False),
+    ],
+)
+def test_claude_pr_reuses_only_recorded_session_at_full_capacity(tmp_path, stored_session, session, known_session):
+    slots = repository(tmp_path)
+    owner = ImplementationOwner("issue", 1993)
+    assert slots.reserve(owner)
+    assert slots.record_provider_session(owner, stored_session)
+    pr = {"number": 2027, "body": f"Implements Issue #1993\nhttps://claude.ai/code/{session}", "head": {"ref": "claude/implementation-slots-dashboard"}}
+    resolved = slots.resolve_owner("pr", pr, GitHubState())
+    assert resolved == (owner if known_session else ImplementationOwner("pr", 2027))
+    execution = slots.start_execution(resolved, implementation_pr=2027 if known_session else None)
+    assert (execution is not None) is known_session
+    assert slots.active_owners() == (owner,)
+    assert slots.snapshot().owners[0].provider_sessions == (stored_session,)
+    assert slots.snapshot().owners[0].implementation_prs == ((2027,) if known_session else ())
+    if known_session:
+        slots.finish_execution(owner, execution)
+        restarted = repository(tmp_path)
+        assert restarted.resolve_owner("pr", {"number": 2027, "body": ""}, GitHubState()) == owner
+        assert restarted.snapshot().normal_usage == 1
+
+
+@pytest.mark.parametrize("stored_session", ["session_recorded", "cse_recorded"])
+def test_startup_discovers_claude_pr_from_recorded_session(tmp_path, stored_session):
+    slots = repository(tmp_path)
+    owner = ImplementationOwner("issue", 1993)
+    assert slots.reserve(owner)
+    assert slots.record_provider_session(owner, stored_session)
+    github = GitHubState(issues={1993: {"state": "open"}}, prs={2027: {"state": "open"}}, open_prs=[{"number": 2027, "body": "https://claude.ai/code/session_recorded"}])
+    slots.reconcile(github, discover_open_prs=True)
+    assert repository(tmp_path).resolve_owner("pr", {"number": 2027, "body": ""}, GitHubState()) == owner
+    assert slots.active_owners() == (owner,)

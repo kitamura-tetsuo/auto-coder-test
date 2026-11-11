@@ -1,0 +1,259 @@
+from unittest.mock import MagicMock, patch
+
+import pytest
+from fastapi import FastAPI
+
+from src.auto_coder.automation_engine import AutomationEngine
+from src.auto_coder.dashboard import init_dashboard
+from src.auto_coder.execution_trace import EventKind, Outcome, TraceCollector, get_trace_collector
+from src.auto_coder.review_audit import EvaluationLifecycle, ExecutionMode, ReviewAuditRecord, ReviewAuditStore
+
+
+@pytest.fixture(autouse=True)
+def reset_collector():
+    TraceCollector._instance = None
+    yield
+    TraceCollector._instance = None
+
+
+def _capture_pages(mock_ui):
+    captured_functions = {}
+
+    def capture_page(path):
+        def decorator(func):
+            captured_functions[path] = func
+            return func
+
+        return decorator
+
+    mock_ui.page.side_effect = capture_page
+    return captured_functions
+
+
+@patch("src.auto_coder.dashboard.ui")
+def test_dashboard_detail_page_registration_and_render(mock_ui):
+    app = FastAPI()
+    engine = MagicMock(spec=AutomationEngine)
+
+    collector = get_trace_collector()
+    with collector.start_execution("owner/repo", "pr", 123, origin="test") as handle:
+        collector.record_event(EventKind.STAGE_RESULT, stage_id="pr.ci-eligibility", origin="test", outcome=Outcome.COMPLETED, facts={"success": True, "in_progress": False})
+        collector.record_event(EventKind.STAGE_RESULT, stage_id="pr.merge-delivery", origin="test", outcome=Outcome.DEFERRED, facts={"reason": "approval not completed"})
+        handle.set_outcome(Outcome.COMPLETED)
+
+    captured_functions = _capture_pages(mock_ui)
+
+    init_dashboard(app, engine, "owner/repo")
+
+    assert "/detail/{item_type}/{item_number}" in captured_functions
+    detail_page_func = captured_functions["/detail/{item_type}/{item_number}"]
+
+    detail_page_func(item_type="pr", item_number=123)
+
+    # Repository is displayed and scoped from init_dashboard, not guessed.
+    label_calls = [str(args[0]) for args, _ in mock_ui.label.call_args_list]
+    assert any("Repository: owner/repo" in text for text in label_calls)
+
+    # Mermaid diagram was rendered with the observed stage labels and
+    # "observed order" edges, not a static workflow graph.
+    mock_ui.mermaid.assert_called()
+    mermaid_args = mock_ui.mermaid.call_args[0][0]
+    assert "graph TD" in mermaid_args
+    assert "observed order" in mermaid_args
+    assert "pr.ci-eligibility" in mermaid_args
+    assert "pr.merge-delivery" in mermaid_args
+
+    # Copy button and evidence/decision tables were rendered.
+    button_calls = [kwargs.get("icon") for _, kwargs in mock_ui.button.call_args_list]
+    assert "content_copy" in button_calls
+    assert mock_ui.table.call_count >= 2  # evidence panel + decision log
+
+    # Back button
+    mock_ui.link.assert_any_call("Back to Dashboard", "/")
+
+    # Auto-refresh timer is registered and wired to stop on disconnect.
+    assert mock_ui.timer.called
+    mock_ui.context.client.on_disconnect.assert_called()
+
+
+@patch("src.auto_coder.dashboard.ui")
+def test_dashboard_detail_invalid_item_type_reports_without_fallback(mock_ui):
+    app = FastAPI()
+    engine = MagicMock(spec=AutomationEngine)
+    captured_functions = _capture_pages(mock_ui)
+
+    init_dashboard(app, engine, "owner/repo")
+    detail_page_func = captured_functions["/detail/{item_type}/{item_number}"]
+
+    mock_ui.reset_mock()
+    detail_page_func(item_type="commit", item_number=123)
+
+    label_calls = [str(args[0]) for args, _ in mock_ui.label.call_args_list]
+    assert any("Invalid or unresolved target" in text for text in label_calls)
+    # Must not proceed to render a diagram or start polling for an invalid target.
+    mock_ui.mermaid.assert_not_called()
+    mock_ui.timer.assert_not_called()
+
+
+@patch("src.auto_coder.dashboard.ui")
+def test_dashboard_detail_unresolved_item_number_reports_without_fallback(mock_ui):
+    app = FastAPI()
+    engine = MagicMock(spec=AutomationEngine)
+    captured_functions = _capture_pages(mock_ui)
+
+    init_dashboard(app, engine, "owner/repo")
+    detail_page_func = captured_functions["/detail/{item_type}/{item_number}"]
+
+    mock_ui.reset_mock()
+    detail_page_func(item_type="pr", item_number=0)
+
+    label_calls = [str(args[0]) for args, _ in mock_ui.label.call_args_list]
+    assert any("Invalid or unresolved target" in text for text in label_calls)
+    mock_ui.mermaid.assert_not_called()
+
+
+@patch("src.auto_coder.dashboard.ui")
+def test_dashboard_detail_different_repository_is_not_mixed_in(mock_ui):
+    """AS-005: two repositories sharing an item number must not mix evidence."""
+    app = FastAPI()
+    engine = MagicMock(spec=AutomationEngine)
+
+    collector = get_trace_collector()
+    with collector.start_execution("owner/repo-a", "pr", 42, origin="test") as handle_a:
+        collector.record_event(EventKind.STAGE_RESULT, stage_id="pr.only-in-a", origin="test", outcome=Outcome.COMPLETED)
+        handle_a.set_outcome(Outcome.COMPLETED)
+    with collector.start_execution("owner/repo-b", "pr", 42, origin="test") as handle_b:
+        collector.record_event(EventKind.STAGE_RESULT, stage_id="pr.only-in-b", origin="test", outcome=Outcome.COMPLETED)
+        handle_b.set_outcome(Outcome.COMPLETED)
+
+    captured_functions = _capture_pages(mock_ui)
+    init_dashboard(app, engine, "owner/repo-a")
+    detail_page_func = captured_functions["/detail/{item_type}/{item_number}"]
+
+    detail_page_func(item_type="pr", item_number=42)
+
+    mermaid_args = mock_ui.mermaid.call_args[0][0]
+    assert "pr.only-in-a" in mermaid_args
+    assert "pr.only-in-b" not in mermaid_args
+
+
+@patch("src.auto_coder.dashboard.ui")
+def test_dashboard_detail_no_executions_reports_absence_not_failure(mock_ui):
+    app = FastAPI()
+    engine = MagicMock(spec=AutomationEngine)
+    captured_functions = _capture_pages(mock_ui)
+
+    init_dashboard(app, engine, "owner/repo")
+    detail_page_func = captured_functions["/detail/{item_type}/{item_number}"]
+
+    detail_page_func(item_type="issue", item_number=999)
+
+    label_calls = [str(args[0]) for args, _ in mock_ui.label.call_args_list]
+    assert any("No execution has been observed locally" in text for text in label_calls)
+    mock_ui.mermaid.assert_not_called()
+
+
+@patch("src.auto_coder.dashboard.ui")
+def test_dashboard_main_page_search(mock_ui):
+    app = FastAPI()
+    engine = MagicMock(spec=AutomationEngine)
+    engine.get_status.return_value = {"active_workers": {}, "queue_items": []}
+
+    captured_functions = _capture_pages(mock_ui)
+
+    init_dashboard(app, engine, "owner/repo")
+
+    main_page_func = captured_functions["/"]
+    main_page_func()
+
+    mock_ui.select.assert_called()
+    mock_ui.number.assert_called()
+    button_calls = [args[0] for args, _ in mock_ui.button.call_args_list]
+    assert "Go" in button_calls
+
+
+@patch("src.auto_coder.dashboard.ui")
+def test_detail_review_timer_exposes_new_audit_row_without_rebuilding_unchanged_content(mock_ui, tmp_path):
+    """REQ-005/006: the mounted detail callback refreshes durable history."""
+    store = ReviewAuditStore(tmp_path / "audit")
+
+    def audit_record(review_id: str, sequence: int) -> ReviewAuditRecord:
+        return ReviewAuditRecord(
+            review_id=review_id,
+            repository="owner/repo",
+            target_type="issue",
+            target_number="42",
+            review_kind="issue_specification",
+            origin="production",
+            process_identity="process",
+            creation_time=f"2026-01-01T00:00:0{sequence}Z",
+            creation_sequence=sequence,
+            reviewed_generation=f"generation-{sequence}",
+            policy_identity="policy",
+            related_issue_membership=None,
+            diagnostic_execution_references=None,
+            lifecycle=EvaluationLifecycle.FINISHED,
+            execution_mode=ExecutionMode.EXECUTED,
+            native_verdict="READY",
+            native_report={"verdict": "READY"},
+            source_review_id=None,
+        )
+
+    assert store.record_evaluation(audit_record("review-1", 1))
+    captured_functions = _capture_pages(mock_ui)
+    with patch("src.auto_coder.dashboard.ReviewAuditStore", return_value=store):
+        init_dashboard(FastAPI(), MagicMock(spec=AutomationEngine), "owner/repo")
+    captured_functions["/detail/{item_type}/{item_number}"](item_type="issue", item_number=42)
+
+    review_callback = mock_ui.timer.call_args_list[-2].args[1]
+    initial_clear_count = mock_ui.column.return_value.clear.call_count
+    review_callback()
+    assert mock_ui.column.return_value.clear.call_count == initial_clear_count
+
+    assert store.record_evaluation(audit_record("review-2", 2))
+    review_callback()
+    link_targets = [args[1] for args, _kwargs in mock_ui.link.call_args_list if len(args) > 1]
+    assert "/detail/issue/42?review_id=review-2" in link_targets
+
+
+@patch("src.auto_coder.dashboard.ui")
+def test_repository_history_first_page_refreshes_while_older_page_is_pinned(mock_ui, tmp_path):
+    store = ReviewAuditStore(tmp_path / "audit")
+
+    def audit_record(review_id: str, sequence: int) -> ReviewAuditRecord:
+        item = ReviewAuditRecord(
+            review_id=review_id,
+            repository="owner/repo",
+            target_type="issue",
+            target_number="42",
+            review_kind="issue_specification",
+            origin="production",
+            process_identity="process",
+            creation_time=f"2026-01-01T00:00:{sequence:02d}Z",
+            creation_sequence=sequence,
+            reviewed_generation=f"generation-{sequence}",
+            policy_identity="policy",
+            related_issue_membership=None,
+            diagnostic_execution_references=None,
+            lifecycle=EvaluationLifecycle.FINISHED,
+            execution_mode=ExecutionMode.EXECUTED,
+            native_verdict="READY",
+            native_report={"verdict": "READY"},
+            source_review_id=None,
+        )
+        return item
+
+    assert store.record_evaluation(audit_record("review-10", 10))
+    pages = _capture_pages(mock_ui)
+    with patch("src.auto_coder.dashboard.ReviewAuditStore", return_value=store):
+        init_dashboard(FastAPI(), MagicMock(spec=AutomationEngine), "owner/repo")
+    mock_ui.select.return_value.value = ""
+    mock_ui.input.return_value.value = ""
+    mock_ui.number.return_value.value = 50
+    pages["/reviews"]()
+    refresh_callback = mock_ui.timer.call_args.args[1]
+
+    assert store.record_evaluation(audit_record("review-11", 11))
+    refresh_callback()
+    link_targets = [args[1] for args, _kwargs in mock_ui.link.call_args_list if len(args) > 1]
+    assert "/detail/issue/42?review_id=review-11" in link_targets

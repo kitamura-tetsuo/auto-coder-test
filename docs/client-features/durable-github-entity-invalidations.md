@@ -1,0 +1,64 @@
+# Durable GitHub Entity Invalidations
+
+A typed GitHub failure while verifying a PR closing directive or Issue-bearing
+branch during startup ownership discovery is retained unchanged under the
+repository's `startup-reconciliation` pending-work identity. The daemon remains
+responsive to shutdown while recovery is incomplete, retained slots remain
+occupied, and an unverified PR never receives fabricated standalone ownership.
+Existing pending-work policy controls resumption: eligible admission/throttle
+failures retry automatically; indeterminate transport failures remain an
+operational block for targeted `pending-work retry` or a fresh startup attempt.
+A successful recovery repeats discovery before enumeration and preserves open
+implementation PR membership.
+
+Caught operational failures during durable entity reevaluation retain a SQLite
+retry deadline at least 60 seconds after handling, in addition to later existing
+stabilization or retry bounds. Transport errors and malformed authoritative
+responses do not mean absence or completion. Generic scheduler wakes, newer or
+duplicate notifications, and reconstruction cannot clear this deadline; the
+ordinary invalidation scheduler automatically refreshes current authority when
+it becomes due. Newer notifications received during the failed evaluation remain
+part of its unfinished generation. Definitely-not-sent governor deferrals retain
+their existing independent deadlines, and cancellation still releases interrupted
+work for recovery.
+
+If the retry transaction fails, the affected worker exits with its processing
+claim retained; it neither acknowledges the entity nor immediately releases it
+for another read. A repository-scoped `worker.failure-backoff` diagnostic reports
+`deferred` only after persistence succeeds, or `failed` when persistence failed.
+An error-free pending PR-review result also remains unfinished: completion is
+revoked before its retry transaction. If that transaction fails, the worker
+stops with the same processing claim and emits only failed persistence evidence;
+it cannot acknowledge the claim or clear a newer generation. A successful
+transaction preserves the pending-review deadline and any later existing bound.
+The dashboard detail evidence displays the recorded reason, retry time and
+generation. This diagnostic is retry scheduling evidence, not implementation,
+provider delivery or business completion. Diagnostic failures cannot change the
+durable transition. See `tests/test_invalidation_failure_backoff.py` for the real
+worker/scheduler/SQLite and dashboard-row regressions.
+
+  durable_github_entity_invalidations:
+    description: "Coalesces webhook notifications into durable authoritative reevaluations keyed by GitHub entity identity."
+    implementation: |
+      DurableInvalidationQueue, EntityIdentity in src/auto_coder/entity_invalidation.py,
+      invalidate_entity, _enqueue_pending_invalidations, _worker_loop in src/auto_coder/automation_engine.py,
+      process_github_payload in src/auto_coder/webhook_server.py
+    behavior:
+      - "Relevant webhook deliveries persist only repository, entity type (issue or pr), and entity number; payload snapshots are not queued as authority. Complete Issue payloads also update a process-local advisory observation cache used solely to refuse admission. Relevant entity notifications invalidate repository-wide negative results before queue I/O, so parent, sibling, and reverse-dependency edits fence in-flight results; out-of-order snapshots cannot restore old refusal evidence."
+      - "Completed BLOCKED admission results can be reused without GitHub calls for up to 300 seconds, keyed to the repository change epoch and effective configuration. READY, successful admission, deferred results, and incomplete publication are never cached as refusals. Restart discards the cache and startup reconciliation invalidates prior observations. A miss always follows the existing cache-bypassing admission path; cached evidence never starts implementation."
+      - "If usable refusal evidence arrives during a worker's initial Issue-refresh admission wait, that unsent GET is cancelled and the worker rechecks the completed refusal before acknowledging its generation. Evidence that changed again releases the claim for reevaluation. Closure/family preparation, Review routing, and final execution reads retain their authoritative path. Webhook intake wakes local admission waiters after fencing and updating observations."
+      - "Durable reissue-required stops are consulted before family enumeration and validation, including a known parent's terminal stop. Webhook body/relationship changes discard inherited negative evidence; terminal Issue-number markers themselves survive edits. Workers acknowledge completed refusals instead of retrying them as operational errors, preserving newer invalidation generations. Dashboard traces expose issue.cached-blocked-admission with the actual reason and negative-only evidence source."
+      - "Notifications received while an entity is dirty or waiting in the worker queue coalesce into its current generation; only a notification received after a worker begins processing advances the generation and forces one subsequent evaluation. That evaluation may only refuse from local evidence; otherwise it refreshes authoritative state."
+      - "Dirty and in-flight records use SQLite durability. Startup recovers interrupted work before workers enter steady-state processing."
+      - "A record is completed after an explicit completed negative admission, or authoritative fetching and the resulting eligibility or processing decision; operational failures and cancellation return it to the dirty set. Incomplete blocked-publication effects are not a completed negative admission."
+      - "GitHub delivery identifiers are persisted for deduplication, preventing a redelivery from advancing the entity generation or causing duplicate processing by itself."
+      - "Webhook arrival order never selects the state used for a decision: semantically redundant or out-of-order notifications coalesce by identity, and the worker reads the current authoritative entity only after claiming that identity."
+      - "GitHub issue, pull request, review, comment, review-thread, workflow, check, and commit-status events use an explicit material-action mapping; unsupported actions do not schedule work."
+      - "Supported workflow, job, check, suite, and status deliveries are atomically persisted before HTTP acknowledgement; intake performs no GitHub lookup and malformed supported deliveries fail closed."
+      - "CI deliveries retain only correlation identities and deduplicate by repository/delivery UUID. SHA-only obligations are correlated later with complete REST pagination and remain pending after lookup failure or restart."
+      - "Known PR and unresolved SHA scopes advance durable observation epochs immediately, then coalesce with a two-second quiet window capped ten seconds after the first event; newer activity during an in-flight reevaluation is retained as one follow-up."
+      - "Delivery UUID, event type, and action are retained with each affected entity for duplicate-delivery diagnostics, while signature verification and configured-repository scoping occur before invalidation."
+      - "Steady-state GitHub work discovery is event-driven: the maintenance scheduler never enumerates candidate Issues or pull requests, while invalidations wake a dedicated consumer. Workers may finish a known negative Issue admission from local evidence; every other evaluation fetches authoritative entity state, and cached evidence never authorizes execution."
+      - "Each process startup performs one fail-closed, cache-bypassing REST reconciliation of every currently open Issue and pull request before webhook-driven steady state begins. The scan emits stable identities through the same durable invalidation queue as webhooks and preserves the shared creation-anchored Issue stabilization deadline; it neither processes snapshots directly nor repeats on a timer. Partial enumeration keeps startup explicitly not reconciled and prevents steady-state loops from starting, while invalidation generations preserve newer concurrent webhook changes."
+      - "A typed, definitely-not-sent governor deferral during a worker's strict authoritative refresh is retained on the same durable entity identity with its reason, API origin, generation, and an independent retry lower bound. The bound is no earlier than one second after handling, the governor deadline, the existing retry guard, or Issue stabilization; webhook and generic wakes cannot bypass it, restart recovery preserves it, and eligibility automatically wakes the ordinary strict-refresh path without holding worker or implementation capacity."
+      - "A successful strict PR response must identify the requested pull request. Empty or mismatched metadata remains a visible malformed-authority error and leaves its reevaluation pending; only an authoritative 404 can represent absence."

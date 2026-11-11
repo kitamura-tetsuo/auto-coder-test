@@ -1,0 +1,374 @@
+import asyncio
+import hashlib
+import hmac
+import time
+from collections.abc import Mapping
+from typing import Any, Dict, Optional
+
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
+from pydantic import BaseModel
+
+from .automation_engine import AutomationEngine
+from .dashboard import init_dashboard
+from .dashboard_adjudication import init_dashboard_adjudication
+from .decomposition_validation_lifecycle import DECOMPOSITION_FINDINGS_MARKER
+from .entity_invalidation import ISSUE_STABILIZATION_SECONDS, CIWebhookDelivery, issue_stabilization_deadline
+from .github_ci_observer import accept_and_fence_ci_delivery
+from .label_manager import LEGACY_AUTO_CODER_LABEL
+from .logger_config import get_logger
+from .public_api import init_public_api, public_api_enabled
+from .specification_validation_lifecycle import FINDINGS_MARKER_PREFIX
+from .util.gh_cache import evict_github_ci_cache, evict_github_entity_cache
+
+logger = get_logger(__name__)
+
+# Webhook actions whose payload carries the single label that was added/removed.
+_LABEL_CHANGE_ACTIONS = {"labeled", "unlabeled"}
+_DEPENDENCY_EVENTS = {"issue_dependencies", "sub_issues"}
+_CI_ACTIONS = {
+    "workflow_run": {"requested", "in_progress", "completed"},
+    "workflow_job": {"queued", "in_progress", "completed"},
+    "check_run": {"created", "completed", "rerequested", "requested_action"},
+    "check_suite": {"requested", "completed", "rerequested"},
+}
+
+
+def _endpoint_is_local(endpoint: Mapping[str, Any], repo_name: str) -> bool:
+    """Validate an endpoint's repository identity without comparing global IDs."""
+    repository = endpoint.get("repository")
+    full_name = repository.get("full_name") if isinstance(repository, Mapping) else None
+    if isinstance(full_name, str):
+        return full_name.casefold() == repo_name.casefold()
+    repository_url = endpoint.get("repository_url")
+    if isinstance(repository_url, str):
+        return repository_url.rstrip("/").casefold().endswith(f"/repos/{repo_name}".casefold())
+    html_url = endpoint.get("html_url")
+    return isinstance(html_url, str) and html_url.casefold().startswith(f"https://github.com/{repo_name}/issues/".casefold())
+
+
+def _is_legacy_auto_coder_label_change(event_type: Optional[str], action: Optional[str], payload: Dict[str, Any]) -> bool:
+    """Detect a labeled/unlabeled webhook delivery for the exact retired "@auto-coder" label.
+
+    REQ-001/REQ-002 (FTR-1792): such deliveries must not create, enqueue, or
+    advance a durable invalidation, regardless of who made the change, while
+    every other label change (including near-misses like "auto-coder" or
+    "@auto-coder-old") must continue through the normal invalidation and
+    delivery-deduplication path unaffected.
+    """
+    if event_type not in ("issues", "pull_request") or action not in _LABEL_CHANGE_ACTIONS:
+        return False
+    label = payload.get("label")
+    return isinstance(label, Mapping) and label.get("name") == LEGACY_AUTO_CODER_LABEL
+
+
+def _is_reviewer_app_findings_echo(engine: AutomationEngine, event_type: Optional[str], action: Optional[str], payload: Dict[str, Any], repo_name: str) -> bool:
+    """Detect our own confirmed Issue-validation findings comment echoing back.
+
+    Scoped narrowly to an ``issue_comment`` "created" delivery whose body
+    carries one of the two findings markers *and* whose commenting actor is
+    the resolved reviewer App identity for this repository (Issue #2026,
+    REQ-009). This is not a blanket bot/comment filter: an unrelated
+    comment, a different bot or human author, or a genuine Issue edit still
+    reaches normal invalidation unaffected, and an unavailable reviewer
+    identity never suppresses a real invalidation.
+    """
+    if event_type != "issue_comment" or action != "created":
+        return False
+    comment = payload.get("comment")
+    body = comment.get("body") if isinstance(comment, Mapping) else None
+    if not isinstance(body, str) or (FINDINGS_MARKER_PREFIX not in body and DECOMPOSITION_FINDINGS_MARKER not in body):
+        return False
+    user = comment.get("user") if isinstance(comment, Mapping) else None
+    login = user.get("login") if isinstance(user, Mapping) else None
+    if not isinstance(login, str):
+        return False
+    try:
+        identity = engine.github.reviewer_app_identity(repo_name)  # type: ignore[attr-defined]
+    except Exception:
+        return False
+    return bool(identity.matches_login(login))
+
+
+class SentryWebhookPayload(BaseModel):
+    message: Optional[str] = None
+    project_name: Optional[str] = None
+    project: Optional[str] = None
+    level: Optional[str] = None
+    url: Optional[str] = None
+    web_url: Optional[str] = None
+    event: Optional[Dict[str, Any]] = None
+    data: Optional[Dict[str, Any]] = None
+
+
+def verify_github_signature(payload: bytes, secret: str, signature: Optional[str]):
+    if not signature:
+        raise HTTPException(status_code=403, detail="Missing signature")
+
+    mac = hmac.new(secret.encode(), msg=payload, digestmod=hashlib.sha256)
+    expected_signature = f"sha256={mac.hexdigest()}"
+
+    if not hmac.compare_digest(expected_signature, signature):
+        raise HTTPException(status_code=403, detail="Invalid signature")
+
+
+def verify_sentry_signature(payload: bytes, secret: str, signature: Optional[str]):
+    if not signature:
+        raise HTTPException(status_code=403, detail="Missing signature")
+
+    mac = hmac.new(secret.encode(), msg=payload, digestmod=hashlib.sha256)
+    if not hmac.compare_digest(mac.hexdigest(), signature):
+        raise HTTPException(status_code=403, detail="Invalid signature")
+
+
+async def process_sentry_payload(payload: SentryWebhookPayload, engine: AutomationEngine, repo_name: str):
+    try:
+        data = payload.data or {}
+        event = data.get("event", {}) if data else (payload.event or {})
+
+        # Fallback extraction
+        message = payload.message or event.get("title") or "Sentry Error"
+        project_name = payload.project_name or payload.project or "Sentry"
+        level = payload.level or event.get("level") or "error"
+        url = payload.url or payload.web_url or ""
+
+        title = f"[Sentry] {message}"
+        if len(title) > 200:
+            title = title[:197] + "..."
+
+        body = f"**Sentry Error Detected**\n\n"
+        body += f"**Project:** {project_name}\n"
+        body += f"**Level:** {level}\n"
+        if url:
+            body += f"**URL:** {url}\n"
+
+        body += "\n\n*This issue was automatically created by Auto-Coder webhook daemon.*"
+
+        logger.info(f"Creating issue for Sentry error: {title}")
+
+        loop = asyncio.get_running_loop()
+        issue = await loop.run_in_executor(None, lambda: engine.github.create_issue(repo_name, title, body, labels=["sentry", "bug", "urgent"]))
+
+        if issue:
+            issue_details = await loop.run_in_executor(None, lambda: engine.github.get_issue_details(issue))
+
+            issue_number = issue_details.get("number")
+            if isinstance(issue_number, int):
+                created_at = issue_details.get("created_at")
+                not_before = time.time() + ISSUE_STABILIZATION_SECONDS
+                if isinstance(created_at, str):
+                    deadline = issue_stabilization_deadline(created_at)
+                    if deadline is None:
+                        logger.warning(f"Invalid created_at for Sentry issue #{issue_number}; using receipt-anchored stabilization")
+                    else:
+                        not_before = deadline
+                await engine.invalidate_entity(repo_name, "issue", issue_number, event_type="sentry", action="created", not_before=not_before)
+                logger.info(f"Scheduled Sentry issue #{issue_number} after stabilization")
+
+    except Exception as e:
+        logger.error(f"Failed to process Sentry payload: {e}")
+
+
+async def process_github_payload(
+    event_type: Optional[str],
+    payload: Dict[str, Any],
+    engine: AutomationEngine,
+    repo_name: str,
+    delivery_id: Optional[str] = None,
+) -> None:
+    """Translate relevant webhook notifications into durable entity invalidations."""
+    action = payload.get("action")
+    recognized_ci = event_type == "status" or event_type in _CI_ACTIONS
+    supported_ci = event_type == "status" or (event_type in _CI_ACTIONS and action in _CI_ACTIONS[event_type])
+    if recognized_ci:
+        if not supported_ci:
+            logger.info(f"Ignored unsupported CI webhook event={event_type} action={action}")
+            return
+        if not delivery_id:
+            raise HTTPException(status_code=422, detail="Supported CI delivery requires X-GitHub-Delivery")
+        container_name = event_type if event_type in _CI_ACTIONS else None
+        container = payload.get(container_name) if container_name else payload
+        container = container if isinstance(container, Mapping) else {}
+        pull_requests = container.get("pull_requests", [])
+        numbers = tuple(sorted({item["number"] for item in pull_requests if isinstance(item, Mapping) and isinstance(item.get("number"), int) and not isinstance(item.get("number"), bool) and item["number"] > 0})) if isinstance(pull_requests, list) else ()
+        sha = container.get("head_sha") or container.get("sha")
+        head_sha = sha.strip() if isinstance(sha, str) and sha.strip() else None
+        if not numbers and head_sha is None:
+            raise HTTPException(status_code=422, detail="Supported CI delivery requires a PR number or head SHA")
+        workflow_id = container.get("workflow_id")
+        run_id = container.get("run_id") or container.get("id")
+        attempt = container.get("run_attempt")
+        delivery = CIWebhookDelivery(
+            repo_name, delivery_id, event_type or "", action if isinstance(action, str) else None, numbers, head_sha, str(workflow_id) if workflow_id is not None else None, str(run_id) if run_id is not None else None, attempt if isinstance(attempt, int) and not isinstance(attempt, bool) else None
+        )
+        try:
+            accepted = await asyncio.to_thread(
+                accept_and_fence_ci_delivery,
+                lambda: engine.invalidations.accept_ci_delivery(delivery),
+                f"webhook:{event_type}",
+            )
+        except Exception as exc:
+            logger.error(f"Failed CI intake repository={repo_name} delivery={delivery_id}: {type(exc).__name__}")
+            raise HTTPException(status_code=503, detail="CI delivery persistence failed") from exc
+        if accepted:
+            if head_sha:
+                await asyncio.to_thread(evict_github_ci_cache, head_sha, repo_name)
+            for number in numbers:
+                await asyncio.to_thread(evict_github_entity_cache, repo_name, "pr", number)
+            wake_event = getattr(engine, "_invalidation_wake_event", None)
+            if wake_event is not None:
+                wake_event.set()
+        logger.info(f"{'Accepted' if accepted else 'Duplicate'} CI intake repository={repo_name} delivery={delivery_id} targets={len(numbers)} sha={bool(head_sha)}")
+        return
+    identities: set[tuple[str, int]] = set()
+    dependency_reevaluation = False
+    entity_actions = {
+        "pull_request": {"opened", "edited", "closed", "reopened", "synchronize", "converted_to_draft", "ready_for_review", "labeled", "unlabeled", "assigned", "unassigned"},
+        "issues": {"opened", "edited", "closed", "reopened", "labeled", "unlabeled", "assigned", "unassigned", "deleted", "transferred"},
+        "pull_request_review": {"submitted", "edited", "dismissed"},
+        "pull_request_review_comment": {"created", "edited", "deleted"},
+        "pull_request_review_thread": {"resolved", "unresolved"},
+        "issue_comment": {"created", "edited", "deleted"},
+    }
+    if event_type in entity_actions and action in entity_actions[event_type]:
+        if _is_legacy_auto_coder_label_change(event_type, action, payload):
+            logger.info(f"Ignoring {event_type} {action} webhook for the retired '{LEGACY_AUTO_CODER_LABEL}' label: no invalidation created")
+        elif _is_reviewer_app_findings_echo(engine, event_type, action, payload, repo_name):
+            logger.info(f"Ignoring self-authored reviewer-App findings comment echo for {event_type} {action}: no invalidation created")
+        else:
+            if event_type == "issues":
+                entity, entity_type = payload.get("issue"), "issue"
+            elif event_type == "issue_comment":
+                entity = payload.get("issue")
+                entity_type = "pr" if isinstance(entity, Mapping) and "pull_request" in entity else "issue"
+            else:
+                entity, entity_type = payload.get("pull_request"), "pr"
+            number = entity.get("number") if isinstance(entity, Mapping) else None
+            if isinstance(number, int):
+                identities.add((entity_type, number))
+            # Issue lifecycle, declarations, and readiness labels can change the
+            # eligibility of Issues which never receive their own webhook.
+            if event_type == "issues":
+                changed_label = payload.get("label")
+                dependency_reevaluation = action in {"opened", "closed", "reopened", "deleted", "transferred"}
+                dependency_reevaluation = dependency_reevaluation or (action == "edited" and isinstance(payload.get("changes"), Mapping) and "body" in payload["changes"])
+                dependency_reevaluation = dependency_reevaluation or (action in _LABEL_CHANGE_ACTIONS and isinstance(changed_label, Mapping) and changed_label.get("name") == "implementation-ready")
+            if event_type == "pull_request" and action == "closed":
+                engine.notify_pr_merged_or_closed()
+                # Issue #2148 REQ-001: a PR-closed webhook is an authoritative
+                # closure observation, not just a wake signal -- make the
+                # affected owner eligible for terminal-PR-backed reclamation.
+                if isinstance(entity, Mapping):
+                    await asyncio.to_thread(engine._schedule_pr_owner_reclamation, repo_name, dict(entity), "webhook-pr-closed")
+
+    if event_type in _DEPENDENCY_EVENTS:
+        dependency_reevaluation = True
+        endpoint_names = ("blocked_issue", "blocking_issue") if event_type == "issue_dependencies" else ("parent_issue", "sub_issue")
+        for endpoint_name in endpoint_names:
+            endpoint = payload.get(endpoint_name)
+            if not isinstance(endpoint, Mapping) or not _endpoint_is_local(endpoint, repo_name):
+                continue
+            number = endpoint.get("number")
+            if isinstance(number, int) and not isinstance(number, bool) and number > 0:
+                identities.add(("issue", number))
+
+    if dependency_reevaluation:
+        # This repository-scoped token is the durable promise to perform a
+        # conservative authoritative scan.  It is persisted before HTTP 200,
+        # so removed edges and downtime cannot erase reverse discovery.
+        identities.add(("dependency", 1))
+
+    # Positively identified source Issue references for this delivery's
+    # dependency-triggering evidence (Issue #2001, REQ-003): every "issue"
+    # identity discovered above, whether from an Issue-lifecycle event or a
+    # native issue_dependencies/sub_issues endpoint. Diagnostic-only -- it
+    # never changes which entities are actually invalidated.
+    dependency_trigger_issue_refs = tuple(sorted(n for entity_type, n in identities if entity_type == "issue"))
+
+    # Queue the scope token first. Its scan then coalesces with endpoint rows
+    # from this delivery instead of redispatching an endpoint already handled.
+    for entity_type, number in sorted(identities, key=lambda identity: (identity[0] != "dependency", identity)):
+        changed_label = payload.get("label")
+        urgent_admission = entity_type == "issue" and event_type == "issues" and action == "labeled" and isinstance(changed_label, Mapping) and changed_label.get("name") == "urgent"
+        not_before = None
+        if entity_type == "issue":
+            issue = payload.get("issue")
+            created_at = issue.get("created_at") if isinstance(issue, Mapping) else None
+            if isinstance(created_at, str):
+                not_before = issue_stabilization_deadline(created_at)
+                if not_before is None:
+                    logger.warning(f"Invalid created_at for issue #{number}; scheduling immediate authoritative reevaluation")
+        elif entity_type == "dependency" and event_type == "issues" and action == "opened":
+            issue = payload.get("issue")
+            created_at = issue.get("created_at") if isinstance(issue, Mapping) else None
+            if isinstance(created_at, str):
+                not_before = issue_stabilization_deadline(created_at)
+        invalidation_args = (repo_name, entity_type, number, delivery_id, event_type, action if isinstance(action, str) else None)
+        issue_snapshot = payload.get("issue")
+        if entity_type == "issue" and isinstance(issue_snapshot, dict) and all(isinstance(issue_snapshot.get(key), str) for key in ("title", "body", "state", "updated_at")):
+            accepted = await engine.invalidate_entity(
+                *invalidation_args,
+                not_before=not_before,
+                urgent_admission=urgent_admission,
+                issue_snapshot=issue_snapshot,
+            )
+        elif urgent_admission:
+            accepted = await engine.invalidate_entity(
+                *invalidation_args,
+                not_before=not_before,
+                urgent_admission=True,
+                dependency_trigger_issue_refs=dependency_trigger_issue_refs,
+            )
+        elif not_before is not None:
+            accepted = await engine.invalidate_entity(*invalidation_args, not_before=not_before, dependency_trigger_issue_refs=dependency_trigger_issue_refs)
+        else:
+            accepted = await engine.invalidate_entity(*invalidation_args, dependency_trigger_issue_refs=dependency_trigger_issue_refs)
+        if accepted and entity_type in ("issue", "pr"):
+            await asyncio.to_thread(evict_github_entity_cache, repo_name, entity_type, number)
+        logger.info(f"{'Accepted' if accepted else 'Ignored duplicate'} invalidation for {entity_type} #{number}")
+
+
+def create_app(engine: AutomationEngine, repo_name: str, github_secret: Optional[str] = None, sentry_secret: Optional[str] = None) -> FastAPI:
+    app = FastAPI(title="Auto-Coder Daemon")
+
+    @app.get("/")
+    async def root():
+        return {"status": "running", "repo": repo_name}
+
+    @app.post("/hooks/sentry")
+    async def sentry_hook(request: Request, background_tasks: BackgroundTasks):
+        if sentry_secret:
+            signature = request.headers.get("Sentry-Hook-Signature")
+            body = await request.body()
+            verify_sentry_signature(body, sentry_secret, signature)
+
+        payload_dict = await request.json()
+        payload = SentryWebhookPayload(**payload_dict)
+        background_tasks.add_task(process_sentry_payload, payload, engine, repo_name)
+        return {"status": "received"}
+
+    @app.post("/hooks/github")
+    async def github_hook(request: Request, background_tasks: BackgroundTasks):
+        event_type = request.headers.get("X-GitHub-Event")
+        delivery_id = request.headers.get("X-GitHub-Delivery")
+
+        if github_secret:
+            signature = request.headers.get("X-Hub-Signature-256")
+            body = await request.body()
+            verify_github_signature(body, github_secret, signature)
+
+        payload = await request.json()
+        repository = payload.get("repository") if isinstance(payload, dict) else None
+        payload_repo = repository.get("full_name") if isinstance(repository, dict) else None
+        if not isinstance(payload_repo, str) or payload_repo.casefold() != repo_name.casefold():
+            raise HTTPException(status_code=403, detail="Repository is outside webhook scope")
+        # Persistence is part of accepting a delivery, so it must finish before
+        # returning 200 rather than being delegated to an in-memory task.
+        await process_github_payload(event_type, payload, engine, repo_name, delivery_id)
+        return {"status": "received"}
+
+    init_dashboard(app, engine, repo_name)
+    init_dashboard_adjudication(app, engine, repo_name)
+    if public_api_enabled():
+        init_public_api(app, engine, repo_name)
+
+    return app

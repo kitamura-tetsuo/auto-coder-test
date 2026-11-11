@@ -1,0 +1,905 @@
+"""
+Jules HTTP API client for Auto-Coder.
+
+Jules is a session-based AI assistant that can be used for issue processing.
+This client uses HTTP API instead of Jules CLI to communicate with Jules.
+"""
+
+import json
+import threading
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional
+
+import requests  # type: ignore
+from dateutil import parser
+from requests.adapters import HTTPAdapter  # type: ignore
+from urllib3.util.retry import Retry
+
+from .cloud_task_client_base import CloudTask, CloudTaskClientBase, CloudTaskState
+from .llm_backend_config import get_llm_config
+from .logger_config import get_logger
+from .prompt_loader import render_prompt
+
+logger = get_logger(__name__)
+
+
+def _build_jules_continuation_message(message: Optional[str]) -> str:
+    """Attach current continuation policy to legacy and custom session resumes."""
+    policy = render_prompt("jules.continuation", include_header=False).rstrip()
+    if not message:
+        return policy
+    if policy in message:
+        return message
+    return f"{message.rstrip()}\n\n{policy}"
+
+
+class JulesSessionRejectedError(RuntimeError):
+    """Raised when Jules authoritatively rejects session creation."""
+
+
+class JulesSessionOutcomeUncertainError(RuntimeError):
+    """Raised when transport failure leaves session creation uncertain."""
+
+
+@dataclass
+class _SessionListCache:
+    """Process-wide cache holding the sessions fetched by ``list_sessions``.
+
+    Listing every Jules session requires walking the whole paginated collection,
+    which takes minutes once a repository accumulates a thousand sessions. The
+    automation loop needs that listing several times per hourly maintenance
+    cycle, so the raw (unfiltered) result is cached here and reused until the loop
+    explicitly
+    invalidates it via :func:`invalidate_jules_sessions_cache`.
+    """
+
+    sessions: Optional[List[Dict[str, Any]]] = None
+    error: Optional[str] = None
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+_session_list_cache = _SessionListCache()
+
+
+def invalidate_jules_sessions_cache() -> None:
+    """Drop the cached Jules session listing so the next call refetches it.
+
+    Call this at the start of an eligible maintenance cycle: every
+    ``list_sessions`` call within that cycle then shares a single HTTP fetch.
+    """
+    with _session_list_cache.lock:
+        _session_list_cache.sessions = None
+        _session_list_cache.error = None
+
+
+class JulesClient(CloudTaskClientBase):
+    """Jules HTTP API client that manages session-based AI interactions."""
+
+    def __init__(self, backend_name: Optional[str] = None) -> None:
+        """Initialize Jules HTTP API client.
+
+        Args:
+            backend_name: Backend name to use for configuration lookup (optional).
+        """
+        self.backend_name = backend_name or "jules"
+        self.timeout = 30
+        self.active_sessions: Dict[str, str] = {}  # Track active sessions
+        self.api_key: Optional[str] = None
+        self.base_url = "https://jules.googleapis.com/v1alpha"
+
+        # Load configuration for this backend
+        config = get_llm_config()
+        config_backend = config.get_backend_config(self.backend_name)
+        self.options = (config_backend and config_backend.options) or []
+        self.options_for_noedit = (config_backend and config_backend.options_for_noedit) or []
+        self.api_key = (config_backend and config_backend.api_key) or None
+
+        # Check API connectivity
+        if not self.api_key:
+            logger.warning("No API key configured for Jules. API calls may fail.")
+
+        # Create HTTP session with retry strategy
+        self.session = requests.Session()
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+            # Session creation is not idempotent.  urllib3 must never replay a
+            # POST after the provider may have accepted it.
+            allowed_methods=frozenset({"DELETE", "GET", "HEAD", "OPTIONS", "PUT"}),
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
+
+        # Set headers
+        self.session.headers.update({"Content-Type": "application/json", "User-Agent": "auto-coder/1.0"})
+        if self.api_key:
+            # Use X-Goog-Api-Key header instead of Authorization: Bearer
+            # This is required for Jules API when using API keys
+            self.session.headers["X-Goog-Api-Key"] = self.api_key
+
+    def start_session(self, prompt: str, repo_name: str, base_branch: str, is_noedit: bool = False, title: Optional[str] = None) -> str:
+        """Start a new Jules session with the given prompt.
+
+        Args:
+            prompt: The prompt to send to Jules
+            repo_name: Repository name (e.g., 'owner/repo')
+            base_branch: Base branch name (e.g., 'main')
+            is_noedit: Whether this is a no-edit operation (uses options_for_noedit)
+            title: Optional title for the session
+
+        Returns:
+            Session ID for the started session
+        """
+        from .cloud_provider_instructions import CloudTaskOperation, prepare_cloud_task
+        from .managed_prompts import save_managed_prompt
+
+        # Composition happens before any network call: a configuration error
+        # here (REQ-002) must fail closed with zero HTTP sends, not surface
+        # as an ambiguous transport outcome.
+        prepared = prepare_cloud_task(prompt, recipient="jules", operation=CloudTaskOperation.NEW_TASK, no_edit=is_noedit)
+
+        try:
+            # Prepare the request
+            url = f"{self.base_url}/sessions"
+            payload = {"prompt": prepared.prepared_task, "automationMode": "AUTO_CREATE_PR", "sourceContext": {"source": f"sources/github/{repo_name}", "githubRepoContext": {"startingBranch": base_branch}}}
+
+            if title:
+                payload["title"] = title
+
+            logger.info("Starting Jules session")
+            logger.info(f"🤖 POST {url}")
+
+            response = self.session.post(url, json=payload, timeout=self.timeout)
+
+            # Check if request was successful
+            if response.status_code not in [200, 201]:
+                error_msg = f"HTTP {response.status_code}: {response.text}"
+                logger.error(f"Failed to start Jules session: {error_msg}")
+                error = f"Failed to start Jules session: {error_msg}"
+                if 400 <= response.status_code < 500:
+                    raise JulesSessionRejectedError(error)
+                # A server-side failure can be returned after Jules committed
+                # the session.  Treat it like a transport failure until an
+                # authoritative session listing establishes the outcome.
+                raise JulesSessionOutcomeUncertainError(error)
+
+            # Parse the response to get the session ID
+            try:
+                response_data = response.json()
+                if not isinstance(response_data, dict):
+                    raise JulesSessionOutcomeUncertainError("Jules returned a malformed successful response")
+                raw_id = response_data.get("id")
+                raw_name = response_data.get("name")
+                name_id = raw_name.removeprefix("sessions/") if isinstance(raw_name, str) and raw_name.startswith("sessions/") else None
+                valid_id = raw_id if isinstance(raw_id, str) and raw_id and "/" not in raw_id else None
+                if raw_name is not None and (not name_id or "/" in name_id):
+                    raise JulesSessionOutcomeUncertainError("Jules returned a malformed Session name")
+                if valid_id and name_id and valid_id != name_id:
+                    raise JulesSessionOutcomeUncertainError("Jules returned conflicting Session identities")
+                session_id = valid_id or name_id
+                if not session_id:
+                    raise JulesSessionOutcomeUncertainError("Jules successful response did not contain a canonical Session identity")
+            except (json.JSONDecodeError, ValueError) as exc:
+                raise JulesSessionOutcomeUncertainError("Jules returned an unparseable successful response") from exc
+
+            # Track the session
+            self.active_sessions[session_id] = prompt
+            save_managed_prompt(repo_name, session_id, prepared)
+
+            logger.info(f"Started Jules session: {session_id}")
+            return session_id
+
+        except (JulesSessionRejectedError, JulesSessionOutcomeUncertainError):
+            raise
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to start Jules session: {e}")
+            raise JulesSessionOutcomeUncertainError(f"Failed to start Jules session: {e}") from e
+        except Exception as e:
+            logger.error(f"Failed to start Jules session: {e}")
+            raise JulesSessionOutcomeUncertainError(f"Failed to start Jules session: {e}") from e
+
+    def _fetch_all_sessions(self, page_size: int) -> List[Dict[str, Any]]:
+        """Fetch every Jules session by walking the paginated collection."""
+        url = f"{self.base_url}/sessions"
+
+        # Note: The API does not support server-side filtering for 'state' or 'source'.
+        # We must fetch sessions and filter them client-side.
+        base_params = {
+            "pageSize": page_size,
+        }
+
+        all_sessions: List[Dict[str, Any]] = []
+        page_token = None
+
+        while True:
+            params = base_params.copy()
+            if page_token:
+                params["pageToken"] = page_token
+
+            logger.debug(f"🤖 GET {url} (pageToken={page_token if page_token else 'None'})")
+
+            response = self.session.get(url, params=params, timeout=self.timeout)
+
+            # Check if request was successful
+            if response.status_code != 200:
+                error_msg = f"HTTP {response.status_code}: {response.text}"
+                logger.error(f"Failed to list Jules sessions: {error_msg}")
+                raise RuntimeError(f"Failed to list Jules sessions: {error_msg}")
+
+            # Parse the response
+            try:
+                response_data = response.json()
+                sessions = response_data.get("sessions", [])
+                all_sessions.extend(sessions)
+
+                # Check for next page
+                page_token = response_data.get("nextPageToken")
+                if not page_token:
+                    break
+
+            except json.JSONDecodeError:
+                logger.error("Failed to parse Jules sessions response as JSON")
+                break
+
+        return all_sessions
+
+    def _get_all_sessions(self, page_size: int) -> List[Dict[str, Any]]:
+        """Return every Jules session, fetching them only once per maintenance cycle."""
+        with _session_list_cache.lock:
+            if _session_list_cache.sessions is not None:
+                logger.debug(f"Reusing cached Jules session listing ({len(_session_list_cache.sessions)} sessions)")
+                return _session_list_cache.sessions
+            if _session_list_cache.error is not None:
+                raise RuntimeError(_session_list_cache.error)
+
+            logger.info(f"Listing Jules sessions (pageSize={page_size})")
+            try:
+                all_sessions = self._fetch_all_sessions(page_size)
+            except Exception as exc:
+                # Remember a failed attempt for the remainder of this cycle.
+                # Otherwise each maintenance pass would independently retry the
+                # same expensive paginated request.
+                _session_list_cache.error = str(exc)
+                raise
+            _session_list_cache.sessions = all_sessions
+            return all_sessions
+
+    def list_sessions(self, repo_name: Optional[str] = None, page_size: int = 20) -> List[Dict[str, Any]]:
+        """List recent Jules sessions, optionally filtered by repository.
+
+        Args:
+            repo_name: Optional repository name to filter sessions by (e.g., 'owner/repo')
+            page_size: Number of sessions to return per page (default: 20)
+
+        Returns:
+            List of session dictionaries
+        """
+        try:
+            all_sessions = self._get_all_sessions(page_size)
+
+            # Filter sessions client-side
+            filtered_sessions = []
+            expected_source = f"sources/github/{repo_name}" if repo_name else None
+
+            for s in all_sessions:
+                # Skip archived sessions
+                if s.get("state") == "ARCHIVED":
+                    continue
+
+                # Filter by repo name if requested
+                if repo_name:
+                    source_context = s.get("sourceContext")
+                    if not source_context:
+                        continue
+
+                    source = source_context.get("source")
+                    if source != expected_source:
+                        continue
+
+                filtered_sessions.append(s)
+
+            logger.info(f"Total sessions retrieved: {len(all_sessions)}, Filtered: {len(filtered_sessions)}")
+            logger.info("=" * 60)
+            return filtered_sessions
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to list Jules sessions: {e}")
+            raise RuntimeError(f"Failed to list Jules sessions: {e}")
+        except Exception as e:
+            logger.error(f"Failed to list Jules sessions: {e}")
+            raise RuntimeError(f"Failed to list Jules sessions: {e}")
+
+    def get_session(self, session_id: str) -> Dict[str, Any]:
+        """Get a specific Jules session.
+
+        Args:
+            session_id: The session ID to retrieve
+
+        Returns:
+            Session dictionary
+        """
+        try:
+            # Prepare the request
+            # Ensure session_id doesn't already contain the full path if possible, or handle it?
+            # The API likely expects projects/.../sessions/SESSION_ID if using name,
+            # or we might need to construct the URL correctly.
+            # Based on list_sessions using {self.base_url}/sessions, GET {self.base_url}/sessions/{session_id}
+            # seems like the standard REST pattern.
+
+            # If session_id is a full path name, extracting just the ID might be safer if the API expects just ID in URL
+            # But usually REST APIs accept the full resource name in URL or just ID.
+            # Let's assume session_id passed here is what we want to append.
+
+            url = f"{self.base_url}/sessions/{session_id}"
+
+            logger.info(f"Getting Jules session: {session_id}")
+            logger.info(f"🤖 GET {url}")
+
+            response = self.session.get(url, timeout=self.timeout)
+
+            # Check if request was successful
+            if response.status_code != 200:
+                error_msg = f"HTTP {response.status_code}: {response.text}"
+                logger.error(f"Failed to get Jules session {session_id}: {error_msg}")
+                raise RuntimeError(f"Failed to get Jules session {session_id}: {error_msg}")
+
+            # Parse the response
+            try:
+                session = response.json()
+                logger.info(f"Successfully retrieved session: {session_id}")
+                return session
+            except json.JSONDecodeError:
+                logger.error(f"Failed to parse Jules session response as JSON for {session_id}")
+                raise RuntimeError(f"Failed to parse Jules session response as JSON for {session_id}")
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to get Jules session {session_id}: {e}")
+            raise RuntimeError(f"Failed to get Jules session {session_id}: {e}")
+        except Exception as e:
+            logger.error(f"Failed to get Jules session {session_id}: {e}")
+            raise RuntimeError(f"Failed to get Jules session {session_id}: {e}")
+
+    def get_session_activities(self, session_id: str) -> List[Dict[str, Any]]:
+        """Fetch the *complete*, ordered activity list for a Jules session (REQ-006).
+
+        Used by the retirement evidence collector to establish activity causality
+        — confirming that a terminal state is attributable to the current admitted
+        activity and not to a prior one that completed before a later resume/repair.
+
+        Returns an ordered list of raw activity dicts in the real Jules API
+        shape (an object per activity, with the event kind expressed as a
+        oneof-style field such as ``sessionCompleted``, plus a timestamp field
+        such as ``createTime``).
+
+        Follows ``nextPageToken`` across pages to retrieve the complete
+        history. A response that reports further pages (``nextPageToken``)
+        but cannot be paginated to completion (a later page's request fails,
+        or that page is empty/malformed while more pages were promised) is
+        NOT truncated silently: this raises ``RuntimeError`` so a partial
+        first page is never mistaken for complete history. A definitively
+        absent endpoint (404, meaning this session has no activities support)
+        returns an empty list, which callers must not confuse with an
+        incomplete read.
+        """
+        activities: List[Dict[str, Any]] = []
+        page_token: Optional[str] = None
+        first_page = True
+        while True:
+            url = f"{self.base_url}/sessions/{session_id}/activities"
+            params: Dict[str, Any] = {}
+            if page_token:
+                params["pageToken"] = page_token
+            try:
+                logger.debug(f"Fetching activities for Jules session: {session_id} (page_token={page_token!r})")
+                response = self.session.get(url, params=params or None, timeout=self.timeout)
+            except Exception as exc:
+                if first_page:
+                    # No page collected yet: absence of contrary evidence is
+                    # not proof of completion, but there is also nothing to
+                    # falsely truncate — treat as "unavailable" (empty list),
+                    # matching prior conservative behavior for a wholly
+                    # unreachable endpoint.
+                    logger.warning(f"Failed to fetch activities for session {session_id}: {exc}")
+                    return []
+                raise RuntimeError(f"Incomplete Jules activities pagination for session {session_id}: {exc}") from exc
+
+            if response.status_code == 404:
+                if first_page:
+                    # Activities endpoint not supported for this session at all.
+                    logger.debug(f"Activities endpoint not found for session {session_id}")
+                    return []
+                raise RuntimeError(f"Jules activities pagination for session {session_id} failed mid-stream " f"(404 on a subsequent page)")
+            if response.status_code != 200:
+                if first_page:
+                    logger.warning(f"Unexpected status {response.status_code} fetching activities " f"for session {session_id}")
+                    return []
+                raise RuntimeError(f"Jules activities pagination for session {session_id} failed mid-stream " f"(status {response.status_code})")
+
+            try:
+                data = response.json()
+            except Exception as exc:
+                if first_page:
+                    logger.warning(f"Malformed activities JSON for session {session_id}: {exc}")
+                    return []
+                raise RuntimeError(f"Malformed Jules activities page for session {session_id}: {exc}") from exc
+
+            page_items: Optional[List[Any]] = None
+            next_token: Optional[str] = None
+            if isinstance(data, list):
+                page_items = data
+            elif isinstance(data, dict):
+                for key in ("activities", "items", "results"):
+                    if isinstance(data.get(key), list):
+                        page_items = data[key]
+                        break
+                next_token = data.get("nextPageToken") or data.get("next_page_token")
+
+            if page_items is None:
+                if first_page:
+                    return []
+                raise RuntimeError(f"Malformed Jules activities page for session {session_id}: no item list found")
+
+            activities.extend(page_items)
+            first_page = False
+
+            if not next_token:
+                break
+            page_token = next_token
+
+        return activities
+
+    def send_message(self, session_id: str, message: str) -> str:
+        """Send a message to an existing Jules session.
+
+        Args:
+            session_id: The session ID to send the message to
+            message: The message to send
+
+        Returns:
+            Response from Jules
+        """
+        # Escape < / > to &lt; / &gt;
+        message = message.replace("<", "&lt;").replace(">", "&gt;")
+
+        try:
+            # Prepare the request
+            url = f"{self.base_url}/sessions/{session_id}:sendMessage"
+            payload = {
+                "prompt": message,
+            }
+
+            logger.info(f"Sending message to Jules session: {session_id}")
+            logger.info(f"🤖 POST {url}")
+            logger.info("=" * 60)
+
+            response = self.session.post(url, json=payload, timeout=self.timeout)
+
+            logger.info("=" * 60)
+
+            # Check if request was successful
+            if response.status_code != 200:
+                error_msg = f"HTTP {response.status_code}: {response.text}"
+                logger.error(f"Failed to send message to Jules session {session_id}: {error_msg}")
+                raise RuntimeError(f"Failed to send message to Jules session {session_id}: {error_msg}")
+
+            # Parse the response
+            try:
+                response_data = response.json()
+                # Extract the response message
+                # The exact field name depends on the API response format
+                response_text = response_data.get("response") or response_data.get("message") or response_data.get("result") or str(response_data)
+                return response_text
+            except json.JSONDecodeError:
+                # If response is not JSON, return the raw text
+                return response.text
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to send message to Jules session {session_id}: {e}")
+            raise RuntimeError(f"Failed to send message to Jules session {session_id}: {e}")
+        except Exception as e:
+            logger.error(f"Failed to send message to Jules session {session_id}: {e}")
+            raise RuntimeError(f"Failed to send message to Jules session {session_id}: {e}")
+
+    def end_session(self, session_id: str) -> bool:
+        """End a Jules session.
+
+        Args:
+            session_id: The session ID to end
+
+        Returns:
+            True if session was ended successfully, False otherwise
+        """
+        try:
+            # Prepare the request
+            url = f"{self.base_url}/sessions/{session_id}"
+
+            logger.info(f"Ending Jules session: {session_id}")
+            logger.info(f"🤖 DELETE {url}")
+            logger.info("=" * 60)
+
+            response = self.session.delete(url, timeout=self.timeout)
+
+            logger.info("=" * 60)
+
+            # Check if request was successful
+            if response.status_code == 200:
+                # Remove from active sessions
+                if session_id in self.active_sessions:
+                    del self.active_sessions[session_id]
+
+                logger.info(f"Ended Jules session: {session_id}")
+                return True
+            else:
+                error_msg = f"HTTP {response.status_code}: {response.text}"
+                logger.error(f"Failed to end Jules session {session_id}: {error_msg}")
+                return False
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to end Jules session {session_id}: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to end Jules session {session_id}: {e}")
+            return False
+
+    def archive_session(self, session_id: str) -> bool:
+        """Archive a Jules session.
+
+        Args:
+            session_id: The session ID to archive
+
+        Returns:
+            True if session was archived successfully, False otherwise
+        """
+        try:
+            # Prepare the request
+            url = f"{self.base_url}/sessions/{session_id}:archive"
+
+            logger.info(f"Archiving Jules session: {session_id}")
+            logger.info(f"🤖 POST {url}")
+            logger.info("=" * 60)
+
+            response = self.session.post(url, json={}, timeout=self.timeout)
+
+            logger.info("=" * 60)
+
+            # Check if request was successful
+            if response.status_code == 200:
+                # Remove from active sessions
+                if session_id in self.active_sessions:
+                    del self.active_sessions[session_id]
+
+                logger.info(f"Archived Jules session: {session_id}")
+                return True
+            else:
+                error_msg = f"HTTP {response.status_code}: {response.text}"
+                logger.error(f"Failed to archive Jules session {session_id}: {error_msg}")
+                return False
+
+            return False
+        except Exception as e:
+            logger.error(f"Failed to archive Jules session {session_id}: {e}")
+            return False
+
+    def approve_plan(self, session_id: str) -> bool:
+        """Approve a plan for a Jules session.
+
+        Args:
+            session_id: The session ID to approve the plan for
+
+        Returns:
+            True if plan was approved successfully, False otherwise
+        """
+        try:
+            # Prepare the request
+            url = f"{self.base_url}/sessions/{session_id}:approvePlan"
+
+            logger.info(f"Approving plan for Jules session: {session_id}")
+            logger.info(f"🤖 POST {url}")
+            logger.info("=" * 60)
+
+            response = self.session.post(url, json={}, timeout=self.timeout)
+
+            logger.info("=" * 60)
+
+            # Check if request was successful
+            if response.status_code == 200:
+                logger.info(f"Approved plan for Jules session: {session_id}")
+                return True
+            else:
+                error_msg = f"HTTP {response.status_code}: {response.text}"
+                logger.error(f"Failed to approve plan for Jules session {session_id}: {error_msg}")
+                return False
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to approve plan for Jules session {session_id}: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to approve plan for Jules session {session_id}: {e}")
+            return False
+
+    def _run_llm_cli(self, prompt: str, is_noedit: bool = False) -> str:
+        """Run Jules HTTP API with the given prompt and return response.
+
+        This method is kept for compatibility with LLMClientBase interface,
+        but Jules uses sessions rather than single-run commands.
+
+        Args:
+            prompt: The prompt to send
+            is_noedit: Whether this is a no-edit operation (uses options_for_noedit)
+
+        Returns:
+            Response from Jules
+        """
+        # Start a new session for this prompt
+        # Note: This fallback method doesn't have access to repo context, so it might fail
+        # if the API strictly requires it. We'll use placeholders or try without it.
+        # For now, we'll try to extract repo info from prompt or use defaults if possible,
+        # but since this is a fallback, we might need to update the interface or accept failure.
+        # Ideally, _run_llm_cli shouldn't be used for Jules in this context.
+        logger.warning("_run_llm_cli called for JulesClient. This may fail due to missing repo context.")
+        session_id = self.start_session(prompt, "unknown/repo", "main", is_noedit)
+
+        try:
+            # Send the prompt and get response
+            response = self.send_message(session_id, prompt)
+            return response
+        finally:
+            # End the session
+            self.end_session(session_id)
+
+    def close(self) -> None:
+        """Close the HTTP session and clean up resources."""
+        if self.session:
+            self.session.close()
+
+    def check_mcp_server_configured(self, server_name: str) -> bool:
+        """Check if a specific MCP server is configured for Jules CLI.
+
+        Args:
+            server_name: Name of the MCP server to check (e.g., 'test-watcher', 'mcp-pdb')
+
+        Returns:
+            True if the MCP server is configured, False otherwise
+        """
+        # Jules doesn't support MCP servers like Claude/Gemini
+        # Return False for all MCP server checks
+        logger.debug(f"Jules does not support MCP servers. Check for '{server_name}' returned False")
+        return False
+
+    def add_mcp_server_config(self, server_name: str, command: str, args: list[str]) -> bool:
+        """Add MCP server configuration for Jules CLI.
+
+        Jules doesn't currently support MCP server configuration.
+
+        Args:
+            server_name: Name of the MCP server (e.g., 'test-watcher', 'mcp-pdb')
+            command: Command to run the MCP server (e.g., 'uv', '/path/to/script.sh')
+            args: Arguments for the command (e.g., ['run', 'main.py'] or [])
+
+        Returns:
+            False - Jules does not support MCP server configuration
+        """
+        # Jules doesn't support MCP servers
+        logger.debug(f"Jules does not support MCP server configuration. Cannot add '{server_name}'")
+        return False
+
+    def start_task(
+        self,
+        prompt: str,
+        repo_name: str = "",
+        base_branch: str = "",
+        title: Optional[str] = None,
+        is_noedit: bool = False,
+    ) -> str:
+        """Start a new Jules task.
+
+        Args:
+            prompt: The prompt to send
+            repo_name: Repository name
+            base_branch: Base branch name
+            title: Optional title
+            is_noedit: Whether this is a no-edit operation
+
+        Returns:
+            Session ID for the started task
+        """
+        return self.start_session(
+            prompt=prompt,
+            repo_name=repo_name or "unknown/repo",
+            base_branch=base_branch or "main",
+            is_noedit=is_noedit,
+            title=title,
+        )
+
+    def _to_cloud_task(self, session: Dict[str, Any]) -> CloudTask:
+        """Convert a Jules session dict to a normalized CloudTask."""
+        session_id = session.get("name", "").split("/")[-1] if session.get("name") else session.get("id", "")
+        raw_state = session.get("state")
+
+        # Determine normalized state
+        if raw_state == "IN_PROGRESS":
+            state = CloudTaskState.RUNNING
+        elif raw_state in ("AWAITING_PLAN_APPROVAL", "AWAITING_USER_FEEDBACK", "AWAITING_COMMENT", "AWAITING_COMMENTS") or (isinstance(raw_state, str) and raw_state.startswith("AWAITING_")):
+            state = CloudTaskState.PAUSED
+        elif raw_state == "COMPLETED":
+            state = CloudTaskState.COMPLETED
+        elif raw_state == "FAILED":
+            state = CloudTaskState.FAILED
+        elif raw_state == "QUEUED":
+            state = CloudTaskState.QUEUED
+        else:
+            state = CloudTaskState.UNKNOWN
+
+        outputs = session.get("outputs", {})
+        if isinstance(outputs, list):
+            norm_outputs: Dict[str, Any] = {}
+            for item in outputs:
+                if isinstance(item, dict):
+                    norm_outputs.update(item)
+                elif isinstance(item, (list, tuple)) and len(item) == 2:
+                    norm_outputs[item[0]] = item[1]
+            outputs = norm_outputs
+        elif not isinstance(outputs, dict):
+            outputs = {}
+
+        pr = outputs.get("pullRequest") or outputs.get("pull_request")
+        err = outputs.get("error")
+
+        created_at = None
+        create_time_str = session.get("createTime")
+        if create_time_str:
+            try:
+                created_at = parser.parse(str(create_time_str))
+            except Exception:
+                pass
+
+        updated_at = None
+        update_time_str = session.get("updateTime")
+        if update_time_str:
+            try:
+                updated_at = parser.parse(str(update_time_str))
+            except Exception:
+                pass
+
+        return CloudTask(
+            task_id=session_id,
+            state=state,
+            raw_state=raw_state,
+            title=session.get("title"),
+            pull_request=pr,
+            prompt=session.get("prompt"),
+            created_at=created_at,
+            updated_at=updated_at,
+            url=f"https://jules.google.com/session/{session_id}" if session_id else None,
+            error=str(err) if err else None,
+            raw_data=session,
+        )
+
+    def get_task(self, task_id: str) -> Optional[CloudTask]:
+        """Retrieve normalized CloudTask for a Jules session."""
+        try:
+            session = self.get_session(task_id)
+            if not session:
+                return None
+            return self._to_cloud_task(session)
+        except Exception as e:
+            logger.warning(f"Failed to get Jules task {task_id}: {e}")
+            return None
+
+    def list_tasks(self, repo_name: Optional[str] = None) -> List[CloudTask]:
+        """List active or recent Jules sessions as normalized CloudTasks."""
+        try:
+            sessions = self.list_sessions(repo_name=repo_name)
+            return [self._to_cloud_task(s) for s in sessions if isinstance(s, dict)]
+        except Exception as e:
+            logger.warning(f"Failed to list Jules tasks: {e}")
+            return []
+
+    def continue_if_paused(self, task_id: str, message: Optional[str] = None) -> bool:
+        """Resume a Jules session if it is currently paused or stopped in a continuable state.
+
+        Handles:
+        - AWAITING_PLAN_APPROVAL: approves plan
+        - AWAITING_USER_FEEDBACK / AWAITING_COMMENT(S) / AWAITING_*: sends continuation message ('ok' or custom message)
+        - FAILED / timed-out IN_PROGRESS: sends continuation message ('ok')
+        - COMPLETED without PR: sends continuation message ('ok' or force PR)
+
+        Returns:
+            True if session was paused and resumed, False otherwise.
+        """
+        try:
+            session = self.get_session(task_id)
+            if not session:
+                return False
+
+            raw_state = session.get("state")
+            outputs = session.get("outputs", {})
+            if isinstance(outputs, list):
+                norm_outputs: Dict[str, Any] = {}
+                for item in outputs:
+                    if isinstance(item, dict):
+                        norm_outputs.update(item)
+                    elif isinstance(item, (list, tuple)) and len(item) == 2:
+                        norm_outputs[item[0]] = item[1]
+                outputs = norm_outputs
+            elif not isinstance(outputs, dict):
+                outputs = {}
+
+            pull_request = outputs.get("pullRequest") or outputs.get("pull_request")
+
+            # Check if timed out while IN_PROGRESS
+            is_timeout = False
+            if raw_state == "IN_PROGRESS":
+                update_time_str = session.get("updateTime")
+                if update_time_str:
+                    try:
+                        update_time = parser.parse(str(update_time_str))
+                        if update_time.tzinfo is None:
+                            update_time = update_time.replace(tzinfo=timezone.utc)
+                        now = datetime.now(timezone.utc)
+                        if (now - update_time) > timedelta(minutes=5):
+                            is_timeout = True
+                    except Exception:
+                        pass
+
+            if raw_state == "AWAITING_PLAN_APPROVAL":
+                logger.info(f"Jules task {task_id} is awaiting plan approval; approving plan")
+                return self.approve_plan(task_id)
+
+            if raw_state in ("AWAITING_USER_FEEDBACK", "AWAITING_COMMENT", "AWAITING_COMMENTS") or (isinstance(raw_state, str) and raw_state.startswith("AWAITING_")):
+                send_msg = _build_jules_continuation_message(message)
+                logger.info(f"Jules task {task_id} is {raw_state}; sending continuation message: {send_msg}")
+                self.send_message(task_id, send_msg)
+                return True
+
+            if raw_state == "FAILED" or is_timeout:
+                send_msg = _build_jules_continuation_message(message)
+                logger.info(f"Jules task {task_id} is {raw_state} (timeout={is_timeout}); sending continuation message: {send_msg}")
+                self.send_message(task_id, send_msg)
+                return True
+
+            if raw_state == "COMPLETED" and not pull_request:
+                send_msg = _build_jules_continuation_message(message)
+                logger.info(f"Jules task {task_id} is COMPLETED without PR; sending continuation message: {send_msg}")
+                self.send_message(task_id, send_msg)
+                return True
+
+            return False
+        except Exception as e:
+            logger.warning(f"Failed to check/continue Jules task {task_id}: {e}")
+            return False
+
+    def stop_task(self, task_id: str) -> bool:
+        """Stop or cancel a Jules task by sending a stop message and ending the session."""
+        try:
+            try:
+                self.send_message(task_id, "stop")
+            except Exception:
+                pass
+            return self.end_session(task_id)
+        except Exception as e:
+            logger.warning(f"Failed to stop Jules task {task_id}: {e}")
+            return False
+
+    def send_followup(self, task_id: str, message: str) -> bool:
+        """Assign follow-up work to an existing Jules implementation session."""
+        if not task_id or not message:
+            return False
+
+        from .cloud_provider_instructions import CloudTaskOperation, prepare_cloud_task
+
+        # An existing-session continuation is never eligible for the initial
+        # component (REQ-007); routed through the same boundary for parity
+        # with new-task dispatch rather than skipping it implicitly.
+        message = prepare_cloud_task(message, recipient="jules", operation=CloudTaskOperation.CONTINUATION, no_edit=False).prepared_task
+
+        try:
+            self.send_message(task_id, message)
+            return True
+        except Exception as exc:
+            logger.warning(f"Failed to send follow-up to Jules session {task_id}: {exc}")
+            return False

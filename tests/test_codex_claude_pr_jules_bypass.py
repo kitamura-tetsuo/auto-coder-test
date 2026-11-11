@@ -1,0 +1,267 @@
+"""Tests for Codex Cloud PR body URL enhancement and Jules fix bypass on Codex/Claude PRs."""
+
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from auto_coder.automation_config import AutomationConfig
+from auto_coder.cloud_manager import CloudManager
+from auto_coder.pr_processor import (
+    _close_empty_pr,
+    _extract_session_id_candidates,
+    _find_codex_cloud_task_for_issue,
+    _is_claude_pr,
+    _is_codex_or_claude_pr,
+    _is_codex_pr,
+    _is_jules_pr,
+    _is_unsafe_codex_cloud_branch,
+    _link_codex_cloud_pr_to_issue,
+    _send_jules_error_feedback,
+    _should_skip_waiting_for_jules,
+    process_pull_request,
+)
+
+
+def test_is_codex_pr_detection():
+    """Verify Codex PR detection via session/task URL in PR body and author login."""
+    # Body containing ChatGPT Codex Cloud task URL
+    pr_with_url = {
+        "number": 1,
+        "body": "Fix bug\n\nCloses #10\n\nhttps://chatgpt.com/codex/tasks/task_e_abc12345",
+        "user": {"login": "octocat"},
+    }
+    assert _is_codex_pr(pr_with_url) is True
+
+    # Body containing chat.openai.com Codex task URL
+    pr_with_openai_url = {
+        "number": 2,
+        "body": "Implementation\n\nhttps://chat.openai.com/codex/tasks/task_xyz789",
+        "user": {"login": "octocat"},
+    }
+    assert _is_codex_pr(pr_with_openai_url) is True
+
+    # PR author login starting with codex
+    pr_with_author = {
+        "number": 3,
+        "body": "Fixes #5",
+        "user": {"login": "codex-bot"},
+    }
+    assert _is_codex_pr(pr_with_author) is True
+
+    # Non-Codex PR
+    normal_pr = {
+        "number": 4,
+        "body": "Just a normal PR\n\nCloses #20",
+        "user": {"login": "developer"},
+    }
+    assert _is_codex_pr(normal_pr) is False
+
+
+@pytest.mark.parametrize("route", ["remote", "codex/tasks", "codex/cloud/tasks"])
+def test_supported_codex_url_routes_have_identical_unsafe_branch_classification(route):
+    pr = {
+        "number": 7,
+        "body": f"Closes #7\n\nhttps://chatgpt.com/{route}/task_e_Ab19",
+        "user": {"login": "repository-user"},
+        "head": {"ref": "work"},
+    }
+
+    assert _is_codex_pr(pr) is True
+    assert _is_unsafe_codex_cloud_branch(pr) is True
+
+
+@pytest.mark.parametrize("route", ["remote", "codex/tasks", "codex/cloud/tasks"])
+def test_supported_codex_url_routes_defer_empty_work_branch_to_recovery(route):
+    pr = {
+        "number": 7,
+        "body": f"Closes #7\n\nhttps://chatgpt.com/{route}/task_e_Ab19",
+        "state": "open",
+        "user": {"login": "repository-user"},
+        "head": {"ref": "work"},
+        "changed_files": 0,
+        "additions": 0,
+        "deletions": 0,
+    }
+    github = MagicMock()
+
+    result = _close_empty_pr(github, "owner/repo", pr, AutomationConfig())
+
+    assert result.closed is False
+    assert result.actions == []
+    github.close_pr.assert_not_called()
+
+
+def test_is_claude_pr_detection():
+    """Verify Claude PR detection via session URL in PR body and author login."""
+    # Body containing Claude Code session URL
+    pr_with_claude_url = {
+        "number": 1,
+        "body": "Add feature\n\nCloses #15\n\nhttps://claude.ai/code/session_01HJKLMNOPQR",
+        "user": {"login": "octocat"},
+    }
+    assert _is_claude_pr(pr_with_claude_url) is True
+
+    # Body containing Claude session text
+    pr_with_claude_text = {
+        "number": 2,
+        "body": "Resolved issue. Claude session active.",
+        "user": {"login": "octocat"},
+    }
+    assert _is_claude_pr(pr_with_claude_text) is True
+
+    # PR author login starting with claude
+    pr_with_author = {
+        "number": 3,
+        "body": "Fixes #3",
+        "user": {"login": "claude[bot]"},
+    }
+    assert _is_claude_pr(pr_with_author) is True
+
+    # Non-Claude PR
+    normal_pr = {
+        "number": 4,
+        "body": "Regular PR\n\nFixes #1",
+        "user": {"login": "developer"},
+    }
+    assert _is_claude_pr(normal_pr) is False
+
+
+def test_is_codex_or_claude_pr():
+    """Verify combined Codex/Claude PR check."""
+    assert _is_codex_or_claude_pr({"body": "https://chatgpt.com/codex/tasks/task_1", "user": {}}) is True
+    assert _is_codex_or_claude_pr({"body": "https://claude.ai/code/session_1", "user": {}}) is True
+    assert _is_codex_or_claude_pr({"body": "Regular PR", "user": {"login": "user1"}}) is False
+
+
+@pytest.mark.parametrize("route", ["remote", "codex/tasks", "codex/cloud/tasks"])
+def test_is_jules_pr_excludes_codex_and_claude(route):
+    """Verify that Codex and Claude PRs are never identified as Jules PRs."""
+    codex_pr = {
+        "number": 1,
+        "body": f"Closes #10\n\nhttps://chatgpt.com/{route}/task_e_123",
+        "user": {"login": "google-labs-jules[bot]"},  # Even if bot login spoofed
+    }
+    assert _is_jules_pr(codex_pr) is False
+
+    claude_pr = {
+        "number": 2,
+        "body": "Closes #11\n\nhttps://claude.ai/code/session_abc",
+        "user": {"login": "google-labs-jules[bot]"},
+    }
+    assert _is_jules_pr(claude_pr) is False
+
+    # Genuine Jules PR
+    jules_pr = {
+        "number": 3,
+        "body": "Fixed bug\n\nhttps://jules.google.com/session/987654321",
+        "user": {"login": "google-labs-jules[bot]"},
+    }
+    assert _is_jules_pr(jules_pr) is True
+
+
+@pytest.mark.parametrize("route", ["remote", "codex/tasks", "codex/cloud/tasks"])
+def test_should_skip_waiting_for_jules_bypasses_codex_and_claude(route):
+    """Verify _should_skip_waiting_for_jules immediately returns False for Codex/Claude PRs."""
+    github_client = MagicMock()
+    config = AutomationConfig()
+
+    codex_pr = {
+        "number": 10,
+        "body": f"Closes #5\n\nhttps://chatgpt.com/{route}/task_e_999",
+        "user": {"login": "octocat"},
+    }
+    assert _should_skip_waiting_for_jules(github_client, "owner/repo", codex_pr, config) is False
+    github_client.get_pr_comments.assert_not_called()
+
+    claude_pr = {
+        "number": 11,
+        "body": "Closes #6\n\nhttps://claude.ai/code/session_888",
+        "user": {"login": "octocat"},
+    }
+    assert _should_skip_waiting_for_jules(github_client, "owner/repo", claude_pr, config) is False
+    github_client.get_pr_comments.assert_not_called()
+
+
+@pytest.mark.parametrize("route", ["remote", "codex/tasks", "codex/cloud/tasks"])
+def test_send_jules_error_feedback_bypasses_codex_and_claude(route):
+    """Verify _send_jules_error_feedback never messages Jules or comments on Codex/Claude PRs."""
+    github_client = MagicMock()
+    config = AutomationConfig()
+
+    codex_pr = {
+        "number": 10,
+        "body": f"Closes #5\n\nhttps://chatgpt.com/{route}/task_e_999",
+        "user": {"login": "octocat"},
+    }
+
+    with patch("auto_coder.jules_client.JulesClient") as mock_jules:
+        actions = _send_jules_error_feedback("owner/repo", codex_pr, [{"name": "test"}], config, github_client)
+        assert any("Skipped Jules error feedback" in action for action in actions.actions)
+        assert actions.attempt_started is False
+        mock_jules.assert_not_called()
+        github_client.add_comment_to_pr.assert_not_called()
+
+
+def test_find_codex_cloud_task_for_issue_cloud_manager(tmp_path: Path):
+    """Verify finding Codex Cloud task URL via CloudManager."""
+    repo = "test-owner/test-repo"
+    cloud_csv = tmp_path / "cloud.csv"
+    cloud_manager = CloudManager(repo, cloud_file_path=cloud_csv)
+    cloud_manager.add_session(42, "task_e_abcdef123456")
+
+    with patch("auto_coder.pr_processor.CloudManager", return_value=cloud_manager):
+        url = _find_codex_cloud_task_for_issue(repo, 42)
+        assert url == "https://chatgpt.com/remote/task_e_abcdef123456"
+
+
+def test_find_codex_cloud_task_for_issue_rejects_placeholder_session(tmp_path: Path):
+    repo = "owner/repo"
+    cloud_manager = CloudManager(repo, cloud_file_path=tmp_path / "cloud.csv")
+    cloud_manager.add_session(42, "task_fake")
+
+    with patch("auto_coder.pr_processor.CloudManager", return_value=cloud_manager):
+        assert _find_codex_cloud_task_for_issue(repo, 42) is None
+
+
+def test_find_codex_cloud_task_for_issue_falls_back_after_placeholder_session(tmp_path: Path):
+    repo = "owner/repo"
+    github_client = MagicMock()
+    github_client.get_issue_comments.return_value = [{"body": "Codex Cloud task started. Task ID: task_e_real123"}]
+    cloud_manager = CloudManager(repo, cloud_file_path=tmp_path / "cloud.csv")
+    cloud_manager.add_session(42, "task_fake")
+
+    with patch("auto_coder.pr_processor.CloudManager", return_value=cloud_manager):
+        url = _find_codex_cloud_task_for_issue(repo, 42, github_client)
+
+    assert url == "https://chatgpt.com/remote/task_e_real123"
+
+
+@pytest.mark.parametrize("route", ["remote", "codex/tasks", "codex/cloud/tasks"])
+def test_find_codex_cloud_task_for_issue_comments(tmp_path: Path, route):
+    """Verify finding Codex Cloud task URL via GitHub issue comments."""
+    repo = "test-owner/test-repo"
+    cloud_csv = tmp_path / "empty.csv"
+    cloud_manager = CloudManager(repo, cloud_file_path=cloud_csv)
+
+    github_client = MagicMock()
+    github_client.get_issue_comments.return_value = [{"body": f"[Codex task](https://chatgpt.com/{route}/task_e_comment123)"}]
+
+    with patch("auto_coder.pr_processor.CloudManager", return_value=cloud_manager):
+        url = _find_codex_cloud_task_for_issue(repo, 99, github_client)
+        assert url == "https://chatgpt.com/remote/task_e_comment123"
+
+
+@pytest.mark.parametrize("route", ["remote", "codex/tasks", "codex/cloud/tasks"])
+def test_codex_task_url_precedes_incidental_task_token_in_session_candidates(route):
+    body = f"Old task_e_Incidental1\n[Current task](https://chatgpt.com/{route}/task_e_Current2)"
+
+    assert _extract_session_id_candidates(body) == [
+        ("Pattern 3c (Codex Task URL)", "task_e_Current2"),
+        ("Pattern 7 (Codex task_ prefix)", "task_e_Incidental1"),
+    ]
+
+
+@pytest.mark.parametrize("body", ["https://example.com/remote/task_e_Unrelated1", "https://chatgpt.com/remote/settings", "/remote/task_e_Unrelated1"])
+def test_unrelated_remote_paths_do_not_identify_codex_prs(body):
+    assert _is_codex_pr({"body": body, "user": {"login": "octocat"}}) is False

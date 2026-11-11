@@ -1,0 +1,184 @@
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+from auto_coder.automation_config import AutomationConfig
+from auto_coder.dispatch_claim_store import DispatchClaimStore, DispatchIdentity, DispatchOutcome
+from auto_coder.pr_processor import _handle_pr_merge
+from auto_coder.util.github_action import GitHubActionsStatusResult, WorkflowDispatchResult
+from tests.ci_observation_fakes import authoritative_ci_status
+
+
+class _StrictMetadataGithubClient:
+    """A plain (non-Mock) client exposing a genuine ``get_pull_request_metadata_strict``
+    method, with every other attribute forwarded to an internal MagicMock.
+
+    ``_resolve_pr_safety_metadata`` in pr_processor.py looks up this method via
+    ``getattr(type(client), "get_pull_request_metadata_strict", None)`` — a class
+    attribute lookup that only finds a method genuinely defined on the class,
+    never one of MagicMock's dynamically created *instance* attributes (and
+    subclassing MagicMock doesn't help: its child-mock machinery would just
+    re-instantiate this class for every attribute access). A plain
+    ``MagicMock()`` client therefore silently skips the strict
+    authoritative-fetch path entirely and falls back to trusting the
+    caller-supplied ``pr_data``, which would hide any regression where the
+    durable dispatch identity is built from stale caller metadata instead of
+    the authoritative REST response.
+    """
+
+    def __init__(self, head_shas):
+        self._head_shas = list(head_shas)
+        self._strict_calls = 0
+        self._fallback = MagicMock()
+        self._fallback.get_pr_review_threads_strict.return_value = []
+
+    def get_pull_request_metadata_strict(self, repo_name, pr_number):
+        index = min(self._strict_calls, len(self._head_shas) - 1)
+        sha = self._head_shas[index]
+        self._strict_calls += 1
+        return {
+            "number": pr_number,
+            "head": {"ref": "feature-branch", "sha": sha},
+            "state": "open",
+            "body": "",
+            "author": "someone",
+            "labels": [],
+        }
+
+    def __getattr__(self, name):
+        return getattr(self._fallback, name)
+
+
+class TestWorkflowTrigger(unittest.TestCase):
+    def setUp(self):
+        self.github_client = MagicMock()
+        self.github_client.get_pr_review_threads_strict.return_value = []
+        self.config = AutomationConfig()
+        self.repo_name = "owner/repo"
+        self.pr_data = {"number": 123, "head": {"ref": "feature-branch", "sha": "sha123"}}
+
+        # Use an isolated, temp-backed dispatch claim store for each test so
+        # dispatch admission decisions do not leak between test runs.
+        self._tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp_dir.cleanup)
+        self._claim_store = DispatchClaimStore(db_path=Path(self._tmp_dir.name) / "dispatch_claims.db")
+        self._env = patch.dict("os.environ", {"AUTO_CODER_INVALIDATION_DB": str(Path(self._tmp_dir.name) / "invalidations.db")})
+        self._env.start()
+        self.addCleanup(self._env.stop)
+        patcher = patch("auto_coder.pr_processor.get_dispatch_claim_store", return_value=self._claim_store)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @patch("auto_coder.pr_processor._check_github_actions_status")
+    @patch("auto_coder.pr_processor.get_detailed_checks_from_history")
+    @patch("auto_coder.pr_processor.LabelManager")
+    @patch("auto_coder.util.github_action.trigger_workflow_dispatch")
+    def test_handle_pr_merge_triggers_workflow(self, mock_trigger, mock_label_manager, mock_get_detailed, mock_check_status):
+        # Setup: No existing checks (ids is empty)
+        mock_check_status.side_effect = authoritative_ci_status(success=True, ids=[], in_progress=False)
+
+        # Mock trigger success
+        mock_trigger.return_value = WorkflowDispatchResult(outcome=DispatchOutcome.ACCEPTED)
+
+        # Mock LabelManager
+        mock_lm_instance = MagicMock()
+        mock_label_manager.return_value.__enter__.return_value = mock_lm_instance
+
+        # Execute
+        actions = _handle_pr_merge(self.github_client, self.repo_name, self.pr_data, self.config, {})
+
+        # Verify
+        mock_trigger.assert_not_called()
+        mock_lm_instance.keep_label.assert_not_called()
+        self.assertTrue(any("No current CI observations are available for PR #123" in action for action in actions))
+
+    @patch("auto_coder.pr_processor.get_commit_log")
+    @patch("auto_coder.pr_processor.cmd.run_command")
+    @patch("auto_coder.pr_processor._check_github_actions_status")
+    @patch("auto_coder.pr_processor.get_detailed_checks_from_history")
+    @patch("auto_coder.pr_processor.LabelManager")
+    @patch("auto_coder.util.github_action.trigger_workflow_dispatch")
+    def test_handle_pr_merge_fails_trigger(self, mock_trigger, mock_label_manager, mock_get_detailed, mock_check_status, mock_run_command, mock_get_commit_log):
+        # Setup: No existing checks
+        mock_check_status.side_effect = authoritative_ci_status(success=True, ids=[], in_progress=False)
+
+        # Mock trigger failure (definitely rejected, so admission may retry later)
+        mock_trigger.return_value = WorkflowDispatchResult(outcome=DispatchOutcome.REJECTED)
+
+        # Mock LabelManager
+        mock_lm_instance = MagicMock()
+        mock_label_manager.return_value.__enter__.return_value = mock_lm_instance
+
+        # Mock cmd.run_command to prevent git branch --show-current execution
+        from auto_coder.utils import CommandResult
+
+        mock_run_command.return_value = CommandResult(success=True, stdout="main", stderr="", returncode=0)
+
+        # Mock get_commit_log to prevent git command execution in _process_pr_jules_mode
+        mock_get_commit_log.return_value = "No commits"
+
+        # Execute
+        actions = _handle_pr_merge(self.github_client, self.repo_name, self.pr_data, self.config, {})
+
+        # Verify
+        mock_trigger.assert_not_called()
+        mock_lm_instance.keep_label.assert_not_called()
+        self.assertTrue(any("No current CI observations are available for PR #123" in action for action in actions))
+
+    @patch("auto_coder.pr_processor._check_github_actions_status")
+    @patch("auto_coder.pr_processor.get_detailed_checks_from_history")
+    @patch("auto_coder.pr_processor.LabelManager")
+    @patch("auto_coder.util.github_action.trigger_workflow_dispatch")
+    def test_new_head_sha_dispatches_despite_prior_accepted_claim(self, mock_trigger, mock_label_manager, mock_get_detailed, mock_check_status):
+        """REQ-001/REQ-007 regression: an accepted claim for head SHA A must not
+        suppress an otherwise eligible dispatch once the PR head advances to a
+        different SHA B, and each identity's persisted claim must carry its own
+        authoritative head SHA rather than collapsing onto one shared identity."""
+        mock_check_status.side_effect = authoritative_ci_status(success=True, ids=[], in_progress=False)
+        mock_trigger.return_value = WorkflowDispatchResult(outcome=DispatchOutcome.ACCEPTED)
+
+        mock_lm_instance = MagicMock()
+        mock_label_manager.return_value.__enter__.return_value = mock_lm_instance
+
+        pr_data_a = {"number": 123, "head": {"ref": "feature-branch", "sha": "sha-A"}}
+        actions_a = _handle_pr_merge(self.github_client, self.repo_name, pr_data_a, self.config, {})
+        self.assertTrue(any("No current CI observations are available for PR #123" in action for action in actions_a))
+
+        pr_data_b = {"number": 123, "head": {"ref": "feature-branch", "sha": "sha-B"}}
+        actions_b = _handle_pr_merge(self.github_client, self.repo_name, pr_data_b, self.config, {})
+        self.assertTrue(any("No current CI observations are available for PR #123" in action for action in actions_b))
+        mock_trigger.assert_not_called()
+
+    @patch("auto_coder.pr_processor._check_github_actions_status")
+    @patch("auto_coder.pr_processor.get_detailed_checks_from_history")
+    @patch("auto_coder.pr_processor.LabelManager")
+    @patch("auto_coder.util.github_action.trigger_workflow_dispatch")
+    def test_dispatch_identity_uses_authoritative_strict_head_not_stale_caller_data(self, mock_trigger, mock_label_manager, mock_get_detailed, mock_check_status):
+        """REQ-001 regression: the durable dispatch identity must be keyed by the
+        authoritative head SHA obtained from the strict, cache-bypassing PR
+        metadata fetch performed inside _handle_pr_merge, not by whatever
+        (possibly stale) head SHA the caller happened to pass in."""
+        mock_check_status.side_effect = authoritative_ci_status(success=True, ids=[], in_progress=False)
+        mock_trigger.return_value = WorkflowDispatchResult(outcome=DispatchOutcome.ACCEPTED)
+
+        mock_lm_instance = MagicMock()
+        mock_label_manager.return_value.__enter__.return_value = mock_lm_instance
+
+        strict_client = _StrictMetadataGithubClient(head_shas=["sha-A", "sha-B"])
+
+        # The caller-supplied pr_data is stale and identical on both calls: if
+        # the identity were derived from this instead of the strict refresh,
+        # both evaluations would collapse onto the same suppressing identity.
+        stale_pr_data = {"number": 123, "head": {"ref": "feature-branch", "sha": "stale-sha-never-authoritative"}}
+
+        actions_first = _handle_pr_merge(strict_client, self.repo_name, stale_pr_data, self.config, {})
+        self.assertTrue(any("No current CI observations are available for PR #123" in action for action in actions_first))
+
+        actions_second = _handle_pr_merge(strict_client, self.repo_name, stale_pr_data, self.config, {})
+        self.assertTrue(any("No current CI observations are available for PR #123" in action for action in actions_second))
+        mock_trigger.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

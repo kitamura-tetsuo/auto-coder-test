@@ -1,0 +1,895 @@
+"""Tests for delegating merge-conflict repair to originating cloud sessions."""
+
+import json
+import threading
+from contextlib import nullcontext
+from types import SimpleNamespace
+from unittest.mock import MagicMock, Mock, patch
+
+import pytest
+
+pytestmark = pytest.mark.pr_repair_contract
+
+from src.auto_coder.automation_config import AutomationConfig
+from src.auto_coder.base_update_execution import BaseUpdateConflictExecutionService
+from src.auto_coder.claude_usage_checker import ClaudeStrictUsageObservation
+from src.auto_coder.cloud_run import CloudRun
+from src.auto_coder.cloud_task_client_base import CloudTaskClientBase
+from src.auto_coder.codex_wham_client import FollowUpDeliveryOutcome
+from src.auto_coder.exceptions import DeliveryCertainty
+from src.auto_coder.execution_trace import TraceCollector
+from src.auto_coder.issue_processor import _process_issue_claude_routine_mode
+from src.auto_coder.llm_backend_config import BackendConfig
+from src.auto_coder.pr_processor import (
+    CloudConflictDeliveryRecord,
+    MergeRouteDisposition,
+    _delegate_cloud_merge_conflict_repair,
+    _delegate_cloud_merge_conflict_repair_result,
+    _delegate_cloud_review_thread_repair,
+    _dispatch_cloud_conflict_repair,
+    _handle_definitive_merge_rejection,
+    _link_jules_pr_to_issue,
+    _merge_pr,
+    _record_cloud_conflict_deliveries,
+    _resolve_cloud_conflict_origin,
+    _start_mergeability_remediation,
+    _update_with_base_branch,
+)
+from src.auto_coder.pr_repair_dispatch import RepairDisposition, RepairOrigin
+from src.auto_coder.util.gh_cache import ReviewThread, ReviewThreadComment
+from src.auto_coder.utils import CommandResult
+
+
+class FollowupClient:
+    """Small capability provider used to observe follow-up delivery."""
+
+    def __init__(self, accepted: bool = True) -> None:
+        self.accepted = accepted
+        self.messages: list[tuple[str, str]] = []
+
+    def send_followup(self, task_id: str, message: str) -> bool:
+        self.messages.append((task_id, message))
+        return self.accepted
+
+
+class UnsupportedClient:
+    """Provider that retains the optional base implementation."""
+
+    send_followup = CloudTaskClientBase.send_followup
+
+
+def test_definitive_rejection_preserves_actual_cloud_quota_producer_wait(tmp_path):
+    """REQ-004: a durable provider hold reaches the direct merge consumer intact."""
+    client = FollowupClient()
+    client.backend_name = "claude-routine"
+    deadline = 9_999_999_999.0
+    wait_store = MagicMock()
+    wait_store.get.return_value = SimpleNamespace(certainty=DeliveryCertainty.NOT_SENT, retry_not_before=deadline)
+    api = MagicMock()
+    api.pulls.get.return_value = {**pr_data(), "mergeable": False}
+    route = MergeRouteDisposition()
+    merge_attempt = MagicMock()
+    service_entries = []
+    original = BaseUpdateConflictExecutionService.execute_conflict_repair
+
+    def observe(service, request, operation=None, *, config=None):
+        service_entries.append(request)
+        return original(service, request, operation, config=config)
+
+    with (
+        patch("src.auto_coder.pr_processor._resolve_cloud_conflict_origin", return_value=(client, "task_existing")),
+        patch("src.auto_coder.pr_processor._cloud_conflict_state_path", return_value=tmp_path / "repairs.json"),
+        patch("src.auto_coder.pr_processor.get_claude_followup_wait_store", return_value=wait_store),
+        patch.object(BaseUpdateConflictExecutionService, "execute_conflict_repair", new=observe),
+        patch("src.auto_coder.pr_processor._resolve_pr_merge_conflicts") as local,
+        patch("src.auto_coder.pr_processor._trigger_fallback_for_pr_failure") as fallback,
+    ):
+        assert not _handle_definitive_merge_rejection("owner/repo", pr_data()["number"], AutomationConfig(), MagicMock(), api, "owner", "repo", MagicMock(), MagicMock(), merge_attempt, "H1", route)
+
+    local.assert_not_called()
+    fallback.assert_not_called()
+    merge_attempt.assert_not_called()
+    assert client.messages == []
+    assert route.retry_not_before == deadline
+    assert len(service_entries) == 1
+    assert service_entries[0].expected_head == "H1"
+    assert service_entries[0].base_ref == "release/2.x"
+
+
+def test_definitive_jules_conflict_executes_once_through_service() -> None:
+    api = MagicMock()
+    pull = {**pr_data(), "mergeable": False, "body": "Session ID: session-existing"}
+    api.pulls.get.return_value = pull
+    jules = MagicMock()
+    service_entries = []
+    original = BaseUpdateConflictExecutionService.execute_conflict_repair
+
+    def observe(service, request, operation=None, *, config=None):
+        service_entries.append(request)
+        return original(service, request, operation, config=config)
+
+    with (
+        patch("src.auto_coder.pr_processor._is_jules_pr", return_value=True),
+        patch("src.auto_coder.pr_processor._guard_outbound_jules_send", return_value=True),
+        patch("auto_coder.jules_client.JulesClient", return_value=jules),
+        patch.object(BaseUpdateConflictExecutionService, "execute_conflict_repair", new=observe),
+        patch("src.auto_coder.pr_processor._resolve_pr_merge_conflicts") as local,
+    ):
+        assert not _handle_definitive_merge_rejection("owner/repo", 1589, AutomationConfig(), MagicMock(), api, "owner", "repo", MagicMock(), MagicMock(), MagicMock(), "H1")
+
+    assert len(service_entries) == 1
+    assert service_entries[0].expected_head == "H1"
+    assert service_entries[0].base_ref == "release/2.x"
+    jules.send_message.assert_called_once()
+    local.assert_not_called()
+
+
+def pr_data(head_sha: str = "H1", base_sha: str = "B1") -> dict:
+    """Build complete PR metadata for a release-branch conflict."""
+    return {
+        "number": 1589,
+        "body": "Closes #1589",
+        "head": {"ref": "cloud/repair-1589", "sha": head_sha},
+        "base": {"ref": "release/2.x", "sha": base_sha},
+    }
+
+
+@pytest.mark.parametrize(
+    "body",
+    ["Closes #1748", "Created by Claude: https://claude.ai/code/session-a"],
+    ids=["linked-issue", "session-url"],
+)
+def test_named_claude_dispatch_survives_restart_through_conflict_delivery(tmp_path, monkeypatch, body) -> None:
+    """Production persistence and conflict delivery retain backend credentials."""
+    backend_a = BackendConfig(
+        name="claude-a",
+        backend_type="claude-routine",
+        url="https://claude-a.example/fire",
+        api_key="token-a",
+    )
+    backend_b = BackendConfig(
+        name="claude-routine",
+        backend_type="claude-routine",
+        url="https://claude-b.example/fire",
+        api_key="token-b",
+    )
+    llm_config = MagicMock()
+    llm_config.get_backend_config.side_effect = {"claude-a": backend_a, "claude-routine": backend_b}.get
+    github = MagicMock()
+    issue = {"number": 1748, "title": "Preserve backend", "body": "Details", "labels": [], "state": "open"}
+    pull_request = pr_data()
+    pull_request["body"] = body
+    pull_request["user"] = {"login": "claude[bot]"}
+    monkeypatch.setenv("CLAUDE_CODE_ROUTINE_TOKEN", "token-b")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "token-b")
+
+    with (
+        patch("src.auto_coder.cloud_manager.Path.home", return_value=tmp_path),
+        patch("src.auto_coder.pr_processor.Path.home", return_value=tmp_path),
+        patch("src.auto_coder.claude_routine_client.get_llm_config", return_value=llm_config),
+        patch("src.auto_coder.claude_routine_client.ClaudeRoutineClient.fire_routine", return_value=("session-a", None)),
+        patch(
+            "src.auto_coder.claude_routine_client.observe_claude_usage_strict",
+            return_value=ClaudeStrictUsageObservation(available=True, detail="eligible"),
+        ),
+        patch("src.auto_coder.issue_processor.get_commit_log", return_value="initial"),
+        patch("src.auto_coder.claude_routine_client.CommandExecutor.run_command", return_value=CommandResult(True, "", "", 0)) as command,
+    ):
+        _process_issue_claude_routine_mode("owner/repo", issue, AutomationConfig(), github, backend_name="claude-a")
+        result = _delegate_cloud_merge_conflict_repair_result("owner/repo", pull_request, github)
+
+    assert result.delegated is True
+    args, kwargs = command.call_args
+    assert args[0][2] == "--cloud=session-a"
+    assert kwargs["env"]["CLAUDE_CODE_ROUTINE_TOKEN"] == "token-a"
+    assert kwargs["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == "token-b"
+
+
+def test_duplicate_named_backend_session_url_fails_closed_after_dispatch(tmp_path) -> None:
+    """A reverse session lookup cannot arbitrarily choose the first CSV issue."""
+    backends = {
+        name: BackendConfig(
+            name=name,
+            backend_type="claude-routine",
+            url=f"https://{name}.example/fire",
+            api_key=f"token-{name}",
+        )
+        for name in ("claude-a", "claude-b")
+    }
+    llm_config = MagicMock()
+    llm_config.get_backend_config.side_effect = backends.get
+    response = MagicMock(status_code=201, text="")
+    response.json.return_value = {"claude_code_session_id": "shared-session"}
+    github = MagicMock()
+    session_comments = {}
+    github.add_comment_to_issue.side_effect = lambda _repo, issue_number, body: session_comments.setdefault(issue_number, []).append({"body": body})
+
+    with (
+        patch("src.auto_coder.cloud_manager.Path.home", return_value=tmp_path),
+        patch("src.auto_coder.pr_processor.Path.home", return_value=tmp_path),
+        patch("src.auto_coder.claude_routine_client.get_llm_config", return_value=llm_config),
+        patch("src.auto_coder.claude_routine_client.check_claude_usage_or_raise"),
+        patch("src.auto_coder.claude_routine_client.requests.Session.post", return_value=response),
+        patch("src.auto_coder.claude_routine_client._save_claude_routine_state"),
+        patch("src.auto_coder.issue_processor.get_commit_log", return_value="initial"),
+        patch("src.auto_coder.claude_routine_client.CommandExecutor.run_command") as command,
+    ):
+        for issue_number, backend_name in ((1, "claude-b"), (2, "claude-a")):
+            issue = {"number": issue_number, "title": "Shared session", "body": "Details", "labels": [], "state": "open"}
+            _process_issue_claude_routine_mode("owner/repo", issue, AutomationConfig(), github, backend_name=backend_name)
+
+        pull_request = pr_data()
+        pull_request["body"] = "Created by Claude: https://claude.ai/code/shared-session"
+        pull_request["user"] = {"login": "claude[bot]"}
+        original_body = pull_request["body"]
+        github.search_issues.return_value = [{"number": 1, "body": ""}, {"number": 2, "body": ""}]
+        github.get_issue_comments.side_effect = lambda _repo, issue_number: session_comments[issue_number]
+
+        linked = _link_jules_pr_to_issue("owner/repo", pull_request, github)
+        conflict_result = _delegate_cloud_merge_conflict_repair_result("owner/repo", pull_request, github)
+        review_result = _delegate_cloud_review_thread_repair(
+            "owner/repo",
+            pull_request,
+            github,
+            (ReviewThread(id="thread-1", comments=[ReviewThreadComment(database_id=1, body="Fix this")]),),
+        )
+
+    assert linked is False
+    assert pull_request["body"] == original_body
+    github.update_pr_body.assert_not_called()
+    assert conflict_result.delegated is False
+    assert conflict_result.reason == "no originating cloud implementation session could be resolved"
+    assert review_result.delivered is False
+    assert review_result == ["Review repair was not delivered for PR #1589: no provider-owned cloud task association was found"]
+    command.assert_not_called()
+
+
+def test_delegation_uses_existing_task_and_actual_pr_branches(tmp_path) -> None:
+    client = FollowupClient()
+    state_path = tmp_path / "repairs.json"
+
+    with (
+        patch("src.auto_coder.pr_processor._resolve_cloud_conflict_origin", return_value=(client, "task_existing")),
+        patch("src.auto_coder.pr_processor._cloud_conflict_state_path", return_value=state_path),
+        patch("src.auto_coder.pr_processor._record_cloud_conflict_deliveries", wraps=_record_cloud_conflict_deliveries) as record,
+    ):
+        assert _delegate_cloud_merge_conflict_repair("owner/repo", pr_data())
+
+    assert len(client.messages) == 1
+    task_id, message = client.messages[0]
+    assert task_id == "task_existing"
+    assert "release/2.x" in message
+    assert "cloud/repair-1589" in message
+    assert "head branch `cloud/repair-1589`" in message
+    assert "H1" in message
+    assert "existing pull request #1589" in message
+    assert "Do not create a new branch." in message
+    assert "Do not create a new pull request." in message
+    assert "Do not replace or close the existing pull request." in message
+
+
+def test_confirmed_delivery_for_old_recipient_does_not_suppress_verified_recipient(tmp_path) -> None:
+    client = FollowupClient()
+    state_path = tmp_path / "repairs.json"
+    old_fingerprint = "owner/repo#1589:H1:B1"
+    _record_cloud_conflict_deliveries(
+        state_path,
+        {old_fingerprint: CloudConflictDeliveryRecord("old-jules", "confirmed")},
+    )
+
+    with (
+        patch("src.auto_coder.pr_processor._resolve_cloud_conflict_origin", return_value=(client, "task_e_verified")),
+        patch("src.auto_coder.pr_processor._cloud_conflict_state_path", return_value=state_path),
+    ):
+        result = _delegate_cloud_merge_conflict_repair_result("owner/repo", pr_data())
+
+    assert result.delegated is True
+    assert client.messages and client.messages[0][0] == "task_e_verified"
+    retained = json.loads(state_path.read_text(encoding="utf-8"))
+    assert retained[old_fingerprint] == {"status": "confirmed", "task_id": "old-jules"}
+    assert retained["owner/repo#1589:H1:B1:task_e_verified"] == {
+        "status": "confirmed",
+        "task_id": "task_e_verified",
+    }
+
+
+def test_production_conflict_path_reports_confirmed_followup_in_actions_and_pr(tmp_path) -> None:
+    """The supported merge path preserves provider acceptance through both outputs."""
+    client = FollowupClient()
+    github = Mock()
+    github.get_pr_comments.return_value = []
+    commands = [
+        CommandResult(True, "", "", 0),
+        CommandResult(True, "3\n", "", 0),
+        CommandResult(False, "CONFLICT", "", 1),
+        CommandResult(True, "", "", 0),
+    ]
+
+    with (
+        patch("src.auto_coder.pr_processor.cmd") as command_executor,
+        patch("src.auto_coder.pr_processor._resolve_cloud_conflict_origin", return_value=(client, "task_e_accepted")),
+        patch("src.auto_coder.pr_processor._cloud_conflict_state_path", return_value=tmp_path / "repairs.json"),
+        patch("src.auto_coder.pr_processor._is_local_llm_pr", return_value=False),
+    ):
+        command_executor.run_command.side_effect = commands
+        actions = _update_with_base_branch("owner/repo", pr_data(), AutomationConfig(), github)
+
+    assert "Codex Cloud task 'task_e_accepted' accepted merge-conflict-repair follow-up for PR #1589 at head H1" in actions
+    assert "Delegated merge-conflict repair for PR #1589 to its existing cloud session" in actions
+    assert "ACTION_FLAG:SKIP_ANALYSIS" in actions
+    comment = github.add_comment_to_pr.call_args.args[2]
+    assert "task_e_accepted" in comment
+    assert "PR #1589" in comment
+    assert "head `H1`" in comment
+    assert "merge-conflict-repair" in comment
+
+
+def test_direct_merge_path_propagates_confirmed_followup_to_action_sink(tmp_path) -> None:
+    """A failed API merge must expose acceptance before deferring cloud repair."""
+    from src.auto_coder.merge_operation_state import MergeOperationStore
+    from src.auto_coder.util.github_request_outcome import DeliveryCertainty, GitHubApiOutcome, GitHubRequestContext, GitHubRequestError, GitHubRequestOutcome, GitHubResponseMetadata, RequestProvenance
+
+    cloud_client = FollowupClient()
+    github = Mock(token="token")
+    github.get_pr_comments.return_value = []
+    api = Mock()
+    # A real conflict is a definitive, cause-specified rejection (not an
+    # HTTP-success body with merged=false, which merge_operation_adapter
+    # treats as indeterminate rather than a confirmed failure -- REQ-005).
+    context = GitHubRequestContext(operation_id="op", attempt_id="attempt", subsystem="test", api_origin="https://api.github.com", method="PUT", kind="mutation", endpoint_template="/pulls/{n}/merge")
+    outcome = GitHubRequestOutcome(context=context, status=405, classification=GitHubApiOutcome.REMOTE_ERROR, provenance=RequestProvenance.NETWORK, delivery=DeliveryCertainty.HTTP_RESPONSE_RECEIVED, metadata=GitHubResponseMetadata(), elapsed_ms=1.0, message="Pull Request is not mergeable")
+    api.pulls.merge.side_effect = GitHubRequestError(outcome)
+    conflicting_pr = pr_data()
+    conflicting_pr["mergeable"] = False
+    api.pulls.get.return_value = conflicting_pr
+
+    store = MergeOperationStore(db_path=tmp_path / "merge_ops.db")
+    with (
+        patch("auto_coder.util.gh_cache.get_ghapi_client", return_value=api),
+        patch("src.auto_coder.merge_operation_adapter.get_ghapi_client", return_value=api),
+        patch("src.auto_coder.merge_operation_state.get_merge_operation_store", return_value=store),
+        patch("src.auto_coder.pr_processor._get_review_thread_gate_state", return_value=Mock(lookup_error=None, has_unresolved=False)),
+        patch("src.auto_coder.pr_processor._get_allowed_merge_methods", return_value=[]),
+        patch("src.auto_coder.pr_processor._resolve_cloud_conflict_origin", return_value=(cloud_client, "task_e_direct")),
+        patch("src.auto_coder.pr_processor._cloud_conflict_state_path", return_value=tmp_path / "repairs.json"),
+        patch("src.auto_coder.pr_processor._resolve_pr_merge_conflicts") as local_resolution,
+        patch("src.auto_coder.pr_processor.log_action") as action_sink,
+    ):
+        merged = _merge_pr("owner/repo", 1589, {}, AutomationConfig(), github)
+
+    assert merged is False
+    assert len(cloud_client.messages) == 1
+    action_sink.assert_any_call("Codex Cloud task 'task_e_direct' accepted merge-conflict-repair follow-up for PR #1589 at head H1")
+    action_sink.assert_any_call("Delegated merge-conflict repair for PR #1589 to its existing cloud session")
+    local_resolution.assert_not_called()
+
+
+def test_delegation_rejects_invalid_metadata_and_uses_provider_task_from_pr_body(tmp_path) -> None:
+    """Exercise conflict delegation through its real task-resolution boundary."""
+    client = FollowupClient()
+    state_path = tmp_path / "repairs.json"
+    pull_request = pr_data()
+    pull_request["_codex_task_id"] = "task_fake"
+    pull_request["body"] = "Closes #1589\n\nhttps://chatgpt.com/codex/tasks/task_e_real123"
+
+    with (
+        patch("src.auto_coder.codex_cloud_client.CodexCloudClient", return_value=client),
+        patch("src.auto_coder.pr_processor._cloud_conflict_state_path", return_value=state_path),
+    ):
+        assert _delegate_cloud_merge_conflict_repair("owner/repo", pull_request) is True
+
+    assert len(client.messages) == 1
+    task_id, message = client.messages[0]
+    assert task_id == "task_e_real123"
+    assert "task_fake" not in message
+    assert state_path.exists()
+
+
+def test_unchanged_state_is_deduplicated_but_changed_states_can_delegate(tmp_path) -> None:
+    client = FollowupClient()
+    state_path = tmp_path / "repairs.json"
+
+    with (
+        patch("src.auto_coder.pr_processor._resolve_cloud_conflict_origin", return_value=(client, "task_existing")),
+        patch("src.auto_coder.pr_processor._cloud_conflict_state_path", return_value=state_path),
+    ):
+        assert _delegate_cloud_merge_conflict_repair("owner/repo", pr_data())
+        assert _delegate_cloud_merge_conflict_repair("owner/repo", pr_data())
+        assert _delegate_cloud_merge_conflict_repair("owner/repo", pr_data(head_sha="H2"))
+        assert _delegate_cloud_merge_conflict_repair("owner/repo", pr_data(head_sha="H2", base_sha="B2"))
+
+    assert [task_id for task_id, _ in client.messages] == ["task_existing"] * 3
+
+
+def test_comment_receipt_is_deduplicated_per_head_and_purpose(tmp_path) -> None:
+    client = FollowupClient()
+    github = Mock()
+    comments: list[dict] = []
+    github.get_pr_comments.side_effect = lambda *_args: list(comments)
+    github.add_comment_to_pr.side_effect = lambda _repo, _number, body: comments.append({"body": body})
+
+    with (
+        patch("src.auto_coder.pr_processor._resolve_cloud_conflict_origin", return_value=(client, "task_existing")),
+        patch("src.auto_coder.pr_processor._cloud_conflict_state_path", return_value=tmp_path / "repairs.json"),
+    ):
+        first = _delegate_cloud_merge_conflict_repair_result("owner/repo", pr_data(), github)
+        repeated = _delegate_cloud_merge_conflict_repair_result("owner/repo", pr_data(), github)
+        advanced = _delegate_cloud_merge_conflict_repair_result("owner/repo", pr_data(head_sha="H2"), github)
+
+    assert first.accepted_action
+    assert repeated.accepted_action
+    assert advanced.accepted_action.endswith("at head H2")
+    assert len(client.messages) == 2
+    assert github.add_comment_to_pr.call_count == 2
+    assert "head `H1`" in comments[0]["body"]
+    assert "head `H2`" in comments[1]["body"]
+
+
+def test_comment_failure_retries_publication_without_resending_followup(tmp_path) -> None:
+    client = FollowupClient()
+    github = Mock()
+    github.get_pr_comments.return_value = []
+    github.add_comment_to_pr.side_effect = [RuntimeError("GitHub unavailable"), None]
+
+    with (
+        patch("src.auto_coder.pr_processor._resolve_cloud_conflict_origin", return_value=(client, "task_existing")),
+        patch("src.auto_coder.pr_processor._cloud_conflict_state_path", return_value=tmp_path / "repairs.json"),
+    ):
+        first = _delegate_cloud_merge_conflict_repair_result("owner/repo", pr_data(), github)
+        second = _delegate_cloud_merge_conflict_repair_result("owner/repo", pr_data(), github)
+
+    assert first.accepted_action == second.accepted_action
+    assert len(client.messages) == 1
+    assert github.add_comment_to_pr.call_count == 2
+
+
+def test_failed_delivery_and_unsupported_provider_preserve_fallback(tmp_path) -> None:
+    state_path = tmp_path / "repairs.json"
+    failed_client = FollowupClient(accepted=False)
+
+    with (
+        patch("src.auto_coder.pr_processor._resolve_cloud_conflict_origin", return_value=(failed_client, "task_existing")),
+        patch("src.auto_coder.pr_processor._cloud_conflict_state_path", return_value=state_path),
+    ):
+        result = _delegate_cloud_merge_conflict_repair_result("owner/repo", pr_data())
+
+    assert not result
+    assert result.reason == "delivery to originating cloud session 'task_existing' was rejected"
+
+    assert len(failed_client.messages) == 1
+    assert state_path.read_text(encoding="utf-8") == "{}"
+
+    unsupported = object.__new__(UnsupportedClient)
+    with (
+        patch("src.auto_coder.pr_processor._resolve_cloud_conflict_origin", return_value=(unsupported, "session_existing")),
+        patch("src.auto_coder.pr_processor._cloud_conflict_state_path", return_value=state_path),
+    ):
+        result = _delegate_cloud_merge_conflict_repair_result("owner/repo", pr_data())
+
+    assert not result
+    assert "does not support repair follow-up" in result.reason
+
+
+def test_missing_origin_preserves_fallback_without_creating_a_task() -> None:
+    with patch("src.auto_coder.pr_processor._resolve_cloud_conflict_origin", return_value=None) as resolver:
+        result = _delegate_cloud_merge_conflict_repair_result("owner/repo", pr_data())
+
+    resolver.assert_called_once()
+    assert not result
+    assert result.reason == "no originating cloud implementation session could be resolved"
+
+
+def test_delivery_is_reserved_before_followup_and_never_redelivered(tmp_path) -> None:
+    """A confirmed send transitions its durable reservation before deduplication."""
+    client = FollowupClient()
+    state_path = tmp_path / "repairs.json"
+
+    with (
+        patch("src.auto_coder.pr_processor._resolve_cloud_conflict_origin", return_value=(client, "task_existing")),
+        patch("src.auto_coder.pr_processor._cloud_conflict_state_path", return_value=state_path),
+        patch("src.auto_coder.pr_processor._record_cloud_conflict_deliveries", wraps=_record_cloud_conflict_deliveries) as record,
+    ):
+        first = _delegate_cloud_merge_conflict_repair_result("owner/repo", pr_data())
+        second = _delegate_cloud_merge_conflict_repair_result("owner/repo", pr_data())
+
+    assert first
+    assert second
+    assert len(client.messages) == 1
+    assert record.call_count == 2
+
+
+def test_dispatch_service_reopens_journal_after_quota_block_without_duplicate_send(tmp_path) -> None:
+    """REQ-006: production dispatch retains deadline and re-enters one journal."""
+    client = FollowupClient()
+    client.backend_name = "claude-routine"
+    state_path = tmp_path / "repairs.json"
+    deadline = 9_999_999_999.0
+    wait_store = MagicMock()
+    wait_store.get.side_effect = [
+        SimpleNamespace(certainty=DeliveryCertainty.NOT_SENT, retry_not_before=deadline),
+        None,
+        None,
+    ]
+
+    with (
+        patch("src.auto_coder.pr_processor._resolve_cloud_conflict_origin", return_value=(client, "task_existing")),
+        patch("src.auto_coder.pr_processor._cloud_conflict_state_path", return_value=state_path),
+        patch("src.auto_coder.pr_processor.get_claude_followup_wait_store", return_value=wait_store),
+        patch("src.auto_coder.pr_processor._record_cloud_conflict_deliveries", wraps=_record_cloud_conflict_deliveries) as record,
+    ):
+        blocked = _dispatch_cloud_conflict_repair("owner/repo", pr_data(), MagicMock())
+        recovered = _dispatch_cloud_conflict_repair("owner/repo", pr_data(), MagicMock())
+        confirmed = _dispatch_cloud_conflict_repair("owner/repo", pr_data(), MagicMock())
+
+    assert blocked.disposition is RepairDisposition.DEFERRED
+    assert blocked.retry_not_before == deadline
+    assert recovered.disposition is RepairDisposition.ACCEPTED_OR_UNCERTAIN
+    assert confirmed.disposition is RepairDisposition.ACCEPTED_OR_UNCERTAIN
+    assert {result.repository for result in (blocked, recovered, confirmed)} == {"owner/repo"}
+    assert {result.input_head for result in (blocked, recovered, confirmed)} == {"H1"}
+    assert {result.base_ref for result in (blocked, recovered, confirmed)} == {"release/2.x"}
+    assert len(client.messages) == 1
+    assert record.call_count == 2
+    assert len(json.loads(state_path.read_text())) == 1
+
+
+class InterruptedJournalClient(FollowupClient):
+    """Expose typed provider receipts and interrupt before the first POST."""
+
+    def __init__(self):
+        super().__init__()
+        self.interrupt = True
+        self.delivery = FollowUpDeliveryOutcome.NOT_DELIVERED
+        self.identities = []
+
+    def get_followup_delivery(self, task_id, logical_identity):
+        self.identities.append((task_id, logical_identity))
+        return self.delivery
+
+    def send_followup(self, task_id, message, logical_identities=()):
+        assert len(logical_identities) == 1
+        if self.interrupt:
+            self.interrupt = False
+            raise KeyboardInterrupt()
+        self.delivery = FollowUpDeliveryOutcome.DELIVERED
+        return super().send_followup(task_id, message)
+
+
+@pytest.mark.parametrize("delivery", list(FollowUpDeliveryOutcome))
+def test_interrupted_conflict_reservation_reconciles_typed_provider_receipt(tmp_path, delivery):
+    client = InterruptedJournalClient()
+    state_path = tmp_path / "repairs.json"
+    with (
+        patch("src.auto_coder.pr_processor._resolve_cloud_conflict_origin", return_value=(client, "task_existing")),
+        patch("src.auto_coder.pr_processor._cloud_conflict_state_path", return_value=state_path),
+    ):
+        with pytest.raises(KeyboardInterrupt):
+            _delegate_cloud_merge_conflict_repair_result("owner/repo", pr_data())
+        pending = json.loads(state_path.read_text())
+        record = next(iter(pending.values()))
+        assert record["status"] == "pending"
+        assert record["logical_identity"].startswith("merge-conflict-repair:")
+        assert client.messages == []
+        client.delivery = delivery
+        result = _delegate_cloud_merge_conflict_repair_result("owner/repo", pr_data())
+        final = next(iter(json.loads(state_path.read_text()).values()))
+        if delivery is FollowUpDeliveryOutcome.INDETERMINATE:
+            api = MagicMock()
+            api.pulls.get.return_value = {**pr_data(), "mergeable": False}
+            route = MergeRouteDisposition()
+            with (
+                patch("src.auto_coder.pr_processor._resolve_pr_merge_conflicts") as local,
+                patch("src.auto_coder.pr_processor._trigger_fallback_for_pr_failure") as fallback,
+            ):
+                merge_attempt = MagicMock()
+                assert not _handle_definitive_merge_rejection("owner/repo", pr_data()["number"], AutomationConfig(), MagicMock(), api, "owner", "repo", MagicMock(), MagicMock(), merge_attempt, "head-sha", route)
+            local.assert_not_called()
+            fallback.assert_not_called()
+            merge_attempt.assert_not_called()
+            assert route.retry_not_before is None
+
+    expected_observations = 2 if delivery is FollowUpDeliveryOutcome.INDETERMINATE else 1
+    assert client.identities == [("task_existing", record["logical_identity"])] * expected_observations
+    if delivery is FollowUpDeliveryOutcome.INDETERMINATE:
+        assert not result
+        assert "not resending" in result.reason
+        assert result.provider
+        assert result.task_id == "task_existing"
+        assert result.receipt_identity == record["logical_identity"]
+        assert result.attempt_started is True
+        assert final == record
+        assert client.messages == []
+    else:
+        assert result
+        assert final["status"] == "confirmed"
+        assert final["logical_identity"] == record["logical_identity"]
+        assert len(client.messages) == (1 if delivery is FollowUpDeliveryOutcome.NOT_DELIVERED else 0)
+
+
+def test_dispatch_defers_behind_active_sender_then_reopens_confirmed_journal(tmp_path):
+    """REQ-006: visible contention defers; re-entry never duplicates the send."""
+    client = FollowupClient()
+    client.backend_name = "claude-routine"
+    state_path = tmp_path / "repairs.json"
+    entered = threading.Event()
+    release = threading.Event()
+    results = []
+    original_send = client.send_followup
+
+    def send(task_id, message):
+        entered.set()
+        assert release.wait(timeout=5)
+        return original_send(task_id, message)
+
+    client.send_followup = send
+    with (
+        patch("src.auto_coder.pr_processor._resolve_cloud_conflict_origin", return_value=(client, "task_existing")),
+        patch("src.auto_coder.pr_processor._cloud_conflict_state_path", return_value=state_path),
+        patch("src.auto_coder.pr_processor._record_cloud_conflict_deliveries", wraps=_record_cloud_conflict_deliveries) as record,
+    ):
+        thread = threading.Thread(target=lambda: results.append(_dispatch_cloud_conflict_repair("owner/repo", pr_data(), MagicMock())))
+        thread.start()
+        try:
+            assert entered.wait(timeout=5)
+            deferred = _dispatch_cloud_conflict_repair("owner/repo", pr_data(), MagicMock())
+            assert deferred.disposition is RepairDisposition.DEFERRED
+            assert deferred.retry_not_before is not None
+            assert deferred.retry_not_before > 0
+            assert deferred.repository == "owner/repo"
+            assert deferred.input_head == "H1"
+            assert deferred.base_ref == "release/2.x"
+            assert next(iter(json.loads(state_path.read_text()).values()))["status"] == "pending"
+        finally:
+            release.set()
+            thread.join(timeout=5)
+        assert not thread.is_alive()
+        recovered = _dispatch_cloud_conflict_repair("owner/repo", pr_data(), MagicMock())
+    assert len(results) == 1
+    assert results[0].disposition is RepairDisposition.ACCEPTED_OR_UNCERTAIN
+    assert recovered.disposition is RepairDisposition.ACCEPTED_OR_UNCERTAIN
+    assert recovered.receipt_state.value == "unknown"
+    assert len(client.messages) == 1
+    assert record.call_count == 2
+    assert next(iter(json.loads(state_path.read_text()).values()))["status"] == "confirmed"
+
+
+@pytest.mark.parametrize("delivery", list(FollowUpDeliveryOutcome))
+def test_reconciled_conflict_delivery_emits_truthful_remediation_stage(tmp_path, delivery):
+    client = InterruptedJournalClient()
+    state_path = tmp_path / "repairs.json"
+    collector = TraceCollector()
+    api = MagicMock()
+    api.pulls.get.return_value = pr_data()
+    with (
+        patch("src.auto_coder.pr_processor._resolve_cloud_conflict_origin", return_value=(client, "task_existing")),
+        patch("src.auto_coder.pr_processor._cloud_conflict_state_path", return_value=state_path),
+        patch("src.auto_coder.pr_processor.get_trace_collector", return_value=collector),
+        patch("src.auto_coder.pr_processor.check_pr_repair_exhaustion", return_value=None),
+        patch("src.auto_coder.pr_processor.GitHubClient.get_instance"),
+        patch("src.auto_coder.pr_processor.get_ghapi_client", return_value=api),
+        patch("src.auto_coder.pr_processor._checkout_pr_branch", return_value=True),
+        patch("src.auto_coder.pr_processor.BranchManager", return_value=nullcontext()),
+        patch("src.auto_coder.pr_processor._is_local_llm_pr", return_value=False),
+        patch("src.auto_coder.pr_processor.cmd") as commands,
+    ):
+        with pytest.raises(KeyboardInterrupt):
+            _delegate_cloud_merge_conflict_repair_result("owner/repo", pr_data())
+        client.delivery = delivery
+        commands.run_command.side_effect = [
+            CommandResult(True, "", "", 0),
+            CommandResult(True, "3\n", "", 0),
+            CommandResult(False, "CONFLICT", "", 1),
+            CommandResult(True, "", "", 0),
+        ]
+        with collector.start_execution("owner/repo", "pr", 1589, origin="explicit-only") as execution:
+            actions = _start_mergeability_remediation(1589, "dirty", "owner/repo")
+
+    events = [event for event in collector.get_snapshot(repository="owner/repo", item_type="pr", item_number=1589).events if event.stage_id == "pr.mergeability-remediation" and event.execution_id == execution.scope.execution_id]
+    assert len(events) == 1
+    event = events[0]
+    assert event.facts["state"] == "dirty"
+    if delivery is FollowUpDeliveryOutcome.INDETERMINATE:
+        assert event.outcome == "deferred"
+        assert event.facts["result"] == "unconfirmed"
+        assert not any("Delegated merge-conflict repair" in action for action in actions)
+    else:
+        assert event.outcome == "accepted_handoff"
+        assert event.facts["result"] == "delegated"
+        assert any("Delegated merge-conflict repair" in action for action in actions)
+
+
+def test_reservation_failure_prevents_non_idempotent_delivery(tmp_path) -> None:
+    """Never send when the durable unchanged-state guard cannot be written."""
+    client = FollowupClient()
+
+    with (
+        patch("src.auto_coder.pr_processor._resolve_cloud_conflict_origin", return_value=(client, "task_existing")),
+        patch("src.auto_coder.pr_processor._cloud_conflict_state_path", return_value=tmp_path / "repairs.json"),
+        patch("src.auto_coder.pr_processor._record_cloud_conflict_deliveries", side_effect=OSError("read-only filesystem")),
+    ):
+        result = _delegate_cloud_merge_conflict_repair_result("owner/repo", pr_data())
+
+    assert not result
+    assert result.reason == "a durable repair delivery receipt could not be reserved: read-only filesystem"
+    assert client.messages == []
+
+
+def test_rejected_delivery_with_failed_cleanup_is_not_reported_as_delegated(tmp_path) -> None:
+    """Production remediation treats a stranded reservation as unconfirmed."""
+    client = FollowupClient(accepted=False)
+    state_path = tmp_path / "repairs.json"
+    write_count = 0
+    commands = [
+        CommandResult(True, "", "", 0),
+        CommandResult(True, "3\n", "", 0),
+        CommandResult(False, "CONFLICT", "", 1),
+        CommandResult(True, "", "", 0),
+    ] * 2
+
+    def fail_cleanup(path, deliveries) -> None:
+        nonlocal write_count
+        write_count += 1
+        if write_count == 2:
+            raise OSError("cleanup unavailable")
+        _record_cloud_conflict_deliveries(path, deliveries)
+
+    with (
+        patch("src.auto_coder.pr_processor.cmd") as command_executor,
+        patch("src.auto_coder.pr_processor._resolve_cloud_conflict_origin", return_value=(client, "task_existing")),
+        patch("src.auto_coder.pr_processor._cloud_conflict_state_path", return_value=state_path),
+        patch("src.auto_coder.pr_processor._record_cloud_conflict_deliveries", side_effect=fail_cleanup),
+        patch("src.auto_coder.pr_processor._is_local_llm_pr", return_value=False),
+    ):
+        command_executor.run_command.side_effect = commands
+        first = _update_with_base_branch("owner/repo", pr_data(), AutomationConfig())
+        second = _update_with_base_branch("owner/repo", pr_data(), AutomationConfig())
+
+    assert any("was rejected" in action and "reservation could not be cleared" in action for action in first)
+    assert any("has unconfirmed status" in action and "not resending" in action for action in second)
+    assert "ACTION_FLAG:SKIP_ANALYSIS" in first
+    assert "ACTION_FLAG:SKIP_ANALYSIS" in second
+    assert not any("Delegated merge-conflict repair" in action for action in first + second)
+    assert len(client.messages) == 1
+
+
+def test_production_conflict_path_reports_rejected_cloud_delivery(tmp_path) -> None:
+    """A resolved session's rejection is reported instead of misclassified."""
+    client = FollowupClient(accepted=False)
+    state_path = tmp_path / "repairs.json"
+    commands = [
+        CommandResult(True, "", "", 0),
+        CommandResult(True, "3\n", "", 0),
+        CommandResult(False, "CONFLICT", "", 1),
+        CommandResult(True, "", "", 0),
+    ]
+
+    with (
+        patch("src.auto_coder.pr_processor.cmd") as command_executor,
+        patch("src.auto_coder.pr_processor._resolve_cloud_conflict_origin", return_value=(client, "task_existing")),
+        patch("src.auto_coder.pr_processor._cloud_conflict_state_path", return_value=state_path),
+        patch("src.auto_coder.pr_processor._is_local_llm_pr", return_value=False),
+    ):
+        command_executor.run_command.side_effect = commands
+        actions = _update_with_base_branch("owner/repo", pr_data(), AutomationConfig())
+
+    assert len(client.messages) == 1
+    assert any("delivery to originating cloud session 'task_existing' was rejected" in action for action in actions)
+    assert "ACTION_FLAG:SKIP_ANALYSIS" in actions
+    assert not any("no usable cloud conflict-repair session" in action for action in actions)
+    assert not any("remediation completed" in action.lower() for action in actions)
+
+
+def test_authoritative_cloud_run_association_precedes_pr_author_heuristics() -> None:
+    """A lifecycle-associated PR remains cloud-owned without author markers."""
+    run = CloudRun(
+        repo_name="owner/repo",
+        issue_number=1589,
+        attempt=2,
+        provider="codex-cloud",
+        task_id="task_e_authoritative",
+        pull_request_numbers=[1589],
+    )
+    unmarked_pr = pr_data()
+    unmarked_pr["body"] = "Closes #1589"
+    unmarked_pr["user"] = {"login": "ordinary-user"}
+
+    with (
+        patch("src.auto_coder.cloud_run.CloudRunRepository.list_for_issue", return_value=[run]),
+        patch("src.auto_coder.codex_cloud_client.CodexCloudClient") as client_type,
+    ):
+        origin = _resolve_cloud_conflict_origin("owner/repo", unmarked_pr)
+
+    assert origin is not None
+    client, task_id = origin
+    assert client is client_type.return_value
+    assert task_id == "task_e_authoritative"
+    client_type.assert_called_once_with(repo_name="owner/repo")
+
+
+@pytest.mark.parametrize("resolved", [True, False])
+def test_local_conflict_repair_emits_confirmed_remediation_outcome(tmp_path, resolved):
+    """Local publication completes remediation; leftover markers do not close PRs."""
+    collector = TraceCollector()
+    api = MagicMock()
+    local_pr = pr_data()
+    local_pr["body"] = "<!-- auto-coder:local-llm -->\nCloses #5456"
+    local_pr["user"] = {"login": "kitamura-tetsuo"}
+    local_pr["head"]["ref"] = "issue-5456"
+    api.pulls.get.return_value = local_pr
+    dispatches = []
+
+    def capture_dispatch(request, operation):
+        result = operation(request)
+        dispatches.append((request, result))
+        return result
+
+    with (
+        patch("src.auto_coder.pr_processor._resolve_cloud_conflict_origin", return_value=None),
+        patch("src.auto_coder.pr_processor.dispatch_pr_repair", side_effect=capture_dispatch),
+        patch("src.auto_coder.pr_processor._cloud_conflict_state_path", return_value=tmp_path / "repairs.json"),
+        patch("src.auto_coder.pr_processor.get_trace_collector", return_value=collector),
+        patch("src.auto_coder.pr_processor.check_pr_repair_exhaustion", return_value=None),
+        patch("src.auto_coder.pr_processor.GitHubClient.get_instance") as github,
+        patch("src.auto_coder.pr_processor.get_ghapi_client", return_value=api),
+        patch("src.auto_coder.pr_processor._checkout_pr_branch", return_value=True),
+        patch("src.auto_coder.pr_processor.BranchManager", return_value=nullcontext()),
+        patch("src.auto_coder.conflict_resolver._perform_base_branch_merge_and_conflict_resolution", return_value=resolved) as repair,
+        patch("src.auto_coder.conflict_resolver.scan_conflict_markers", return_value=[] if resolved else ["app.txt"]),
+        patch("src.auto_coder.pr_processor.cmd") as commands,
+    ):
+        commands.run_command.side_effect = [
+            CommandResult(True, "", "", 0),
+            CommandResult(True, "3\n", "", 0),
+            CommandResult(False, "CONFLICT", "", 1),
+            CommandResult(True, "H2\n", "", 0),
+        ]
+        with collector.start_execution("owner/repo", "pr", 1589, origin="explicit-only") as execution:
+            actions = _start_mergeability_remediation(1589, "dirty", "owner/repo")
+
+    repair.assert_called_once()
+    local_dispatches = [(request, result) for request, result in dispatches if request.origin.value == "local"]
+    assert len(local_dispatches) == 1
+    assert local_dispatches[0][0].local_origin == "synchronous-local-conflict-repair"
+    assert local_dispatches[0][1].synchronized is resolved
+    github.return_value.close_pr.assert_not_called()
+    assert "ACTION_FLAG:DEGRADING_MERGE_SKIP_MERGE" not in actions
+    events = [event for event in collector.get_snapshot(repository="owner/repo", item_type="pr", item_number=1589).events if event.stage_id == "pr.mergeability-remediation" and event.execution_id == execution.scope.execution_id]
+    assert len(events) == 1
+    assert events[0].outcome == ("completed" if resolved else "failed")
+    assert events[0].facts["result"] == ("success" if resolved else "failed")
+
+
+def test_jules_conflict_enters_typed_dispatch_with_existing_guard_and_session() -> None:
+    """REQ-001: the production base-update route retains Jules ownership."""
+    pull_request = pr_data()
+    pull_request["body"] = "Session ID: session_jules_conflict"
+    pull_request["user"] = {"login": "google-labs-jules[bot]"}
+    requests = []
+
+    def capture_dispatch(request, operation):
+        requests.append(request)
+        return operation(request)
+
+    commands = [
+        CommandResult(True, "", "", 0),
+        CommandResult(True, "2\n", "", 0),
+        CommandResult(False, "", "conflict", 1),
+    ]
+    with (
+        patch("src.auto_coder.pr_processor.cmd") as command_executor,
+        patch("src.auto_coder.pr_processor._is_jules_pr", return_value=True),
+        patch("src.auto_coder.pr_processor._guard_outbound_jules_send", return_value=True) as guard,
+        patch("src.auto_coder.pr_processor.dispatch_pr_repair", side_effect=capture_dispatch),
+        patch("auto_coder.jules_client.JulesClient") as jules_type,
+    ):
+        command_executor.run_command.side_effect = commands
+        actions = _update_with_base_branch("owner/repo", pull_request, AutomationConfig())
+
+    assert len(requests) == 1
+    assert requests[0].origin is RepairOrigin.JULES
+    assert requests[0].owner_identity == "session_jules_conflict"
+    assert requests[0].kind.value == "merge_conflict"
+    guard.assert_called_once()
+    jules_type.return_value.send_message.assert_called_once()
+    assert actions.repair_result is not None
+    assert actions.repair_result.disposition is RepairDisposition.ACCEPTED_OR_UNCERTAIN

@@ -1,0 +1,362 @@
+"""
+Unit tests for CloudManager.
+"""
+
+import csv
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+from src.auto_coder.cloud_manager import CloudManager
+
+
+class TestCloudManager:
+    """Test suite for CloudManager."""
+
+    def test_init_default_path(self):
+        """Test that CloudManager creates the correct default path."""
+        repo_name = "owner/repo"
+        manager = CloudManager(repo_name)
+        assert manager.repo_name == repo_name
+        expected_path = Path.home() / ".auto-coder" / repo_name / "cloud.csv"
+        assert manager.cloud_file_path == expected_path
+
+    def test_init_custom_path(self):
+        """Test that CloudManager uses custom path when provided."""
+        repo_name = "owner/repo"
+        custom_path = Path("/custom/path/cloud.csv")
+        manager = CloudManager(repo_name, cloud_file_path=custom_path)
+        assert manager.repo_name == repo_name
+        assert manager.cloud_file_path == custom_path
+
+    def test_add_session(self):
+        """Test adding a session for an issue."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cloud_file = Path(tmpdir) / "cloud.csv"
+            manager = CloudManager("owner/repo", cloud_file_path=cloud_file)
+
+            # Add a session
+            result = manager.add_session(123, "session-abc")
+            assert result is True
+            assert cloud_file.exists()
+
+            # Verify the CSV content
+            with open(cloud_file, "r") as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+                assert len(rows) == 1
+                assert rows[0]["issue_number"] == "123"
+                assert rows[0]["session_id"] == "session-abc"
+                assert rows[0]["backend_name"] == ""
+
+    def test_provider_binding_survives_new_manager_instance(self, tmp_path):
+        """A production-written association retains ownership after restart."""
+        cloud_file = tmp_path / "cloud.csv"
+        assert CloudManager("owner/repo", cloud_file).add_session(1677, "11778985556824899970", provider="jules")
+
+        restarted = CloudManager("owner/repo", cloud_file)
+        binding = restarted.get_binding(1677)
+
+        assert binding is not None
+        assert binding.provider == "jules"
+        assert binding.task_id == "11778985556824899970"
+        assert binding.backend_name == ""
+
+    def test_legacy_claude_binding_uses_historical_backend_identity(self, tmp_path):
+        cloud_file = tmp_path / "cloud.csv"
+        cloud_file.write_text(
+            "issue_number,provider,session_id\n1748,claude-routine,legacy-session\n",
+            encoding="utf-8",
+        )
+
+        binding = CloudManager("owner/repo", cloud_file).get_binding(1748)
+
+        assert binding is not None
+        assert binding.provider == "claude-routine"
+        assert binding.backend_name == "claude-routine"
+        assert binding.task_id == "legacy-session"
+
+    def test_task_lookup_exposes_conflicting_backend_ownership(self, tmp_path):
+        manager = CloudManager("owner/repo", tmp_path / "cloud.csv")
+        assert manager.add_session(1, "shared-session", provider="claude-routine", backend_name="claude-a")
+        assert manager.add_session(2, "shared-session", provider="claude-routine", backend_name="claude-b")
+
+        bindings = manager.get_bindings_for_task("claude-routine", "shared-session")
+
+        assert [binding.backend_name for binding in bindings] == ["claude-a", "claude-b"]
+        assert manager.get_issues_by_session("shared-session") == (1, 2)
+        assert manager.get_issue_by_session("shared-session") is None
+
+    def test_legacy_session_without_provider_is_not_routable(self, tmp_path):
+        cloud_file = tmp_path / "cloud.csv"
+        cloud_file.write_text("issue_number,session_id\n1677,opaque-task\n", encoding="utf-8")
+
+        manager = CloudManager("owner/repo", cloud_file)
+
+        assert manager.get_session_id(1677) == "opaque-task"
+        assert manager.get_binding(1677) is None
+
+    def test_add_session_creates_directory(self):
+        """Test that add_session creates the directory if it doesn't exist."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create a path with non-existent nested directory
+            cloud_file = Path(tmpdir) / "nonexistent" / "dir" / "cloud.csv"
+            manager = CloudManager("owner/repo", cloud_file_path=cloud_file)
+
+            # Add session should create the directory
+            result = manager.add_session(123, "session-abc")
+            assert result is True
+            assert cloud_file.exists()
+
+    def test_add_multiple_sessions(self):
+        """Test adding multiple sessions."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cloud_file = Path(tmpdir) / "cloud.csv"
+            manager = CloudManager("owner/repo", cloud_file_path=cloud_file)
+
+            # Add multiple sessions
+            manager.add_session(123, "session-abc")
+            manager.add_session(456, "session-def")
+            manager.add_session(789, "session-xyz")
+
+            # Verify all sessions are stored
+            assert manager.get_session_id(123) == "session-abc"
+            assert manager.get_session_id(456) == "session-def"
+            assert manager.get_session_id(789) == "session-xyz"
+
+    def test_add_duplicate_issue_updates_session(self):
+        """Test that adding a session for the same issue updates it."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cloud_file = Path(tmpdir) / "cloud.csv"
+            manager = CloudManager("owner/repo", cloud_file_path=cloud_file)
+
+            # Add initial session
+            manager.add_session(123, "session-abc")
+            assert manager.get_session_id(123) == "session-abc"
+
+            # Update session for same issue
+            manager.add_session(123, "session-xyz")
+            assert manager.get_session_id(123) == "session-xyz"
+
+            # Verify only one entry exists
+            with open(cloud_file, "r") as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+                assert len(rows) == 1
+                assert rows[0]["issue_number"] == "123"
+                assert rows[0]["session_id"] == "session-xyz"
+
+    def test_get_session_id_exists(self):
+        """Test getting a session ID that exists."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cloud_file = Path(tmpdir) / "cloud.csv"
+            manager = CloudManager("owner/repo", cloud_file_path=cloud_file)
+
+            # Add a session
+            manager.add_session(123, "session-abc")
+
+            # Get the session
+            session_id = manager.get_session_id(123)
+            assert session_id == "session-abc"
+
+    def test_get_session_id_not_exists(self):
+        """Test getting a session ID that doesn't exist."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cloud_file = Path(tmpdir) / "cloud.csv"
+            manager = CloudManager("owner/repo", cloud_file_path=cloud_file)
+
+            # Get session for non-existent issue
+            session_id = manager.get_session_id(999)
+            assert session_id is None
+
+    def test_get_session_id_empty_file(self):
+        """Test getting a session ID from an empty CSV file."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cloud_file = Path(tmpdir) / "cloud.csv"
+            cloud_file.touch()  # Create empty file
+            manager = CloudManager("owner/repo", cloud_file_path=cloud_file)
+
+            session_id = manager.get_session_id(123)
+            assert session_id is None
+
+    def test_is_managed_true(self):
+        """Test is_managed returns True for an issue with a session."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cloud_file = Path(tmpdir) / "cloud.csv"
+            manager = CloudManager("owner/repo", cloud_file_path=cloud_file)
+
+            # Add a session
+            manager.add_session(123, "session-abc")
+
+            # Check if managed
+            assert manager.is_managed(123) is True
+
+    def test_is_managed_false(self):
+        """Test is_managed returns False for an issue without a session."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cloud_file = Path(tmpdir) / "cloud.csv"
+            manager = CloudManager("owner/repo", cloud_file_path=cloud_file)
+
+            # Don't add any session for issue 999
+
+            # Check if managed
+            assert manager.is_managed(999) is False
+
+    def test_csv_header(self):
+        """Test that CSV file has correct header."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cloud_file = Path(tmpdir) / "cloud.csv"
+            manager = CloudManager("owner/repo", cloud_file_path=cloud_file)
+
+            # Add a session
+            manager.add_session(123, "session-abc")
+
+            # Verify header
+            with open(cloud_file, "r") as f:
+                reader = csv.reader(f)
+                header = next(reader)
+                assert header == ["issue_number", "provider", "backend_name", "session_id"]
+
+    def test_csv_sorted_by_issue_number(self):
+        """Test that CSV entries are sorted by issue number."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cloud_file = Path(tmpdir) / "cloud.csv"
+            manager = CloudManager("owner/repo", cloud_file_path=cloud_file)
+
+            # Add sessions in random order
+            manager.add_session(789, "session-xyz")
+            manager.add_session(123, "session-abc")
+            manager.add_session(456, "session-def")
+
+            # Verify sorted order
+            with open(cloud_file, "r") as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+                assert len(rows) == 3
+                assert rows[0]["issue_number"] == "123"
+                assert rows[0]["session_id"] == "session-abc"
+                assert rows[1]["issue_number"] == "456"
+                assert rows[1]["session_id"] == "session-def"
+                assert rows[2]["issue_number"] == "789"
+                assert rows[2]["session_id"] == "session-xyz"
+
+    def test_thread_safety(self):
+        """Test that operations are thread-safe."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cloud_file = Path(tmpdir) / "cloud.csv"
+            manager = CloudManager("owner/repo", cloud_file_path=cloud_file)
+
+            # Simulate concurrent access
+            def add_session(issue_num):
+                manager.add_session(issue_num, f"session-{issue_num}")
+
+            # Create multiple threads
+            import threading
+
+            threads = []
+            for i in range(10):
+                thread = threading.Thread(target=add_session, args=(i,))
+                threads.append(thread)
+                thread.start()
+
+            # Wait for all threads to complete
+            for thread in threads:
+                thread.join()
+
+            # Verify all sessions were added
+            for i in range(10):
+                assert manager.get_session_id(i) == f"session-{i}"
+
+    def test_invalid_csv_handling(self):
+        """Test handling of invalid CSV file."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cloud_file = Path(tmpdir) / "cloud.csv"
+            # Create invalid CSV
+            with open(cloud_file, "w") as f:
+                f.write("invalid,csv,content\nwithout,proper,headers\n")
+
+            manager = CloudManager("owner/repo", cloud_file_path=cloud_file)
+
+            # Should return None for non-existent issue
+            session_id = manager.get_session_id(123)
+            assert session_id is None
+
+            # Should return False for non-existent issue
+            assert manager.is_managed(123) is False
+
+    def test_malformed_csv_row_handling(self):
+        """Test handling of malformed CSV rows."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cloud_file = Path(tmpdir) / "cloud.csv"
+            # Create CSV with some valid and some invalid rows
+            with open(cloud_file, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["issue_number", "session_id"])
+                writer.writerow(["123", "session-abc"])
+                writer.writerow(["invalid", "row"])  # Missing fields
+                writer.writerow(["456"])  # Only issue_number
+
+            manager = CloudManager("owner/repo", cloud_file_path=cloud_file)
+
+            # Should handle malformed rows gracefully
+            assert manager.get_session_id(123) == "session-abc"
+            assert manager.get_session_id(456) is None
+
+    def test_special_characters_in_session_id(self):
+        """Test handling of special characters in session ID."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cloud_file = Path(tmpdir) / "cloud.csv"
+            manager = CloudManager("owner/repo", cloud_file_path=cloud_file)
+
+            # Add session with special characters
+            special_session = "session-abc-123_456@domain.com"
+            manager.add_session(123, special_session)
+
+            # Verify session is stored correctly
+            session_id = manager.get_session_id(123)
+            assert session_id == special_session
+
+    def test_large_session_id(self):
+        """Test handling of large session IDs."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cloud_file = Path(tmpdir) / "cloud.csv"
+            manager = CloudManager("owner/repo", cloud_file_path=cloud_file)
+
+            # Add session with large session ID
+            large_session = "session-" + "x" * 10000
+            manager.add_session(123, large_session)
+
+            # Verify session is stored correctly
+            session_id = manager.get_session_id(123)
+            assert session_id == large_session
+
+    def test_file_permission_error_handling(self):
+        """Test handling of file permission errors."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cloud_file = Path(tmpdir) / "cloud.csv"
+            # Create a directory instead of a file to cause permission error
+            cloud_file.mkdir()
+
+            manager = CloudManager("owner/repo", cloud_file_path=cloud_file)
+
+            # Operations should fail gracefully
+            assert manager.add_session(123, "session-abc") is False
+            assert manager.get_session_id(123) is None
+            assert manager.is_managed(123) is False
+
+    def test_claude_routine_session_prefix_equivalence(self):
+        """Test that session_ and cse_ prefixes with identical IDs match."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cloud_file = Path(tmpdir) / "cloud.csv"
+            manager = CloudManager("owner/repo", cloud_file_path=cloud_file)
+
+            manager.add_session(2124, "cse_013LQWaEue387YHUzLAM6G85", provider="claude-routine", backend_name="claude-sonnet-routine")
+
+            # Lookup by session_ variant should find issue 2124
+            assert manager.get_issue_by_session("session_013LQWaEue387YHUzLAM6G85") == 2124
+            # Lookup by cse_ variant should also find issue 2124
+            assert manager.get_issue_by_session("cse_013LQWaEue387YHUzLAM6G85") == 2124
+            # Unrelated session ID should return None
+            assert manager.get_issue_by_session("session_other999") is None

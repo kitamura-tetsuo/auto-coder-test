@@ -1,0 +1,65 @@
+"""Shared marker for a cloud implementation agent's "addressed" claim on a PR review thread.
+
+Auto-Coder can delegate an unresolved GitHub PR review thread to a cloud
+implementation agent. The agent must fix the reported problem and explain why
+it believes the finding has been addressed, but it must never resolve the
+GitHub review thread itself: that decision belongs to a later, independent
+validation pass. To let that later pass distinguish an explicit
+implementation-complete claim from ordinary discussion (e.g. "I think this is
+fixed"), the agent's reply must contain this stable, versioned marker.
+"""
+
+import re
+
+from .review_adjudication import is_adjudication_envelope
+
+REVIEW_ADDRESSED_MARKER_VERSION = "v1"
+
+REVIEW_ADDRESSED_MARKER = f"<!-- auto-coder-review-addressed:{REVIEW_ADDRESSED_MARKER_VERSION} -->"
+
+_REVIEW_ADDRESSED_MARKER_RE = re.compile(r"<!--\s*auto-coder-review-addressed:[^>]+-->")
+
+
+def reply_claims_review_addressed(body: str) -> bool:
+    """Return whether a review-thread reply carries the Auto-Coder addressed marker.
+
+    Ordinary natural-language phrases such as "fixed" or "done" never count;
+    only the presence of the explicit, versioned marker does.
+    """
+    if not isinstance(body, str):
+        return False
+    return bool(_REVIEW_ADDRESSED_MARKER_RE.search(body))
+
+
+REVIEW_GUIDANCE_MARKER = "<!-- auto-coder-review-guidance:v1 -->"
+
+
+def _review_guidance_body(body: str) -> str:
+    """Remove terminal role declarations without modifying substantive prose."""
+    guidance = body.rstrip()
+    while guidance.endswith("\n" + REVIEW_GUIDANCE_MARKER):
+        guidance = guidance[: -len(REVIEW_GUIDANCE_MARKER)].rstrip()
+    return "" if guidance == REVIEW_GUIDANCE_MARKER else guidance
+
+
+def is_adjudication_feedback(body: str) -> bool:
+    """Keep role declarations from laundering an adjudication into prose.
+
+    This is an intake exclusion only. It does not change adjudication parsing,
+    authentication, acceptance, or effect ownership. Repeated same-comment
+    annotations cannot change the result.
+    """
+    return is_adjudication_envelope(_review_guidance_body(body))
+
+
+def reply_requests_review_correction(body: str) -> bool:
+    """Recognize explicit reviewer guidance when the account also implements.
+
+    The final standalone marker declares the role of this reply, not authority
+    to adjudicate or close a finding. An addressed claim wins over conflicting
+    role declarations. Unmarked prose remains ambiguous and is never guessed.
+    """
+    if not isinstance(body, str) or not body.rstrip().endswith("\n" + REVIEW_GUIDANCE_MARKER) or reply_claims_review_addressed(body):
+        return False
+    guidance = _review_guidance_body(body)
+    return bool(guidance) and not is_adjudication_feedback(body)

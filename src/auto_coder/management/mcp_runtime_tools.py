@@ -1,0 +1,1084 @@
+"""Authenticated, bounded runtime MCP tools over fixed Supervisor bridges."""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import re
+import threading
+import time
+import uuid
+from dataclasses import asdict, dataclass
+from typing import Callable
+
+from mcp.types import ToolAnnotations
+from pydantic import StrictInt
+
+from auto_coder.operating_policy import ActionClass, DecisionOutcome, OperatingPolicy, PolicyIntent, TargetChannel, evaluate_snapshot, load_operating_policy
+from auto_coder.tested_source_refs import TestedSourcePublisher
+from auto_coder.util.gh_cache import GitHubGitDataClient
+
+from .action_scopes import DEPLOY_SCOPE, OPERATE_SCOPE, READ_SCOPE
+from .action_scopes import AcceptedAuthority as GrantAuthority
+from .action_scopes import PendingAuthorityStatus
+from .beta_runtime_smoke import ACTION as BETA_ACCEPTANCE_ACTION
+from .beta_runtime_smoke import BetaRuntimeSmokeProducer, SmokeProfile
+from .mcp_resource import ManagementTool, current_management_grant
+from .oauth_config import ManagementSettings
+from .oauth_grants import AuthenticatedGrant, OAuthGrantService
+from .operation_executor import ManagementOperationDispatcher, OperationHandler
+from .operation_store import ManagementOperationStore
+from .operations import (
+    AcceptedAuthority,
+    ActionParameter,
+    AdmissionStatus,
+    EffectReceipt,
+    EffectState,
+    ManagedTarget,
+    MutationStatus,
+    OperationIntent,
+    OperationPhase,
+    OperationRecord,
+    ReadStatus,
+)
+from .release_worker_deployment import ReleaseWorkerEvidenceIdentity
+from .retained_journal import RetainedGuardedOperationStore, RetainedJournal
+from .self_update_operation import ManagementSelfUpdateHandler
+from .self_update_policy import ManagementUpdateAction
+from .source_acceptance import BetaAcceptanceHandler, SourceAcceptancePublisher
+from .source_evidence import BetaEvidenceReader, SourceEvidenceError
+from .source_release_dispatch import ACTION as SOURCE_RELEASE_ACTION
+from .source_release_dispatch import INPUT_FIELDS as SOURCE_RELEASE_FIELDS
+from .source_release_dispatch import SourceReleaseDispatch
+from .worker_lifecycle import LIFECYCLE_ACTIONS, WorkerLifecycle
+from .worker_network_client import WorkerNetworkClient, WorkerNetworkResult
+
+REEVALUATE_ACTION = "reevaluate_target"
+_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
+_IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}\Z")
+_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
+_SHA = re.compile(r"[a-f0-9]{64}\Z")
+_LOG_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
+_CURSOR = re.compile(r"[A-Za-z0-9_-]{1,1024}\Z")
+_ATTEMPT_ID = re.compile(r"[0-9a-f]{32}\Z")
+
+
+@dataclass(frozen=True)
+class ResolvedWorker:
+    target_id: str
+    client: WorkerNetworkClient
+    policy_revision: str
+
+    @property
+    def target(self) -> ManagedTarget:
+        config = self.client.config
+        return ManagedTarget(config.instance_id, config.channel, config.repository)
+
+
+class ManagementRuntime:
+    """One service-lifetime adapter, with no Docker or worker scheduling powers."""
+
+    def __init__(
+        self,
+        settings: ManagementSettings,
+        grants: OAuthGrantService,
+        clients: dict[str, WorkerNetworkClient],
+        *,
+        self_update_source_authority: TestedSourcePublisher | None = None,
+        retained_journal: RetainedJournal | None = None,
+        beta_acceptance_source: BetaEvidenceReader | None = None,
+        beta_acceptance_publisher: SourceAcceptancePublisher | None = None,
+        beta_acceptance_profile: SmokeProfile | None = None,
+    ) -> None:
+        self.settings = settings
+        self.grants = grants
+        self.clients = {client.config.target_id or client.config.instance_id: client for client in clients.values()}
+        if len(self.clients) != len(clients):
+            raise ValueError("duplicate configured worker target")
+        clients = self.clients
+        self._startup_bindings = {target_id: client.config.binding_digest for target_id, client in clients.items()}
+        self.retained_journal = retained_journal
+        self.journal = RetainedGuardedOperationStore(settings.operation_state_root or settings.state_root, retained_journal) if retained_journal is not None else ManagementOperationStore(settings.operation_state_root or settings.state_root)
+        self.dispatcher = ManagementOperationDispatcher(self.journal, effect_guard=self.retained_effect_permitted)
+        self.dispatcher.register(REEVALUATE_ACTION, OperationHandler(self._forward_reevaluation, self._reconcile_reevaluation))
+        self.self_update = ManagementSelfUpdateHandler(settings, grants, self.journal, self_update_source_authority)
+        self.dispatcher.register(ManagementUpdateAction.SELF_UPDATE.value, OperationHandler(self.self_update.forward, self.self_update.reconcile))
+        self.source_release = SourceReleaseDispatch(self)
+        self.dispatcher.register(SOURCE_RELEASE_ACTION, OperationHandler(self.source_release.process, self.source_release.process))
+        self._worker_locks = {target_id: threading.RLock() for target_id in clients}
+        self.lifecycle = WorkerLifecycle(self)
+        for action in sorted(LIFECYCLE_ACTIONS):
+            self.dispatcher.register(action, OperationHandler(self.lifecycle.process, self.lifecycle.process))
+        self.beta_acceptance: BetaAcceptanceHandler | None = None
+        beta_clients = {target_id: client for target_id, client in clients.items() if client.config.channel == "beta"}
+        repository = settings.source_repository
+        if beta_clients and repository is not None:
+            source = beta_acceptance_source
+            publisher = beta_acceptance_publisher
+            if source is None or publisher is None:
+                token = ""
+                if settings.source_evidence_token_file is not None:
+                    token = settings.source_evidence_token_file.read_text(encoding="utf-8").strip()
+                git = GitHubGitDataClient(token, repository)
+                source = source or BetaEvidenceReader(git, repository)
+                publisher = publisher or SourceAcceptancePublisher(git, repository)
+            producer = BetaRuntimeSmokeProducer(self.journal, beta_clients, source, beta_acceptance_profile or SmokeProfile())
+            self.beta_acceptance = BetaAcceptanceHandler(self, producer, publisher)
+            self.dispatcher.register(BETA_ACCEPTANCE_ACTION, OperationHandler(self.beta_acceptance.forward, self.beta_acceptance.reconcile))
+        self._lifecycle_monitor: asyncio.Task[None] | None = None
+
+    def retained_effect_permitted(self, record: OperationRecord) -> bool:
+        return not isinstance(self.journal, RetainedGuardedOperationStore) or self.journal.effect_permitted(record)
+
+    def retained_admission(self, intent: OperationIntent, authority: AcceptedAuthority, target_id: str) -> dict[str, object] | None:
+        if self.retained_journal is None:
+            return None
+        try:
+            decision = self.retained_journal.admission(intent, authority)
+            if decision is None:
+                return None
+            if decision.status is AdmissionStatus.CONFLICT and decision.record is not None and self._same_original_intent(decision.record, intent):
+                # A two-channel journal has no bridge fingerprint. On the
+                # unchanged original target, its exact original request can
+                # still be read back without creating another operation.
+                decision = type(decision)(AdmissionStatus.REPLAY, decision.record)
+            if decision.status is not AdmissionStatus.REPLAY or decision.record is None:
+                return self._response(decision.status.value.upper(), "retained_journal_" + decision.status.value, operation_id=decision.record.operation_id if decision.record else None)
+            evidence = self.retained_journal.owned_evidence(decision.record.operation_id, intent.target, target_id, authority)
+            if evidence is None:
+                return self._response("UNAVAILABLE", "retained_operation_evidence_unavailable")
+            return self._project_retained(*evidence)
+        except Exception:
+            return self._response("UNAVAILABLE", "retained_journal_unavailable")
+
+    def _project_retained(self, record: OperationRecord, snapshot: dict[str, object] | None) -> dict[str, object]:
+        if record.intent.action in LIFECYCLE_ACTIONS:
+            if snapshot is None:
+                projected = self._response("NEEDS_ATTENTION", "lifecycle_journal_unavailable", operation_id=record.operation_id)
+            else:
+                projected = self.lifecycle.project_snapshot(record, snapshot)
+                stage = projected.get("status")
+                if (stage == "SUCCEEDED" and record.phase is not OperationPhase.SUCCEEDED) or (stage in {"FAILED", "SUPERSEDED"} and record.phase is not OperationPhase.FAILED):
+                    projected = {**projected, "status": "NEEDS_ATTENTION", "reason": "retained_lifecycle_outcome_not_settled"}
+        else:
+            projected = self._project_operation(record)
+        return {**projected, "history_origin": "retained_prior_instance"}
+
+    def _project_retained_management(self, record: OperationRecord) -> dict[str, object]:
+        """Project only old journal evidence; never consult a new handoff."""
+        status = record.phase.value.upper()
+        if record.phase is OperationPhase.NEEDS_ATTENTION and record.safe_error_category.startswith("UNKNOWN:"):
+            status = "UNKNOWN"
+        receipt = record.effect.receipt
+        return {
+            "status": status,
+            "operation_id": record.operation_id,
+            "action": record.intent.action,
+            "target": asdict(record.intent.target),
+            "phase": record.phase.value,
+            "effect_state": record.effect.state.value,
+            "revision": record.revision,
+            "safe_reason": record.safe_error_category or None,
+            "candidate_source_sha": self._params(record).get("source_sha"),
+            "receipt": None if receipt is None else {"source": receipt.observation_source, "result": receipt.safe_result, "observed_at": receipt.observed_at},
+            "verification": {"handoff_phase": "unavailable"},
+            "history_origin": "retained_prior_instance",
+        }
+
+    async def start_monitor(self) -> None:
+        self._lifecycle_monitor = asyncio.create_task(self._monitor_lifecycle(), name="management-worker-lifecycle-monitor")
+
+    async def stop_monitor(self) -> None:
+        if self._lifecycle_monitor is not None:
+            self._lifecycle_monitor.cancel()
+            try:
+                await self._lifecycle_monitor
+            except asyncio.CancelledError:
+                pass
+            self._lifecycle_monitor = None
+
+    async def _monitor_lifecycle(self) -> None:
+        while True:
+            await asyncio.sleep(2)
+            await self._poll_lifecycle_once()
+
+    async def _poll_lifecycle_once(self) -> None:
+        """Continue lifecycle and acceptance work on the original journal lane."""
+        cursor = 0
+        while True:
+            page = await asyncio.to_thread(self.journal.list_operations, cursor=cursor, limit=100, outstanding_only=True)
+            if page.status.value != "ok":
+                break
+            for record in page.records:
+                if record.intent.action in LIFECYCLE_ACTIONS or (record.intent.action == BETA_ACCEPTANCE_ACTION and self.beta_acceptance is not None):
+                    # The producer enforces the persisted interval and deadline.
+                    await self.dispatcher.submit(record.operation_id)
+            if page.next_cursor is None:
+                break
+            cursor = page.next_cursor
+
+    @staticmethod
+    def _response(status: str, reason: str, **fields: object) -> dict[str, object]:
+        return {"status": status, "reason": reason, **fields}
+
+    @staticmethod
+    def _same_original_intent(record: OperationRecord, requested: OperationIntent) -> bool:
+        if record.intent_fingerprint == requested.fingerprint():
+            return True
+        original_names = {parameter.name for parameter in record.intent.parameters}
+        new_parameters = tuple(parameter for parameter in requested.parameters if parameter.name != "worker_binding")
+        if "worker_binding" in original_names or len(new_parameters) == len(requested.parameters):
+            return False
+        legacy = OperationIntent(requested.target, requested.action, new_parameters, requested.idempotency_key, requested.expected_incarnation, requested.expected_artifact)
+        return record.intent_fingerprint == legacy.fingerprint()
+
+    acceptance_action_class = ActionClass.DEPLOYMENT
+
+    @staticmethod
+    def is_resolved_worker(value: object) -> bool:
+        return isinstance(value, ResolvedWorker)
+
+    @staticmethod
+    def _grant(required: tuple[str, ...]) -> AuthenticatedGrant:
+        grant = current_management_grant()
+        if not set(required) <= set(grant.scopes):
+            raise PermissionError("the current management grant lacks the required scopes")
+        return grant
+
+    def _resolve_snapshot(self, policy: OperatingPolicy, target_id: str, action: ActionClass) -> ResolvedWorker | dict[str, object]:
+        """Classify one policy alias against its fixed client without I/O."""
+        target = next((item for item in policy.targets if item.target_id == target_id), None)
+        if target is None:
+            return self._response("DENIED", "target_unknown")
+        client = self.clients.get(target_id)
+        if client is None:
+            return self._response("UNAVAILABLE", "supervisor_bridge_unconfigured")
+        config = client.config
+        # A policy alias cannot substitute a different physical bridge.
+        if len(target.repositories) != 1 or target.repositories[0] != config.repository or target.channel.value != config.channel:
+            return self._response("DENIED", "target_configuration_mismatch")
+        decision = evaluate_snapshot(policy, PolicyIntent(target_id, config.repository, action, TargetChannel(config.channel)))
+        if decision.outcome is not DecisionOutcome.ALLOWED:
+            return self._response(decision.outcome.value, decision.reason_code.value)
+        return ResolvedWorker(target_id, client, policy.revision)
+
+    def _resolve(self, target_id: str, action: ActionClass) -> ResolvedWorker | dict[str, object]:
+        if not isinstance(target_id, str) or not _NAME.fullmatch(target_id):
+            return self._response("INVALID_REQUEST", "invalid_target_id")
+        if self.settings.operating_policy_path is None:
+            return self._response("UNAVAILABLE", "operating_policy_unconfigured")
+        loaded = load_operating_policy(self.settings.operating_policy_path)
+        if loaded.outcome is DecisionOutcome.UNAVAILABLE or loaded.policy is None:
+            return self._response("UNAVAILABLE", "operating_policy_unavailable")
+        return self._resolve_snapshot(loaded.policy, target_id, action)
+
+    async def targets(self) -> dict[str, object]:
+        """Discover configured inspectable aliases without probing a worker."""
+        self._grant((READ_SCOPE,))
+        if self.settings.operating_policy_path is None:
+            return self._response("UNAVAILABLE", "operating_policy_unconfigured")
+        loaded = load_operating_policy(self.settings.operating_policy_path)
+        if loaded.outcome is DecisionOutcome.UNAVAILABLE or loaded.policy is None:
+            return self._response("UNAVAILABLE", "operating_policy_unavailable")
+
+        candidates: list[dict[str, str]] = []
+        for target in loaded.policy.targets:
+            # A valid policy key is not necessarily a resolvable logical ID.
+            if _NAME.fullmatch(target.target_id) is None:
+                continue
+            resolved = self._resolve_snapshot(loaded.policy, target.target_id, ActionClass.INSPECT)
+            if isinstance(resolved, ResolvedWorker):
+                config = resolved.client.config
+                candidates.append({"target_id": resolved.target_id, "repository": config.repository, "channel": config.channel})
+            elif resolved["status"] == "UNAVAILABLE":
+                # One unknown classification makes the whole projection unknown.
+                return self._response("UNAVAILABLE", "target_classification_unavailable")
+        return self._response("OK", "inspectable_targets", targets=candidates)
+
+    def _record_client(self, record: OperationRecord) -> tuple[str, WorkerNetworkClient] | None:
+        """Recover only the original physical worker, including its secret."""
+        params = self._params(record)
+        target_id = params.get("target_id")
+        if not isinstance(target_id, str):
+            return None
+        client = self.clients.get(target_id)
+        if client is None:
+            return None
+        config = client.config
+        if record.intent.target != ManagedTarget(config.instance_id, config.channel, config.repository):
+            return None
+        binding = params.get("worker_binding")
+        # Existing two-channel journals had no binding digest. Their immutable
+        # Supervisor instance/repository/channel and signed receipt remain the
+        # migration identity; all newly accepted operations pin the full bridge.
+        if binding is not None and binding != config.binding_digest:
+            return None
+        if binding is None and not self.journal.pin_legacy_worker_binding(record.operation_id, self._startup_bindings[target_id]):
+            return None
+        return target_id, client
+
+    @staticmethod
+    def _runtime_binding(data: dict[str, object], observation: dict[str, object], supervisor: dict[str, object]) -> tuple[str, dict[str, object] | None]:
+        status = data.get("binding_status")
+        binding = data.get("runtime_binding")
+        if status != "VERIFIED":
+            return ("CONFLICT" if status == "CONFLICT" or binding is not None else "UNAVAILABLE"), None
+        if not isinstance(binding, dict):
+            return "UNAVAILABLE", None
+        worker = supervisor.get("worker")
+        artifact = observation.get("artifact")
+        if not isinstance(worker, dict) or not isinstance(artifact, dict):
+            return "CONFLICT", None
+        source, version = artifact.get("source_revision"), artifact.get("distribution_version")
+        if not isinstance(source, dict) or not isinstance(version, dict):
+            return "CONFLICT", None
+        supervisor_binding = worker.get("runtime_binding")
+        exact = isinstance(supervisor_binding, dict) and binding.get("runtime_id") == supervisor.get("selected_runtime_id") == worker.get("runtime_id") and binding.get("runtime_id") == supervisor_binding.get("runtime_id")
+        if not exact or any(not isinstance(binding.get(key), str) or not binding[key] for key in ("runtime_id", "content_identity", "lock_sha256", "source_sha", "distribution_version")):
+            return "CONFLICT", None
+        if (
+            not _SHA.fullmatch(str(binding["content_identity"]))
+            or not _SHA.fullmatch(str(binding["lock_sha256"]))
+            or binding.get("process_run_id") != observation.get("process_run_id")
+            or binding.get("deployment_generation") != observation.get("deployment_generation")
+            or source.get("available") is not True
+            or version.get("available") is not True
+            or source.get("value") != binding.get("source_sha")
+            or version.get("value") != binding.get("distribution_version")
+            or worker.get("binding_status") != "VERIFIED"
+        ):
+            return "CONFLICT", None
+        # The signed Supervisor projection and nonce-bound worker observation
+        # must both identify the same selected READY receipt and locked inputs.
+        assert isinstance(supervisor_binding, dict)
+        if any(supervisor_binding.get(field) != binding.get(field) for field in ("runtime_id", "content_identity", "lock_sha256", "source_sha", "distribution_version", "process_run_id", "deployment_generation")):
+            return "CONFLICT", None
+        return "VERIFIED", {key: binding[key] for key in ("runtime_id", "content_identity", "lock_sha256", "source_sha", "distribution_version", "process_run_id", "deployment_generation")}
+
+    def _observe(self, resolved: ResolvedWorker) -> dict[str, object]:
+        client = resolved.client
+        with self._worker_locks[resolved.target_id]:
+            supervisor_result = client.inspect_supervisor()
+            supervisor = supervisor_result.data
+            if supervisor_result.result_code != "OK" or not isinstance(supervisor, dict) or supervisor.get("supervisor_incarnation") != supervisor_result.supervisor_generation:
+                return self._response("UNAVAILABLE", "supervisor_observation_unavailable", target_id=resolved.target_id, instance_id=client.config.instance_id, repository=client.config.repository, channel=client.config.channel)
+            if supervisor.get("alive") is not True or supervisor.get("status") != "RUNNING":
+                return self._response("UNAVAILABLE", "worker_not_running", target_id=resolved.target_id, instance_id=client.config.instance_id, repository=client.config.repository, channel=client.config.channel, supervisor_status=supervisor.get("status"))
+            observation_result = client.observe_worker(uuid.uuid4().hex)
+            data = observation_result.data
+            if observation_result.result_code != "OK" or not isinstance(data, dict) or observation_result.supervisor_generation != supervisor_result.supervisor_generation:
+                return self._response("UNAVAILABLE", "worker_observation_unavailable", target_id=resolved.target_id, instance_id=client.config.instance_id, repository=client.config.repository, channel=client.config.channel)
+            observation = data.get("observation")
+            worker = supervisor.get("worker")
+            if not isinstance(observation, dict) or not isinstance(worker, dict) or observation.get("process_run_id") != worker.get("process_run_id") or observation.get("deployment_generation") != worker.get("deployment_generation"):
+                return self._response("CONFLICT", "worker_incarnation_mismatch", target_id=resolved.target_id, instance_id=client.config.instance_id, repository=client.config.repository, channel=client.config.channel)
+            binding_status, binding = self._runtime_binding(data, observation, supervisor)
+            return self._response(
+                "OK" if binding_status == "VERIFIED" else binding_status,
+                "verified_worker_observation" if binding_status == "VERIFIED" else "runtime_binding_" + binding_status.lower(),
+                target_id=resolved.target_id,
+                supervisor_generation=supervisor_result.supervisor_generation,
+                instance_id=client.config.instance_id,
+                repository=client.config.repository,
+                channel=client.config.channel,
+                observation=observation,
+                runtime_binding=binding,
+                binding_status=binding_status,
+            )
+
+    def _diagnostic(self, target_id: str, kind: str, params: dict[str, str]) -> dict[str, object]:
+        self._grant((READ_SCOPE,))
+        resolved = self._resolve(target_id, ActionClass.INSPECT)
+        if not isinstance(resolved, ResolvedWorker):
+            return resolved
+        identity = {"target_id": target_id, "instance_id": resolved.target.instance_id, "channel": resolved.target.channel, "repository": resolved.target.repository}
+        with self._worker_locks[resolved.target_id]:
+            observed = self._observe(resolved)
+            observation = observed.get("observation")
+            if not isinstance(observation, dict):
+                return observed
+            result = resolved.client.diagnostics(kind, params)
+            if result.supervisor_generation != observed["supervisor_generation"]:
+                return self._response("CONFLICT", "supervisor_changed_during_diagnostic", **identity)
+            # A worker may be replaced while the private diagnostic request is in
+            # flight even though the long-lived Supervisor incarnation is stable.
+            # Re-observe the authoritative process identity before presenting the
+            # projection as belonging to the worker observed above.
+            after_result = resolved.client.inspect_supervisor()
+            after = after_result.data
+            after_worker = after.get("worker") if isinstance(after, dict) else None
+            if (
+                after_result.result_code != "OK"
+                or after_result.supervisor_generation != observed["supervisor_generation"]
+                or not isinstance(after_worker, dict)
+                or after_worker.get("process_run_id") != observation.get("process_run_id")
+                or after_worker.get("deployment_generation") != observation.get("deployment_generation")
+            ):
+                return self._response("CONFLICT", "worker_changed_during_diagnostic", **identity)
+            if result.result_code not in {"OK", "ACCEPTED"}:
+                return self._response(result.result_code, "worker_diagnostic_" + result.result_code.lower(), projection=result.data, **identity)
+            if kind == "consumer-identity":
+                if observed["binding_status"] == "CONFLICT":
+                    return self._response("CONFLICT", "runtime_binding_conflict", **identity)
+                projection = result.data
+                if not isinstance(projection, dict) or projection.get("status") not in {"OK", "CONFLICT", "UNAVAILABLE"}:
+                    return self._response("UNAVAILABLE", "invalid_consumer_identity", **identity)
+                status = str(projection["status"])
+                if status == "OK":
+                    hashes = projection.get("sha256")
+                    names = {"requirement_contract.py", "specification_analyzer.py", "specification_validation_lifecycle.py", "issue_review_service.py", "prompts.yaml"}
+                    if projection.get("origin") != "worker_package_disk_sha256" or not isinstance(projection.get("semantics"), str) or not isinstance(hashes, dict) or set(hashes) != names or any(not isinstance(value, str) or not _SHA.fullmatch(value) for value in hashes.values()):
+                        return self._response("UNAVAILABLE", "invalid_consumer_identity", **identity)
+                return self._response(
+                    status,
+                    "worker_consumer_identity",
+                    target_id=target_id,
+                    instance_id=resolved.target.instance_id,
+                    channel=resolved.target.channel,
+                    repository=resolved.target.repository,
+                    process_run_id=observation["process_run_id"],
+                    deployment_generation=observation["deployment_generation"],
+                    supervisor_generation=observed["supervisor_generation"],
+                    artifact=observation.get("artifact"),
+                    runtime_binding=observed["runtime_binding"],
+                    binding_status=observed["binding_status"],
+                    projection=projection,
+                )
+            return self._response(
+                str(observed["status"]),
+                "worker_diagnostic" if observed["status"] == "OK" else str(observed["reason"]),
+                target_id=target_id,
+                instance_id=resolved.target.instance_id,
+                channel=resolved.target.channel,
+                repository=resolved.target.repository,
+                process_run_id=observation["process_run_id"],
+                deployment_generation=observation["deployment_generation"],
+                supervisor_generation=observed["supervisor_generation"],
+                worker_observation=observation if kind == "status" else None,
+                artifact=observation.get("artifact"),
+                runtime_binding=observed["runtime_binding"],
+                binding_status=observed["binding_status"],
+                projection=result.data,
+            )
+
+    async def consumer_identity(self, target_id: str) -> dict[str, object]:
+        """Measure the fixed installed specification-consumer files on the target worker."""
+        return await asyncio.to_thread(self._diagnostic, target_id, "consumer-identity", {})
+
+    async def status(self, target_id: str, limit: StrictInt = 50) -> dict[str, object]:
+        if type(limit) is not int or not 1 <= limit <= 500:
+            return self._response("INVALID_REQUEST", "invalid_limit")
+        return await asyncio.to_thread(self._diagnostic, target_id, "status", {"limit": str(limit)})
+
+    async def logs(self, target_id: str, limit: StrictInt = 50, item_type: str | None = None, item_number: StrictInt | None = None, execution_id: str | None = None, process_run_id: str | None = None, after_sequence: StrictInt | None = None, cursor: str | None = None) -> dict[str, object]:
+        if (
+            type(limit) is not int
+            or not 1 <= limit <= 500
+            or (item_type is None) != (item_number is None)
+            or (item_type is not None and (item_type not in {"issue", "pr"} or type(item_number) is not int or not 0 < item_number <= 999999999))
+            or (after_sequence is not None and (type(after_sequence) is not int or not 0 <= after_sequence < 10**15))
+        ):
+            return self._response("INVALID_REQUEST", "invalid_log_selection")
+        optional: dict[str, object] = {"item_type": item_type, "item_number": item_number, "execution_id": execution_id, "process_run_id": process_run_id, "after_sequence": after_sequence, "cursor": cursor}
+        if (
+            any(value is not None and not _LOG_ID.fullmatch(value) for value in (execution_id, process_run_id))
+            or (cursor is not None and not _CURSOR.fullmatch(cursor))
+            or (cursor is not None and any(value is not None for key, value in optional.items() if key != "cursor"))
+            or ((execution_id is not None or after_sequence is not None) and process_run_id is None)
+        ):
+            return self._response("INVALID_REQUEST", "invalid_log_selection")
+        params = {key: str(value) for key, value in optional.items() if value is not None}
+        params["limit"] = str(limit)
+        return await asyncio.to_thread(self._diagnostic, target_id, "logs", params)
+
+    async def validation_attempt(self, target_id: str, pr_number: StrictInt | None = None, attempt_id: str | None = None, attempt_sequence: StrictInt | None = None) -> dict[str, object]:
+        if (
+            type(pr_number) is not int
+            or not 0 < pr_number <= 999999999
+            or (attempt_id is None) == (attempt_sequence is None)
+            or (attempt_sequence is not None and (type(attempt_sequence) is not int or not 0 < attempt_sequence < 10**15))
+            or (attempt_id is not None and not _ATTEMPT_ID.fullmatch(attempt_id))
+        ):
+            return self._response("INVALID_REQUEST", "invalid_validation_selection")
+        params = {key: str(value) for key, value in {"pr_number": pr_number, "attempt_id": attempt_id, "attempt_sequence": attempt_sequence}.items() if value is not None}
+        return await asyncio.to_thread(self._diagnostic, target_id, "validation-attempts", params)
+
+    async def pr_diagnostics(self, target_id: str, pr_number: StrictInt, limit: StrictInt = 50, cursor: StrictInt = 0, expected_revision: str | None = None) -> dict[str, object]:
+        """Return retained evidence for exactly one configured worker PR."""
+        if type(pr_number) is not int or not 0 < pr_number <= 999999999 or type(limit) is not int or not 1 <= limit <= 100 or type(cursor) is not int or not 0 <= cursor < 10**9 or (expected_revision is not None and not _SHA.fullmatch(expected_revision)) or (cursor > 0 and expected_revision is None):
+            return self._response("INVALID_REQUEST", "invalid_pr_diagnostic_selection")
+        params = {"pr_number": str(pr_number), "limit": str(limit), "cursor": str(cursor)}
+        if expected_revision is not None:
+            params["expected_revision"] = expected_revision
+        return await asyncio.to_thread(self._diagnostic, target_id, "pr-evidence", params)
+
+    @staticmethod
+    def _journal_authority(grant: AuthenticatedGrant, original: GrantAuthority) -> AcceptedAuthority:
+        if original.grant_id != grant.grant_id or original.client_id != grant.client_id:
+            raise PermissionError("original grant changed during admission")
+        return AcceptedAuthority(original.issuer, original.resource, original.project_id, original.uid, original.client_id, original.grant_id, original.accepted_scopes, original.auth_time, original.accepted_at)
+
+    @staticmethod
+    def _project_operation(record: OperationRecord) -> dict[str, object]:
+        receipt = record.effect.receipt
+        return {
+            "status": "accepted_for_reevaluation" if record.intent.action == REEVALUATE_ACTION and record.phase is OperationPhase.SUCCEEDED and record.effect.state is EffectState.CONFIRMED else record.phase.value.upper(),
+            "operation_id": record.operation_id,
+            "target": asdict(record.intent.target),
+            "target_id": ManagementRuntime._params(record).get("target_id"),
+            "action": record.intent.action,
+            "phase": record.phase.value,
+            "effect_state": record.effect.state.value,
+            "revision": record.revision,
+            "safe_reason": record.safe_error_category or None,
+            "accepted_actor": {"project_id": record.authority.project_id, "uid": record.authority.uid, "client_id": record.authority.oauth_client_id, "scopes": record.authority.accepted_scopes},
+            "receipt": None if receipt is None else {"source": receipt.observation_source, "result": receipt.safe_result, "observed_at": receipt.observed_at},
+        }
+
+    def _owned_operation(self, target_id: str, operation_id: str, grant: AuthenticatedGrant) -> OperationRecord | dict[str, object]:
+        if not isinstance(operation_id, str) or not _IDENTITY.fullmatch(operation_id):
+            return self._response("INVALID_REQUEST", "invalid_operation_id")
+        lookup = self.journal.get(operation_id)
+        if lookup.status is ReadStatus.UNAVAILABLE:
+            return self._response("UNAVAILABLE", "journal_unavailable")
+        record = lookup.record
+        if (
+            record is None
+            or self._params(record).get("target_id") != target_id
+            or (record.authority.project_id, record.authority.uid, record.authority.oauth_client_id, record.authority.issuer, record.authority.resource) != (grant.principal.project_id, grant.principal.uid, grant.client_id, self.settings.oauth.canonical_issuer, grant.resource)
+        ):
+            return self._response("NOT_FOUND", "operation_not_found")
+        return record
+
+    async def operation_get(self, operation_id: str, target_id: str | None = None) -> dict[str, object]:
+        """Query an original operation, retaining the existing reconciliation behavior."""
+        return await self._operation_query(operation_id, target_id, advance=True)
+
+    async def operation_inspect(self, operation_id: str, target_id: str | None = None) -> dict[str, object]:
+        """Return the original owned journal projection without dispatching effects."""
+        return await self._operation_query(operation_id, target_id, advance=False)
+
+    async def _operation_query(self, operation_id: str, target_id: str | None, *, advance: bool) -> dict[str, object]:
+        grant = self._grant((READ_SCOPE,))
+        release_lookup = await asyncio.to_thread(self.journal.get, operation_id)
+        if release_lookup.record is not None and release_lookup.record.intent.action == SOURCE_RELEASE_ACTION:
+            recorded_target = self._params(release_lookup.record).get("target_id")
+            owned_release = self._owned_operation(target_id if target_id is not None else str(recorded_target), operation_id, grant)
+            if not isinstance(owned_release, OperationRecord):
+                return owned_release
+            if advance and owned_release.effect.state is EffectState.SENT_UNKNOWN:
+                updated_release = await self.dispatcher.submit(operation_id)
+                owned_release = updated_release or owned_release
+            return self.source_release.project(owned_release)
+        if self.retained_journal is not None and target_id is None:
+            if not isinstance(operation_id, str) or not _IDENTITY.fullmatch(operation_id):
+                return self._response("INVALID_REQUEST", "invalid_operation_id")
+            lookup = await asyncio.to_thread(self.journal.get, operation_id)
+            if lookup.status is ReadStatus.UNAVAILABLE:
+                return self._response("UNAVAILABLE", "journal_unavailable")
+            if lookup.status is ReadStatus.NOT_FOUND:
+                authority = self._journal_authority(grant, self.grants.accepted_authority(grant))
+                try:
+                    previous = await asyncio.to_thread(self.retained_journal.owned_management, operation_id, authority)
+                except Exception:
+                    return self._response("UNAVAILABLE", "retained_management_history_unavailable")
+                return self._project_retained_management(previous) if previous is not None else self._response("NOT_FOUND", "operation_not_found")
+        if self.retained_journal is not None and target_id is not None:
+            if not isinstance(operation_id, str) or not _IDENTITY.fullmatch(operation_id):
+                return self._response("INVALID_REQUEST", "invalid_operation_id")
+            lookup = await asyncio.to_thread(self.journal.get, operation_id)
+            if lookup.status is ReadStatus.UNAVAILABLE:
+                return self._response("UNAVAILABLE", "journal_unavailable")
+            if lookup.status is ReadStatus.NOT_FOUND:
+                resolved = self._resolve(target_id, ActionClass.INSPECT)
+                if not isinstance(resolved, ResolvedWorker):
+                    return resolved
+                authority = self._journal_authority(grant, self.grants.accepted_authority(grant))
+                try:
+                    evidence = await asyncio.to_thread(self.retained_journal.owned_evidence, operation_id, resolved.target, target_id, authority)
+                except Exception:
+                    return self._response("UNAVAILABLE", "retained_journal_unavailable")
+                if evidence is None:
+                    return self._response("NOT_FOUND", "operation_not_found")
+                return self._project_retained(*evidence)
+        management = await asyncio.to_thread(self.self_update.owned_operation, operation_id, grant)
+        if management is not None:
+            if isinstance(management, dict):
+                return management
+            if target_id is not None and target_id != management.intent.target.instance_id:
+                return self._response("NOT_FOUND", "operation_not_found")
+            if advance:
+                await self.observe_authenticated_identity(grant)
+                queued = self.dispatcher.enqueue(operation_id)
+                return {**await asyncio.to_thread(self.self_update.project, management), "dispatch_queued": queued}
+            return await asyncio.to_thread(self.self_update.project, management)
+        if target_id is None:
+            return self._response("INVALID_REQUEST", "worker_target_id_required")
+        owned = self._owned_operation(target_id, operation_id, grant)
+        if not isinstance(owned, OperationRecord):
+            return owned
+        if owned.intent.action in LIFECYCLE_ACTIONS:
+            # An inspection-only MCP call must not become the actuator for
+            # the next worker-changing step. The service dispatcher owns it.
+            return self.lifecycle.project(owned)
+        if advance and owned.effect.state in {EffectState.SENT_UNKNOWN, EffectState.CONFIRMED} and owned.phase not in {OperationPhase.SUCCEEDED, OperationPhase.FAILED, OperationPhase.ROLLED_BACK}:
+            updated = await self.dispatcher.submit(operation_id)
+            if updated is not None:
+                owned = updated
+        return self._project_operation(owned)
+
+    async def update_management_service(self, source_sha: str, idempotency_key: str) -> dict[str, object]:
+        grant = self._grant((READ_SCOPE, DEPLOY_SCOPE))
+        if self.retained_journal is not None:
+            if not isinstance(source_sha, str) or not re.fullmatch(r"[a-f0-9]{40}", source_sha) or not isinstance(idempotency_key, str) or not _KEY.fullmatch(idempotency_key):
+                return self._response("INVALID_REQUEST", "exact_source_sha_and_bounded_idempotency_key_required")
+            authority = self._journal_authority(grant, self.grants.accepted_authority(grant))
+            try:
+                prior = await asyncio.to_thread(self.retained_journal.management_request, idempotency_key, source_sha, authority)
+            except Exception:
+                return self._response("UNAVAILABLE", "retained_management_history_unavailable")
+            if prior is not None:
+                if prior.status is AdmissionStatus.REPLAY and prior.record is not None:
+                    return self._project_retained_management(prior.record)
+                return self._response(prior.status.value.upper(), "retained_journal_" + prior.status.value, operation_id=prior.record.operation_id if prior.record else None)
+        admitted = await asyncio.to_thread(self.self_update.admit, source_sha, idempotency_key, grant)
+        if isinstance(admitted, dict):
+            return admitted
+        queued = self.dispatcher.enqueue(admitted.operation_id)
+        return {**await asyncio.to_thread(self.self_update.project, admitted), "dispatch_queued": queued}
+
+    async def observe_authenticated_identity(self, grant: AuthenticatedGrant, observation_id: str = "") -> None:
+        from .readiness_observation import publish_authenticated_readback
+
+        await asyncio.to_thread(self.self_update.observe_authenticated_identity, grant)
+        await asyncio.to_thread(publish_authenticated_readback, self.settings, grant, startup_reconciled=self.self_update.startup_reconciled, observation_id=observation_id)
+
+    async def deployment_status(self, target_id: str) -> dict[str, object]:
+        self._grant((READ_SCOPE,))
+        resolved = self._resolve(target_id, ActionClass.INSPECT)
+        if not isinstance(resolved, ResolvedWorker):
+            return resolved
+        with self._worker_locks[resolved.target_id]:
+            result = resolved.client.inspect_supervisor()
+            if result.result_code != "OK" or not isinstance(result.data, dict):
+                return self._response("UNAVAILABLE", "supervisor_status_unavailable", target_id=target_id, instance_id=resolved.target.instance_id, channel=resolved.target.channel, repository=resolved.target.repository)
+            data = result.data
+            output = self._response(
+                "OK",
+                "supervisor_observed",
+                target_id=target_id,
+                instance_id=resolved.target.instance_id,
+                channel=resolved.target.channel,
+                repository=resolved.target.repository,
+                supervisor_generation=result.supervisor_generation,
+                process_state=data.get("status"),
+                alive=data.get("alive"),
+                selected_runtime_id=data.get("selected_runtime_id"),
+                worker=data.get("worker"),
+            )
+            if data.get("alive") is True and data.get("status") == "RUNNING":
+                observed = self._observe(resolved)
+                output["worker_observation"] = observed.get("observation")
+                output["installed_binding_status"] = observed.get("binding_status")
+                output["installed_runtime"] = observed.get("runtime_binding")
+            return output
+
+    async def beta_source_readback(self, target_id: str) -> dict[str, object]:
+        """Report the independently selected beta source without admitting deployment."""
+        self._grant((READ_SCOPE,))
+        resolved = self._resolve(target_id, ActionClass.INSPECT)
+        if not isinstance(resolved, ResolvedWorker):
+            return resolved
+        if resolved.target.channel != "beta":
+            return self._response("DENIED", "beta_target_required")
+        try:
+            # The beta source differs from the management candidate revision.
+            # Reuse the actual deployer's configured credential and producer.
+            evidence = await asyncio.to_thread(lambda: self.lifecycle._source().read_current())
+        except (SourceEvidenceError, RuntimeError, OSError, ValueError):
+            return self._response("UNAVAILABLE", "configured_beta_source_evidence_unavailable")
+        return self._response(
+            "OK",
+            "configured_beta_source_verified",
+            target_id=target_id,
+            repository=evidence.repository,
+            source_sha=evidence.source_sha,
+            tested_source_oid=evidence.tested_source_oid,
+            proof_run_id=evidence.proof_run_id,
+            proof_run_attempt=evidence.proof_run_attempt,
+            selection_oid=evidence.selection_oid,
+            selection_operation_id=evidence.selection_operation_id,
+            selected_run_id=evidence.selected_run_id,
+            selected_run_attempt=evidence.selected_run_attempt,
+        )
+
+    async def start_worker(self, target_id: str, idempotency_key: str, expected_supervisor_generation: str, expected_runtime_id: str | None = None) -> dict[str, object]:
+        return await self.lifecycle.admit("start_worker", target_id, idempotency_key, expected_supervisor_generation, None, None, expected_runtime_id)
+
+    async def stop_worker(self, target_id: str, idempotency_key: str, expected_supervisor_generation: str, expected_process_run_id: str, expected_deployment_generation: str, expected_runtime_id: str) -> dict[str, object]:
+        return await self.lifecycle.admit("stop_worker", target_id, idempotency_key, expected_supervisor_generation, expected_process_run_id, expected_deployment_generation, expected_runtime_id)
+
+    async def restart_worker(self, target_id: str, idempotency_key: str, expected_supervisor_generation: str, expected_process_run_id: str, expected_deployment_generation: str, expected_runtime_id: str) -> dict[str, object]:
+        return await self.lifecycle.admit("restart_worker", target_id, idempotency_key, expected_supervisor_generation, expected_process_run_id, expected_deployment_generation, expected_runtime_id)
+
+    async def deploy_beta_source(self, target_id: str, selected_git_sha: str, idempotency_key: str, expected_supervisor_generation: str, expected_runtime_id: str | None = None, expected_process_run_id: str | None = None, expected_deployment_generation: str | None = None) -> dict[str, object]:
+        return await self.lifecycle.admit("deploy_beta_source", target_id, idempotency_key, expected_supervisor_generation, expected_process_run_id, expected_deployment_generation, expected_runtime_id, selected_git_sha)
+
+    async def deploy_release_source(
+        self,
+        target_id: str,
+        selected_git_sha: str,
+        promotion_operation_id: str,
+        catalog_ref: str,
+        catalog_oid: str,
+        acceptance_ref: str,
+        acceptance_oid: str,
+        idempotency_key: str,
+        expected_supervisor_generation: str,
+        expected_runtime_id: str | None = None,
+        expected_process_run_id: str | None = None,
+        expected_deployment_generation: str | None = None,
+    ) -> dict[str, object]:
+        identity = ReleaseWorkerEvidenceIdentity(promotion_operation_id, selected_git_sha, catalog_ref, catalog_oid, acceptance_ref, acceptance_oid)
+        return await self.lifecycle.admit(
+            "deploy_release_source",
+            target_id,
+            idempotency_key,
+            expected_supervisor_generation,
+            expected_process_run_id,
+            expected_deployment_generation,
+            expected_runtime_id,
+            selected_git_sha,
+            identity,
+        )
+
+    def _project_beta_acceptance(self, record: OperationRecord) -> dict[str, object]:
+        projected = self._project_operation(record)
+        try:
+            local = self.beta_acceptance.producer.read(record.operation_id) if self.beta_acceptance is not None else None
+        except (OSError, RuntimeError, ValueError, TypeError):
+            local = None
+        if local is not None:
+            projected["local_state"] = local.state.value
+            projected["local_result"] = local.evidence.local_result.value if local.evidence is not None else None
+            projected["local_evidence_id"] = local.evidence.local_evidence_id if local.evidence is not None else None
+            projected["next_sample_at"] = local.next_sample_at
+        if record.phase is OperationPhase.SUCCEEDED and record.effect.state is EffectState.CONFIRMED:
+            projected["status"] = "PASS_PUBLISHED"
+        return projected
+
+    async def run_beta_acceptance(self, target_id: str, selected_git_sha: str, installed_runtime_id: str, process_run_id: str, deployment_generation: str, supervisor_generation: str, deployment_operation_id: str, idempotency_key: str) -> dict[str, object]:
+        grant = self._grant((READ_SCOPE, DEPLOY_SCOPE))
+        values = (installed_runtime_id, process_run_id, deployment_generation, supervisor_generation, deployment_operation_id)
+        if self.beta_acceptance is None:
+            return self._response("UNAVAILABLE", "beta_acceptance_unconfigured")
+        if not isinstance(selected_git_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", selected_git_sha) or not isinstance(idempotency_key, str) or not _KEY.fullmatch(idempotency_key) or any(not isinstance(value, str) or not _IDENTITY.fullmatch(value) for value in values):
+            return self._response("INVALID_REQUEST", "invalid_beta_acceptance_request")
+        resolved = self._resolve(target_id, ActionClass.DEPLOYMENT)
+        if not isinstance(resolved, ResolvedWorker) or resolved.client.config.channel != "beta":
+            return resolved if isinstance(resolved, dict) else self._response("DENIED", "beta_target_required")
+        intent = OperationIntent(
+            resolved.target,
+            BETA_ACCEPTANCE_ACTION,
+            (
+                ActionParameter("target_id", target_id),
+                ActionParameter("worker_binding", resolved.client.config.binding_digest),
+                ActionParameter("source_sha", selected_git_sha),
+                ActionParameter("deployment_operation_id", deployment_operation_id),
+                ActionParameter("supervisor_generation", supervisor_generation),
+                ActionParameter("deployment_generation", deployment_generation),
+            ),
+            idempotency_key,
+            process_run_id,
+            installed_runtime_id,
+        )
+        authority = self._journal_authority(grant, self.grants.accepted_authority(grant))
+        old = await asyncio.to_thread(self.journal.find_by_key, intent, authority)
+        if old.status is ReadStatus.UNAVAILABLE:
+            return self._response("UNAVAILABLE", "journal_unavailable")
+        if old.record is not None:
+            if not self._same_original_intent(old.record, intent):
+                return self._response("CONFLICT", "idempotency_key_conflict", operation_id=old.record.operation_id)
+            updated = await self.dispatcher.submit(old.record.operation_id)
+            return self._project_beta_acceptance(updated or old.record)
+        admitted = await asyncio.to_thread(self.journal.admit, intent, authority)
+        if admitted.status in {AdmissionStatus.UNAVAILABLE, AdmissionStatus.CONFLICT, AdmissionStatus.BUSY}:
+            return self._response(admitted.status.value.upper(), "journal_" + admitted.status.value, operation_id=admitted.record.operation_id if admitted.record else None)
+        assert admitted.record is not None
+        updated = await self.dispatcher.submit(admitted.record.operation_id)
+        return self._project_beta_acceptance(updated or admitted.record)
+
+    async def beta_acceptance_get(self, target_id: str, operation_id: str) -> dict[str, object]:
+        grant = self._grant((READ_SCOPE,))
+        record = self._owned_operation(target_id, operation_id, grant)
+        if isinstance(record, dict):
+            return record
+        if record.intent.action != BETA_ACCEPTANCE_ACTION:
+            return self._response("NOT_FOUND", "operation_not_found")
+        return self._project_beta_acceptance(record)
+
+    @staticmethod
+    def _ready_to_reevaluate(observed: dict[str, object], expected_run: str, expected_generation: str) -> bool:
+        observation = observed.get("observation")
+        if observed.get("status") != "OK" or not isinstance(observation, dict):
+            return False
+        lifecycle, invocations, heartbeat = observation.get("lifecycle"), observation.get("invocations"), observation.get("heartbeat")
+        return (
+            observation.get("process_run_id") == expected_run
+            and observation.get("deployment_generation") == expected_generation
+            and isinstance(lifecycle, dict)
+            and lifecycle.get("state") == "running"
+            and lifecycle.get("startup_reconciled") is True
+            and lifecycle.get("daemon_serving") is True
+            and isinstance(invocations, dict)
+            and invocations.get("state") == "running"
+            and isinstance(heartbeat, dict)
+            and heartbeat.get("available") is True
+        )
+
+    async def reevaluate_target(self, target_id: str, target_type: str, number: StrictInt, idempotency_key: str, expected_process_run_id: str, expected_deployment_generation: str) -> dict[str, object]:
+        grant = self._grant((READ_SCOPE, OPERATE_SCOPE))
+        if (
+            target_type not in {"issue", "pr"}
+            or type(number) is not int
+            or not 0 < number <= 2**31 - 1
+            or not isinstance(idempotency_key, str)
+            or not _KEY.fullmatch(idempotency_key)
+            or not isinstance(expected_process_run_id, str)
+            or not _IDENTITY.fullmatch(expected_process_run_id)
+            or not isinstance(expected_deployment_generation, str)
+            or not _IDENTITY.fullmatch(expected_deployment_generation)
+        ):
+            return self._response("INVALID_REQUEST", "invalid_reevaluation_request")
+        resolved = self._resolve(target_id, ActionClass.INSPECT)
+        if not isinstance(resolved, ResolvedWorker):
+            return resolved
+        intent = OperationIntent(
+            resolved.target,
+            REEVALUATE_ACTION,
+            (ActionParameter("target_id", target_id), ActionParameter("worker_binding", resolved.client.config.binding_digest), ActionParameter("target_type", target_type), ActionParameter("number", number)),
+            idempotency_key,
+            expected_process_run_id,
+            expected_deployment_generation,
+        )
+        original = self._journal_authority(grant, self.grants.accepted_authority(grant))
+        retained = await asyncio.to_thread(self.retained_admission, intent, original, target_id)
+        if retained is not None:
+            return retained
+        old = await asyncio.to_thread(self.journal.find_by_key, intent, original)
+        if old.status is ReadStatus.UNAVAILABLE:
+            return self._response("UNAVAILABLE", "journal_unavailable")
+        if old.record is not None:
+            if not self._same_original_intent(old.record, intent):
+                return self._response("CONFLICT", "idempotency_key_conflict", operation_id=old.record.operation_id)
+            # Replays retain the original immutable authority. They may observe
+            # an already-sent receipt, but never substitute a refreshed grant.
+            updated = await self.dispatcher.submit(old.record.operation_id)
+            return self._project_operation(updated or old.record)
+        mutation = self._resolve(target_id, ActionClass.WORKER_CONTROL)
+        if not isinstance(mutation, ResolvedWorker):
+            return mutation
+        observed = await asyncio.to_thread(self._observe, mutation)
+        if not self._ready_to_reevaluate(observed, expected_process_run_id, expected_deployment_generation):
+            return self._response("UNAVAILABLE" if observed.get("status") == "UNAVAILABLE" else "CONFLICT", "worker_not_ready_or_generation_mismatch")
+        admitted = await asyncio.to_thread(self.journal.admit, intent, original)
+        if admitted.status in {AdmissionStatus.UNAVAILABLE, AdmissionStatus.CONFLICT, AdmissionStatus.BUSY}:
+            return self._response(admitted.status.value.upper(), "journal_" + admitted.status.value, operation_id=admitted.record.operation_id if admitted.record else None)
+        assert admitted.record is not None
+        updated = await self.dispatcher.submit(admitted.record.operation_id)
+        return self._project_operation(updated or admitted.record)
+
+    @staticmethod
+    def _params(record: OperationRecord) -> dict[str, str | int | bool]:
+        return {part.name: part.value for part in record.intent.parameters}
+
+    def _recorded_target(self, record: OperationRecord) -> ResolvedWorker | None:
+        if record.intent.action != REEVALUATE_ACTION or not _IDENTITY.fullmatch(record.intent.expected_incarnation) or not _IDENTITY.fullmatch(record.intent.expected_artifact):
+            return None
+        params = self._params(record)
+        if set(params) not in ({"target_id", "target_type", "number"}, {"target_id", "target_type", "number", "worker_binding"}) or not isinstance(params["target_id"], str) or params["target_type"] not in {"issue", "pr"} or type(params["number"]) is not int or params["number"] <= 0:
+            return None
+        resolved = self._resolve(params["target_id"], ActionClass.WORKER_CONTROL)
+        return resolved if isinstance(resolved, ResolvedWorker) and resolved.target == record.intent.target and self._record_client(record) is not None else None
+
+    def _policy_refusal(self, record: OperationRecord) -> str | None:
+        params = self._params(record)
+        target_id = params.get("target_id")
+        if not isinstance(target_id, str):
+            return "recorded_target_invalid"
+        outcome = self._resolve(target_id, ActionClass.WORKER_CONTROL)
+        if isinstance(outcome, ResolvedWorker) and outcome.target == record.intent.target and self._record_client(record) is not None:
+            return None
+        if isinstance(outcome, dict) and outcome.get("status") == "UNAVAILABLE":
+            return "current_policy_unavailable"
+        return "current_policy_denied"
+
+    def _hold(self, record: OperationRecord, reason: str) -> OperationRecord | None:
+        if record.phase is OperationPhase.NEEDS_ATTENTION:
+            return record
+        result = self.journal.transition(record.operation_id, record.revision, OperationPhase.NEEDS_ATTENTION, safe_error_category=reason)
+        return result.record
+
+    def _forward_reevaluation(self, record: OperationRecord) -> OperationRecord | None:
+        # No newer OAuth token can overwrite the original acceptance context.
+        authority = record.authority
+        if (authority.issuer, authority.resource, authority.project_id) != (self.settings.oauth.canonical_issuer, self.settings.oauth.resource, self.settings.oauth.firebase_project_id) or not set((READ_SCOPE, OPERATE_SCOPE)) <= set(authority.accepted_scopes):
+            return self._hold(record, "original_authority_denied")
+        original = GrantAuthority(authority.trusted_grant_id, authority.project_id, authority.uid, authority.authentication_time, authority.oauth_client_id, authority.issuer, authority.resource, authority.accepted_scopes, authority.accepted_at)
+        decision = self.grants.check_pending_authority(original, (READ_SCOPE, OPERATE_SCOPE))
+        if decision.status is not PendingAuthorityStatus.PERMITTED:
+            return self._hold(record, "original_authority_unavailable" if decision.status is PendingAuthorityStatus.UNAVAILABLE else "original_authority_denied")
+        refusal = self._policy_refusal(record)
+        if refusal is not None:
+            return self._hold(record, refusal)
+        resolved = self._recorded_target(record)
+        if resolved is None:
+            return self._hold(record, "recorded_target_invalid")
+        with self._worker_locks[resolved.target_id]:
+            observed = self._observe(resolved)
+            if not self._ready_to_reevaluate(observed, record.intent.expected_incarnation, record.intent.expected_artifact):
+                return self._hold(record, "worker_not_ready_or_generation_mismatch")
+            # The original durable grant and the current phase-policy are
+            # checked again at the actual first-send boundary, not just prior
+            # to potentially slow Supervisor observation.
+            check = self.grants.check_pending_authority(original, (READ_SCOPE, OPERATE_SCOPE))
+            if check.status is not PendingAuthorityStatus.PERMITTED:
+                return self._hold(record, "original_authority_unavailable" if check.status is PendingAuthorityStatus.UNAVAILABLE else "original_authority_denied")
+            refusal = self._policy_refusal(record)
+            if refusal is not None:
+                return self._hold(record, refusal)
+            # The journal CAS is the durable pre-send fence. Once installed,
+            # even a lost HTTP response may only be reconciled by readback.
+            correlation = hashlib.sha256(json.dumps((record.operation_id, asdict(record.intent.target), observed["supervisor_generation"], record.intent.expected_incarnation, record.intent.expected_artifact), sort_keys=True).encode()).hexdigest()
+            attempt = uuid.uuid4().hex
+            begun = self.journal.begin_effect(record.operation_id, record.revision, owner_attempt_id=attempt, attempt_id=attempt, correlation_identity=correlation)
+            if begun.status is not MutationStatus.UPDATED or begun.record is None:
+                return begun.record
+            if not self.retained_effect_permitted(begun.record):
+                return begun.record
+            params = self._params(record)
+            response = resolved.client.accept_reevaluation(record.operation_id, process_run_id=record.intent.expected_incarnation, deployment_generation=record.intent.expected_artifact, target_type=str(params["target_type"]), number=int(params["number"]))
+            return self._consume_receipt(begun.record, response) or begun.record
+
+    @staticmethod
+    def _verified_receipt(record: OperationRecord, response: WorkerNetworkResult) -> EffectReceipt | None:
+        value = response.data
+        params = ManagementRuntime._params(record)
+        if response.http_status not in {200, 202} or response.result_code not in {"OK", "ACCEPTED"} or not isinstance(value, dict):
+            return None
+        target = value.get("target")
+        invalidation = value.get("invalidation")
+        if not isinstance(target, dict) or not isinstance(invalidation, dict):
+            return None
+        if (
+            value.get("schema_version") != 1
+            or value.get("operation_id") != record.operation_id
+            or value.get("repository") != record.intent.target.repository
+            or value.get("channel") != record.intent.target.channel
+            or target != {"type": params["target_type"], "number": params["number"]}
+            or value.get("requested_process_run_id") != record.intent.expected_incarnation
+            or value.get("requested_deployment_generation") != record.intent.expected_artifact
+            or value.get("accepting_process_run_id") != record.intent.expected_incarnation
+            or value.get("accepting_deployment_generation") != record.intent.expected_artifact
+            or value.get("outcome") != "accepted_for_reevaluation"
+            or type(invalidation.get("generation")) is not int
+            or invalidation["generation"] <= 0
+            or not isinstance(invalidation.get("disposition"), str)
+            or not invalidation["disposition"]
+        ):
+            return None
+        safe = json.dumps({"outcome": value["outcome"], "generation": invalidation["generation"], "disposition": invalidation["disposition"], "accepting_process_run_id": value["accepting_process_run_id"]}, sort_keys=True)
+        if len(safe) > 512:
+            return None
+        return EffectReceipt(record.effect.correlation_identity, "worker-uds-invalidation-receipt", time.time(), safe)
+
+    def _consume_receipt(self, record: OperationRecord, response: WorkerNetworkResult) -> OperationRecord | None:
+        receipt = self._verified_receipt(record, response)
+        if receipt is None:
+            # UNAVAILABLE, NOT_FOUND, conflicting/stale identity and lost replies
+            # all retain ownership. No missing receipt can prove no effect.
+            return record
+        if record.effect.state is EffectState.SENT_UNKNOWN:
+            mutation = self.journal.record_effect(record.operation_id, record.revision, attempt_id=record.effect.attempt_id, state=EffectState.CONFIRMED, receipt=receipt)
+            if mutation.status is not MutationStatus.UPDATED or mutation.record is None:
+                return mutation.record
+            record = mutation.record
+        elif record.effect.state is not EffectState.CONFIRMED:
+            return record
+        if record.phase is OperationPhase.NEEDS_ATTENTION:
+            completed = self.journal.resolve_needs_attention(record.operation_id, record.revision, OperationPhase.SUCCEEDED, evidence=record.effect.receipt or receipt)
+        else:
+            completed = self.journal.transition(record.operation_id, record.revision, OperationPhase.SUCCEEDED, evidence=record.effect.receipt or receipt)
+        return completed.record
+
+    def _reconcile_reevaluation(self, record: OperationRecord) -> OperationRecord | None:
+        if record.effect.state is EffectState.CONFIRMED and record.effect.receipt is not None:
+            if record.phase is OperationPhase.NEEDS_ATTENTION:
+                terminal = self.journal.resolve_needs_attention(record.operation_id, record.revision, OperationPhase.SUCCEEDED, evidence=record.effect.receipt)
+            else:
+                terminal = self.journal.transition(record.operation_id, record.revision, OperationPhase.SUCCEEDED, evidence=record.effect.receipt)
+            return terminal.record
+        if record.effect.state is not EffectState.SENT_UNKNOWN:
+            return record
+        # Reconciliation is tied to the immutable physical endpoint recorded
+        # before send. It requires no fresh mutation or policy authority.
+        bound = self._record_client(record)
+        if bound is None:
+            return record
+        target_id, client = bound
+        with self._worker_locks[target_id]:
+            if client.inspect_supervisor().result_code != "OK":
+                return record
+            response = client.read_reevaluation(record.operation_id)
+            return self._consume_receipt(record, response) or record
+
+    async def promote_accepted_source_release(
+        self, target_id: str, source_sha: str, ci_run_id: StrictInt, ci_run_attempt: StrictInt, tested_source_ref: str, tested_source_oid: str, tested_source_record_sha256: str, acceptance_ref: str, acceptance_oid: str, idempotency_key: str
+    ) -> dict[str, object]:
+        return await self.source_release.admit(
+            target_id,
+            idempotency_key,
+            {
+                "source_sha": source_sha,
+                "ci_run_id": ci_run_id,
+                "ci_run_attempt": ci_run_attempt,
+                "tested_source_ref": tested_source_ref,
+                "tested_source_oid": tested_source_oid,
+                "tested_source_record_sha256": tested_source_record_sha256,
+                "acceptance_ref": acceptance_ref,
+                "acceptance_oid": acceptance_oid,
+            },
+        )
+
+    def tool_registrations(self) -> tuple[ManagementTool, ...]:
+        read = ToolAnnotations(readOnlyHint=True, idempotentHint=True, destructiveHint=False, openWorldHint=False)
+        mutation = ToolAnnotations(readOnlyHint=False, idempotentHint=True, destructiveHint=False, openWorldHint=False)
+        return (
+            ManagementTool("auto_coder_targets", self.targets, (READ_SCOPE,), read, ()),
+            ManagementTool("auto_coder_consumer_identity", self.consumer_identity, (READ_SCOPE,), read),
+            ManagementTool("auto_coder_status", self.status, (READ_SCOPE,), read),
+            ManagementTool("auto_coder_logs", self.logs, (READ_SCOPE,), read),
+            ManagementTool("auto_coder_validation_attempt", self.validation_attempt, (READ_SCOPE,), read),
+            ManagementTool("auto_coder_pr_diagnostics", self.pr_diagnostics, (READ_SCOPE,), read),
+            ManagementTool("auto_coder_operation_get", self.operation_get, (READ_SCOPE,), mutation),
+            ManagementTool("auto_coder_operation_inspect", self.operation_inspect, (READ_SCOPE,), read),
+            ManagementTool("auto_coder_reevaluate_target", self.reevaluate_target, (READ_SCOPE, OPERATE_SCOPE), mutation),
+            ManagementTool("auto_coder_update_management_service", self.update_management_service, (READ_SCOPE, DEPLOY_SCOPE), ToolAnnotations(readOnlyHint=False, idempotentHint=True, destructiveHint=True, openWorldHint=False), ("source_sha", "idempotency_key")),
+            ManagementTool("auto_coder_deployment_status", self.deployment_status, (READ_SCOPE,), read),
+            ManagementTool("auto_coder_beta_source_readback", self.beta_source_readback, (READ_SCOPE,), read),
+            ManagementTool("auto_coder_start_worker", self.start_worker, (READ_SCOPE, DEPLOY_SCOPE), mutation),
+            ManagementTool("auto_coder_stop_worker", self.stop_worker, (READ_SCOPE, DEPLOY_SCOPE), mutation),
+            ManagementTool("auto_coder_restart_worker", self.restart_worker, (READ_SCOPE, DEPLOY_SCOPE), mutation),
+            ManagementTool("auto_coder_deploy_beta_source", self.deploy_beta_source, (READ_SCOPE, DEPLOY_SCOPE), mutation),
+            ManagementTool(
+                "auto_coder_deploy_release_source",
+                self.deploy_release_source,
+                (READ_SCOPE, DEPLOY_SCOPE),
+                mutation,
+                ("target_id", "selected_git_sha", "promotion_operation_id", "catalog_ref", "catalog_oid", "acceptance_ref", "acceptance_oid", "idempotency_key", "expected_supervisor_generation", "expected_runtime_id", "expected_process_run_id", "expected_deployment_generation"),
+            ),
+            ManagementTool("auto_coder_run_beta_acceptance", self.run_beta_acceptance, (READ_SCOPE, DEPLOY_SCOPE), mutation),
+            ManagementTool("auto_coder_beta_acceptance_get", self.beta_acceptance_get, (READ_SCOPE,), read),
+            ManagementTool("auto_coder_promote_accepted_source_release", self.promote_accepted_source_release, (READ_SCOPE, DEPLOY_SCOPE), mutation, ("target_id", *SOURCE_RELEASE_FIELDS, "idempotency_key")),
+        )

@@ -1,0 +1,4561 @@
+"""Adversarial validation functionality for Auto-Coder automation engine.
+
+Validates PR implementation against the original issue specification / acceptance criteria
+using a strong model to catch false-success PRs before merge.
+"""
+
+from __future__ import annotations
+
+import ast
+import hashlib
+import json
+import re
+from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional, Sequence
+
+from .accepted_finding_bridge import (
+    FINDING_ROOT_MARKER,
+    AcceptedFindingBridge,
+    AcceptedFindingProjection,
+    BridgeDiagnostic,
+    ObservedRoot,
+    OrdinaryDisposition,
+    ProjectionTarget,
+    RootObservation,
+    known_gap_from_record,
+    render_accepted_findings,
+)
+from .automation_config import AutomationConfig
+from .backend_manager import CLOUD_BACKEND_TYPES, BackendManager, run_llm_prompt
+from .ci_observation import CIConclusion, ObservationAvailability, WorkflowObservation
+from .cli_event_stream import extract_claude_jsonl_result, extract_codex_jsonl_message, extract_muse_jsonl_result
+from .issue_context import IssueOracleResolution, VerifiedIssueOracle, get_linked_issues_context, resolve_issue_oracles
+from .logger_config import get_logger
+from .ordinary_correction_references import CANONICAL_CORRECTION_PREFIX, CanonicalCorrectionContext, build_correction_reference_context, validate_correction_reference
+from .pr_review_execution import ReviewExecutionInput, ReviewExecutionResult, build_review_prompt, parse_review_result
+from .progress_footer import ProgressStage
+from .prompt_loader import render_prompt
+from .requirement_contract import build_normative_issue_manifest, is_explicit_test_deliverable
+from .review_capture import validation_evidence
+from .reviewer_session_registry import RecoveredFileEvidence, ReviewerSession, ReviewerSessionRegistry, TestOracleGap
+from .security_utils import redact_string
+from .trace_logger import get_trace_logger
+from .util.gh_cache import GitHubClient, PartialPRChangedFilesError
+from .utils import CommandExecutor
+
+if TYPE_CHECKING:
+    from .review_thread_validation import ClaimedReviewThread
+    from .util.github_action import GitHubActionsStatusResult
+
+logger = get_logger(__name__)
+
+ADVERSARIAL_RESPONSE_PREVIEW_LIMIT = 2000
+ADVERSARIAL_VALIDATION_COMMENT_LIMIT = 60000
+ADVERSARIAL_VALIDATION_COMMENT_FIELD_LIMIT = 2000
+ADVERSARIAL_VALIDATION_COVERAGE_ID_LIMIT = 20
+ADVERSARIAL_VALIDATION_CACHE_VERSION = "v11"
+ADVERSARIAL_ADJACENT_EXPLORATION_BUDGET = 8
+ADVERSARIAL_EVIDENCE_RECOVERY_BUDGET = 300
+RECOVERED_FILE_IDENTITY_VERSION = 1
+CHANGE_PROVENANCE_CLARIFICATION_MARKER = "<!-- auto-coder-change-provenance-clarification:v1 -->"
+TEST_ORACLE_GAP_STATUSES = {"OPEN", "RESOLVED", "INVALID"}
+TEST_ORACLE_GAP_REREVIEW_EXCEPTIONS = {
+    "CORRECTIVE_DIFF_NEW_BOUNDARY",
+    "PROTECTION_WEAKENED",
+    "REVALIDATION_EXPOSED_UNTESTED_BOUNDARY",
+}
+
+
+class _DuplicateAwareDict(dict[str, Any]):
+    """JSON object retaining duplicate-member evidence for extension checks."""
+
+    duplicate_keys: tuple[str, ...]
+
+
+def _retain_duplicate_json_members(pairs: list[tuple[str, Any]]) -> _DuplicateAwareDict:
+    result = _DuplicateAwareDict()
+    duplicates: list[str] = []
+    for key, value in pairs:
+        if key in result:
+            duplicates.append(key)
+        result[key] = value
+    result.duplicate_keys = tuple(duplicates)
+    return result
+
+
+def _closure_input_unavailable_reason(closure_input: ReviewExecutionInput) -> str:
+    """Return the missing controller context that forbids closure assessment."""
+    missing: list[str] = []
+    required_strings = {
+        "repository": closure_input.repository,
+        "round_id": closure_input.round_id,
+        "attempt_id": closure_input.attempt_id,
+        "head_sha": closure_input.head_sha,
+        "base_sha": closure_input.base_sha,
+        "audited_head_sha": closure_input.audited_head_sha,
+        "requirements_snapshot": closure_input.contract.requirements_text,
+        "policy_identity": closure_input.policy.identity,
+        "repository_evidence": closure_input.repository_evidence,
+        "cumulative_diff_evidence": closure_input.diff_evidence,
+    }
+    missing.extend(name for name, value in required_strings.items() if not value.strip())
+    if not closure_input.contract.issue_ids:
+        missing.append("issue_identities")
+    for name, value in {
+        "pr_number": closure_input.pr_number,
+        "attempt_sequence": closure_input.attempt_sequence,
+    }.items():
+        if value <= 0:
+            missing.append(name)
+    if closure_input.open_epoch < 0:  # a PR's first open epoch is 0 in the owning review cycle
+        missing.append("open_epoch")
+    if not closure_input.findings:
+        missing.append("accepted_finding_bundle")
+    return ", ".join(missing)
+
+
+@dataclass
+class AdversarialValidationFinding:
+    """Demonstrated specification violation identified during validation."""
+
+    requirement_id: str = ""
+    requirement_ids: List[str] = field(default_factory=list)
+    finding_identity: str = ""
+    correction_identity: str = ""
+    correction_scope_fingerprint: str = ""
+    correction_context_fingerprint: str = ""
+    violated_requirement: str = ""
+    requirement_text: str = ""
+    reachability: str = ""
+    required_behavior: str = ""
+    actual_behavior: str = ""
+    evidence: str = ""
+    evidence_classification: str = "DEMONSTRATED"
+    counterexample: str = ""
+    test_gap: str = ""
+    suggested_regression_scenario: str = ""
+    anchor_path: str = ""
+    anchor_line: Optional[int] = None
+    anchor_side: str = "RIGHT"
+    anchor_start_line: Optional[int] = None
+
+    @property
+    def all_requirement_ids(self) -> List[str]:
+        """Return every requirement implicated by this concrete finding."""
+        return list(dict.fromkeys([requirement_id for requirement_id in [self.requirement_id, *self.requirement_ids] if requirement_id]))
+
+
+@dataclass
+class IssueRequirement:
+    """Stable requirement unit extracted deterministically from the Issue oracle."""
+
+    requirement_id: str = ""
+    text: str = ""
+
+
+@dataclass
+class DynamicCheckExecution:
+    """A dynamic-check result bound to the repository revision it executed."""
+
+    success: bool = False
+    output: str = ""
+    errors: str = ""
+    executed_sha: Optional[str] = None
+    verification_error: Optional[str] = None
+    target_selection_error: Optional[str] = None
+
+
+CANONICAL_PR_TESTS_WORKFLOW = ".github/workflows/pr-tests.yml"
+
+
+def validate_dynamic_check_target(check_target: str, repository_root: Path) -> Optional[str]:
+    """Validate the intentionally narrow reviewer-to-test-runner protocol."""
+    if check_target == "all":
+        return None
+    if not check_target or check_target != check_target.strip():
+        return "target must be 'all' or one repository-relative tests path"
+    if any(character.isspace() for character in check_target) or any(character in check_target for character in ";|&`$<>\\"):
+        return "target contains prose, whitespace, or shell/control syntax"
+    path_text, *selectors = check_target.split("::")
+    if selectors and (not path_text.endswith(".py") or any(not selector for selector in selectors)):
+        return "pytest node selectors require a .py file and non-empty components"
+    candidate = Path(path_text)
+    if candidate.is_absolute() or not candidate.parts or candidate.parts[0] != "tests" or ".." in candidate.parts:
+        return "target must resolve inside the repository tests/ tree"
+    tests_root = (repository_root / "tests").resolve()
+    resolved = (repository_root / candidate).resolve()
+    if not resolved.is_relative_to(tests_root):
+        return "target resolves outside the repository tests/ tree"
+    if not resolved.exists():
+        return "requested test file or directory does not exist"
+    if resolved.is_file() and resolved.suffix != ".py":
+        return "requested test file must have a .py suffix"
+    if not resolved.is_file() and not resolved.is_dir():
+        return "requested target is not a regular file or directory"
+    return None
+
+
+def canonical_pr_tests_succeeded(status: Optional["GitHubActionsStatusResult"]) -> bool:
+    """Require pass eligibility and verified canonical workflow provenance."""
+    if status is None or not status.success or status.in_progress or status.error or status.observation is None:
+        return False
+    snapshot = status.observation
+    if snapshot.availability is not ObservationAvailability.KNOWN:
+        return False
+    newest: Dict[tuple[str, str], int] = {}
+    for fact in snapshot.facts:
+        if isinstance(fact, WorkflowObservation) and fact.execution.attempt is not None:
+            key = (fact.execution.workflow_id, fact.execution.run_id)
+            newest[key] = max(newest.get(key, 0), fact.execution.attempt)
+    return any(isinstance(fact, WorkflowObservation) and fact.execution.attempt == newest.get((fact.execution.workflow_id, fact.execution.run_id)) and fact.workflow_path == CANONICAL_PR_TESTS_WORKFLOW and fact.conclusion is CIConclusion.SUCCESS for fact in snapshot.facts)
+
+
+def focused_ci_target_succeeded(status: Optional["GitHubActionsStatusResult"], target: str) -> bool:
+    """Return true only for an exact target explicitly reported by passing CI."""
+    if not canonical_pr_tests_succeeded(status) or status is None or status.observation is None:
+        return False
+    newest: Dict[tuple[str, str], int] = {}
+    for fact in status.observation.facts:
+        if isinstance(fact, WorkflowObservation) and fact.execution.attempt is not None:
+            key = (fact.execution.workflow_id, fact.execution.run_id)
+            newest[key] = max(newest.get(key, 0), fact.execution.attempt)
+    return any(
+        isinstance(fact, WorkflowObservation) and fact.conclusion is CIConclusion.SUCCESS and fact.workflow_path == CANONICAL_PR_TESTS_WORKFLOW and fact.execution.attempt == newest.get((fact.execution.workflow_id, fact.execution.run_id)) and target in fact.successful_test_targets
+        for fact in status.observation.facts
+    )
+
+
+def _ci_decision_evidence_equivalent(presented: Optional["GitHubActionsStatusResult"], current: Optional["GitHubActionsStatusResult"]) -> bool:
+    """Compare execution facts while allowing fresh authority/read identities."""
+    if presented is None or current is None or presented.observation is None or current.observation is None:
+        return False
+    before = presented.observation
+    after = current.observation
+    return (
+        before.availability is ObservationAvailability.KNOWN
+        and after.availability is ObservationAvailability.KNOWN
+        and before.subject == after.subject
+        and sorted(repr(fact) for fact in before.facts) == sorted(repr(fact) for fact in after.facts)
+        and presented.success == current.success
+        and presented.in_progress == current.in_progress
+        and presented.error == current.error
+    )
+
+
+def format_ci_execution_evidence(status: Optional["GitHubActionsStatusResult"]) -> str:
+    """Serialize the authoritative observation without flattening provider facts."""
+    if status is None or status.observation is None:
+        return json.dumps({"availability": "unavailable", "diagnostic": "No authoritative CI observation was supplied"}, sort_keys=True)
+    snapshot = status.observation
+    facts = []
+    newest_attempt: Dict[tuple[str, str], int] = {}
+    for fact in snapshot.facts:
+        if isinstance(fact, WorkflowObservation) and fact.execution.attempt is not None:
+            key = (fact.execution.workflow_id, fact.execution.run_id)
+            newest_attempt[key] = max(newest_attempt.get(key, 0), fact.execution.attempt)
+    for fact in snapshot.facts:
+        if isinstance(fact, WorkflowObservation):
+            actionable = fact.execution.attempt == newest_attempt.get((fact.execution.workflow_id, fact.execution.run_id))
+            facts.append(
+                {
+                    "kind": "workflow",
+                    "workflow_id": fact.execution.workflow_id,
+                    "run_id": fact.execution.run_id,
+                    "run_attempt": fact.execution.attempt,
+                    "workflow_path": fact.workflow_path,
+                    "conclusion": fact.conclusion.value,
+                    "actionable": actionable,
+                    "successful_test_targets": list(fact.successful_test_targets),
+                }
+            )
+        else:
+            facts.append(
+                {
+                    "kind": "check",
+                    "app_id": fact.execution.app_id,
+                    "check_id": fact.execution.check_id,
+                    "workflow_id": fact.execution.workflow_id,
+                    "run_id": fact.execution.run_id,
+                    "run_attempt": fact.execution.attempt,
+                    "conclusion": fact.conclusion.value,
+                    "actionable": True,
+                }
+            )
+    return json.dumps(
+        {
+            "subject": {
+                "api_origin": snapshot.subject.api_origin,
+                "repository": snapshot.subject.repository,
+                "pr_number": snapshot.subject.pr_number,
+                "head_sha": snapshot.subject.head_sha,
+            },
+            "observation": {
+                "cycle_id": snapshot.cycle_id,
+                "invalidation_epoch": snapshot.invalidation_epoch,
+                "availability": snapshot.availability.value,
+                "request_source": snapshot.request.source,
+                "request_representation": snapshot.request.representation,
+            },
+            "provider_facts": facts,
+            "gate_pass_eligible": bool(status.success and not status.in_progress and not status.error),
+        },
+        sort_keys=True,
+    )
+
+
+def _pytest_target_selection_error(test_result: Any) -> Optional[str]:
+    """Recognize pure pytest selection failures without hiding collection errors."""
+    output = f"{test_result.stdout}\n{test_result.stderr}".lower()
+    collection_failure = any(marker in output for marker in ("error collecting", "collection error", "importerror while importing", "modulenotfounderror"))
+    selection_failure = test_result.returncode in {4, 5} and any(
+        marker in output
+        for marker in (
+            "not found:",
+            "found no collectors",
+            "no tests ran",
+            "collected 0 items",
+            "0 tests collected",
+        )
+    )
+    if selection_failure and not collection_failure:
+        return "pytest could not resolve the requested file/node or selected zero tests"
+    return None
+
+
+def run_exact_head_dynamic_check(
+    config: AutomationConfig,
+    check_target: str,
+    expected_head_sha: str,
+    execution_cwd: Optional[str] = None,
+) -> DynamicCheckExecution:
+    """Run a focused check locally only after proving the current exact HEAD.
+
+    Adversarial validation enters a detached PR-head worktree before reaching
+    this boundary.  Unlike ordinary local testing, this runner deliberately
+    does not consult test-watcher or target-container routing: either could
+    substitute evidence from a different checkout.  A second SHA assertion
+    prevents a check that moved HEAD from being accepted as evidence.
+    """
+    target_error = validate_dynamic_check_target(check_target, Path(execution_cwd).resolve()) if execution_cwd else None
+    if target_error:
+        return DynamicCheckExecution(verification_error=f"dynamic-check target protocol error: {target_error}")
+    executor = CommandExecutor()
+
+    def current_head() -> Any:
+        command = ["git", "rev-parse", "HEAD"]
+        return executor.run_command(command, cwd=execution_cwd) if execution_cwd else executor.run_command(command)
+
+    before = current_head()
+    if not before.success or not before.stdout.strip():
+        reason = (before.stderr or "git rev-parse HEAD returned no revision").strip()
+        return DynamicCheckExecution(verification_error=reason)
+
+    executed_sha = before.stdout.strip().lower()
+    expected_sha = expected_head_sha.strip().lower()
+    if executed_sha != expected_sha:
+        return DynamicCheckExecution(
+            executed_sha=executed_sha,
+            verification_error=f"execution-target mismatch: expected {expected_sha}, found {executed_sha}",
+        )
+
+    command = ["bash", config.TEST_SCRIPT_PATH]
+    if check_target != "all":
+        command.append(check_target)
+    # scripts/test.sh normally redirects from the Auto-Coder service container
+    # to its configured target container.  This worktree is itself the verified
+    # execution target, so explicitly suppress that redirect at the script's
+    # supported boundary.  Otherwise the surrounding SHA assertions would
+    # prove only the caller's checkout, not the repository that ran the tests.
+    test_result = executor.run_command(
+        command,
+        timeout=executor.DEFAULT_TIMEOUTS["test"],
+        env_overrides={"INSIDE_TARGET_EXECUTION": "true"},
+        cwd=execution_cwd,
+    )
+
+    after = current_head()
+    if not after.success or not after.stdout.strip():
+        reason = (after.stderr or "git rev-parse HEAD returned no revision after the check").strip()
+        return DynamicCheckExecution(
+            success=test_result.success,
+            output=test_result.stdout,
+            errors=test_result.stderr,
+            verification_error=reason,
+        )
+    final_sha = after.stdout.strip().lower()
+    if final_sha != expected_sha:
+        return DynamicCheckExecution(
+            success=test_result.success,
+            output=test_result.stdout,
+            errors=test_result.stderr,
+            executed_sha=final_sha,
+            verification_error=f"execution-target mismatch after check: expected {expected_sha}, found {final_sha}",
+        )
+    return DynamicCheckExecution(
+        success=test_result.success,
+        output=test_result.stdout,
+        errors=test_result.stderr,
+        executed_sha=executed_sha,
+        target_selection_error=_pytest_target_selection_error(test_result),
+    )
+
+
+@dataclass
+class IssueRequirementManifest:
+    """Authoritative requirements and diagnostics derived from direct Issues."""
+
+    requirements: List[IssueRequirement] = field(default_factory=list)
+    mode: str = "legacy-extraction"
+    error: Optional[str] = None
+
+
+@dataclass
+class RequirementCoverageEntry:
+    """Reviewer's structured disposition for one stable Issue requirement."""
+
+    requirement_id: str = ""
+    status: str = "UNVERIFIED"
+    evidence: str = ""
+
+
+@dataclass
+class EvidenceRecoveryEntry:
+    """Independent attempt to recover initially absent validator evidence."""
+
+    path: str = ""
+    source: str = ""
+    status: str = "UNAVAILABLE"
+    evidence: str = ""
+    requirement_ids: List[str] = field(default_factory=list)
+    provenance: str = "FRESH"
+    origin_head_sha: str = ""
+
+
+@dataclass
+class DecisionCriticalEvidenceGap:
+    """Smallest irreducible evidence gap preventing a correctness decision."""
+
+    requirement_id: str = ""
+    evidence_needed: str = ""
+    recovery_attempts: List[str] = field(default_factory=list)
+
+
+@dataclass
+class ReviewThreadDisposition:
+    """Validator's independent disposition for one claimed-addressed review thread.
+
+    ``ADDRESSED`` means the original finding no longer holds on the validated
+    head; ``STILL_VALID`` means the defect remains; ``INCONCLUSIVE`` means the
+    available evidence could not establish either conclusion safely. This is
+    orthogonal to the PR-level ``result`` (a thread may be ADDRESSED while the
+    PR itself is NEEDS_FIX for an unrelated defect, and vice versa).
+    """
+
+    thread_id: str = ""
+    status: str = ""  # "ADDRESSED", "STILL_VALID", "INCONCLUSIVE"
+    rationale: str = ""
+    evidence: str = ""
+    blocker_id: Optional[str] = None
+    concern_ids: tuple[str, ...] = ()
+    # Controller-bound identity of the complete discussion supplied with the
+    # validator request.  This is deliberately not model-authored.
+    discussion_evidence_digest: str = ""
+
+
+VALID_REVIEW_THREAD_DISPOSITION_STATUSES = {"ADDRESSED", "STILL_VALID", "INCONCLUSIVE"}
+
+
+@dataclass
+class SpecificationGap:
+    """Material behavior for which the authoritative Issue defines no policy."""
+
+    question: str = ""
+    why_existing_issue_is_insufficient: str = ""
+    observed_case: str = ""
+    affected_scope: str = ""
+    candidate_options: List[str] = field(default_factory=list)
+
+
+@dataclass
+class ChangeProvenanceItem:
+    """One material changed file or related group whose PR provenance is unknown."""
+
+    paths: List[str] = field(default_factory=list)
+    change_group: str = ""
+    why_unexplained: str = ""
+
+
+@dataclass(frozen=True)
+class UnverifiedLocalRepair:
+    blocker_id: str = ""
+    thread_id: str = ""
+    reason: str = ""
+
+
+@dataclass
+class AdversarialValidationResult:
+    """Outcome of adversarial PR validation against the specification oracle.
+
+    Fail-closed design:
+    - Only 'PASS' with 0 findings evaluates to is_pass=True.
+    - Only findings carrying demonstrated reachability evidence normalize to 'NEEDS_FIX'.
+    - Empty, malformed, 'BLOCKED', 'INCONCLUSIVE', 'ERROR', or 'EXHAUSTED' evaluates to is_blocked=True.
+    - 'EXHAUSTED' is never actionable/corrective; unlike the other non-pass
+      results it self-recovers via ``retry_not_before_epoch``.
+    """
+
+    result: str = "ERROR"  # "PASS", "NEEDS_FIX", "NEEDS_TESTS", "BLOCKED", "INCONCLUSIVE", "ERROR", "EXHAUSTED"
+    summary: str = ""
+    findings: List[AdversarialValidationFinding] = field(default_factory=list)
+    raw_response: str = ""
+    dynamic_check_requested: Optional[str] = None
+    diagnostic_category: Optional[str] = None
+    diagnostic_reason: Optional[str] = None
+    requirement_coverage: List[RequirementCoverageEntry] = field(default_factory=list)
+    evidence_recovery: List[EvidenceRecoveryEntry] = field(default_factory=list)
+    decision_critical_evidence_gaps: List[DecisionCriticalEvidenceGap] = field(default_factory=list)
+    specification_gaps: List[SpecificationGap] = field(default_factory=list)
+    test_oracle_gaps: List[TestOracleGap] = field(default_factory=list)
+    thread_dispositions: List[ReviewThreadDisposition] = field(default_factory=list)
+    unexplained_changes: List[ChangeProvenanceItem] = field(default_factory=list)
+    clarification_reply_fingerprint: str = ""
+    publish_clarification_thread: bool = True
+    provenance_thread_comment_ids: Dict[str, int] = field(default_factory=dict)
+    attempt_id: str = ""
+    attempt_sequence: int = 0
+    reviewer_session_checkpoint: Optional[ReviewerSession] = field(default=None, repr=False)
+    reviewer_session_registry: Optional[ReviewerSessionRegistry] = field(default=None, repr=False)
+    accepted_finding_projection: Optional[AcceptedFindingProjection] = field(default=None, repr=False)
+    correction_reference_context: Optional[CanonicalCorrectionContext] = field(default=None, repr=False)
+    # The unmodified model verdict once an effective decision replaced it. It is
+    # historical diagnostic evidence and never publication or merge authority.
+    raw_model_result: str = ""
+    # Only set for result="EXHAUSTED": the earliest epoch time at which an
+    # automatic retry may run (REQ-006). Published durably in the comment
+    # marker so a deferred retry survives restart without local state (REQ-007).
+    retry_not_before_epoch: Optional[float] = None
+    # Optional, non-authorizing assessment produced by this same ordinary
+    # semantic response.  Durable acceptance remains owned by the review cycle.
+    closure_assessment: Optional[ReviewExecutionResult] = None
+    closure_assessment_diagnostic: str = ""
+    local_repair_generation_id: str = ""
+    local_repair_verification_pending: bool = False
+    unverified_local_repairs: List[UnverifiedLocalRepair] = field(default_factory=list)
+    # Diagnostic-only link to the attempt-local response this result was parsed
+    # from; empty for a local outcome with no semantic answer. Never authority.
+    source_response_id: str = field(default="", repr=False)
+
+    @property
+    def is_pass(self) -> bool:
+        """Return whether all defined requirements passed (gaps are orthogonal)."""
+        return self.result.strip().upper() == "PASS" and len(self.findings) == 0 and not self.open_test_oracle_gaps
+
+    @property
+    def open_test_oracle_gaps(self) -> List[TestOracleGap]:
+        """Return material test-oracle gaps that still require regression protection."""
+        return [gap for gap in self.test_oracle_gaps if gap.status == "OPEN"]
+
+    @property
+    def allows_auto_merge(self) -> bool:
+        """Return whether this result satisfies every validation merge gate."""
+        return self.is_pass and not self.specification_gaps
+
+    @property
+    def needs_fix(self) -> bool:
+        """Return True if validation explicitly determined NEEDS_FIX with findings."""
+        return self.result.strip().upper() == "NEEDS_FIX" and len(self.findings) > 0
+
+    @property
+    def needs_tests(self) -> bool:
+        """Return True when focused regression protection is still required."""
+        return self.result.strip().upper() in {"NEEDS_TESTS", "NEEDS_FIX"} and bool(self.open_test_oracle_gaps)
+
+    @property
+    def is_blocked(self) -> bool:
+        """Return True if validation could not complete or produced non-pass status."""
+        return not self.is_pass and not self.needs_fix and not self.needs_tests
+
+    @property
+    def is_exhausted(self) -> bool:
+        """Return True if validation could not run because every otherwise-valid
+        adversarial-validation backend is confirmed quota/usage exhausted."""
+        return self.result.strip().upper() == "EXHAUSTED"
+
+
+@dataclass
+class AdversarialValidationContext:
+    """Context gathered for adversarial PR validation."""
+
+    repo_name: str = ""
+    pr_number: int = 0
+    pr_title: str = ""
+    pr_body: str = ""
+    pr_diff: str = ""
+    all_changed_files: List[str] = field(default_factory=list)
+    changed_tests: List[str] = field(default_factory=list)
+    issue_context: str = ""
+    is_diff_truncated: bool = False
+    unverified_files: List[str] = field(default_factory=list)
+    issue_requirements: List[IssueRequirement] = field(default_factory=list)
+    requirement_manifest_mode: str = "legacy-extraction"
+    requirement_manifest_error: Optional[str] = None
+    evidence_retrieval_error: Optional[str] = None
+    requires_human_review: bool = False
+    validation_snapshot: str = ""
+    controller_file_evidence: List[FileDiffEvidence] = field(default_factory=list)
+    unresolvable_file_count: int = 0
+    file_change_identities: dict[str, str] = field(default_factory=dict)
+    requirement_manifest_identity: str = ""
+    # Ordinary representations of accepted Strong findings are anchored by their
+    # existing native root, not by this head's changed-file set.
+    accepted_known_gap_ids: frozenset[str] = frozenset()
+    # The subset of those representations that this attempt's independent
+    # disposition upholds (STILL_VALID with evidence). Only these may be treated
+    # as a currently demonstrated violation; a retained OPEN lifecycle state alone
+    # is a closure wait, not current evidence.
+    accepted_upheld_gap_ids: frozenset[str] = frozenset()
+    correction_reference_context: Optional[CanonicalCorrectionContext] = None
+
+    @property
+    def has_complete_file_coverage(self) -> bool:
+        """Return whether every changed file has complete patch evidence."""
+        return not self.unverified_files
+
+
+@dataclass
+class FileDiffEvidence:
+    """Bounded patch evidence and coverage state for one changed file."""
+
+    path: str = ""
+    patch: str = ""
+    original_size: int = 0
+    is_complete: bool = False
+
+
+def _snapshot_digest(repo_name: str, pr_data: Dict[str, Any], changed_files: Sequence[Dict[str, Any]], requirements: Sequence[IssueRequirement], raw_diff: str = "") -> str:
+    """Bind adjudication inputs to one deterministic PR/contract snapshot.
+
+    ``raw_diff`` is hashed in directly (not just the authoritative REST
+    listing) because the initial reviewer round is shown the raw diff itself
+    for every file it covers. When omitted files require an independent REST
+    listing, that listing alone can be unchanged even though the raw diff
+    content the initial round actually decided from has changed; without
+    binding the raw diff too, a stale initial decision could be revalidated
+    against an identical digest.
+    """
+    identity = {
+        "repository": repo_name,
+        "pr_number": pr_data.get("number"),
+        "head_sha": (pr_data.get("head") or {}).get("sha") or pr_data.get("head_sha"),
+        "base_sha": (pr_data.get("base") or {}).get("sha") or pr_data.get("base_sha"),
+        "files": changed_files,
+        "requirements": [(item.requirement_id, item.text) for item in requirements],
+        "raw_diff_sha256": hashlib.sha256(raw_diff.encode()).hexdigest(),
+    }
+    return hashlib.sha256(json.dumps(identity, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _stable_digest(value: object) -> str:
+    """Return a deterministic identity for an authoritative persisted value."""
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+
+
+def _requirement_manifest_identity(requirements: Sequence[IssueRequirement]) -> str:
+    return _stable_digest([(item.requirement_id, item.text) for item in requirements])
+
+
+def _complete_file_change_identity(record: Dict[str, Any]) -> str:
+    """Identify a complete semantic PR-file representation, excluding locators.
+
+    GitHub's URL fields contain the current commit name and therefore are not
+    part of the change itself. Conversely, an absent/truncated patch cannot
+    prove the base-side representation and intentionally has no reusable
+    identity.
+    """
+    if not _github_file_record_has_complete_patch(record):
+        return ""
+    representation = {
+        key: record.get(key)
+        for key in (
+            "filename",
+            "previous_filename",
+            "status",
+            "sha",
+            "additions",
+            "deletions",
+            "changes",
+            "patch",
+        )
+    }
+    return _stable_digest(representation)
+
+
+def _github_file_record_has_complete_patch(record: Dict[str, Any]) -> bool:
+    """Reject absent or truncated REST patches using authoritative line totals."""
+    patch = record.get("patch")
+    additions = record.get("additions")
+    deletions = record.get("deletions")
+    if not isinstance(patch, str) or not patch.strip() or not isinstance(additions, int) or not isinstance(deletions, int):
+        return False
+    # GitHub's per-file REST `patch` field contains only the hunk header(s)
+    # (`@@ ... @@`) and content lines; it never includes unified-diff
+    # `--- a/file` / `+++ b/file` file headers. A content line beginning with
+    # `++` or `--` is real source text (e.g. `++counter;`), not a header, so
+    # it must not be excluded from the addition/deletion counts.
+    patch_additions = sum(1 for line in patch.splitlines() if line.startswith("+"))
+    patch_deletions = sum(1 for line in patch.splitlines() if line.startswith("-"))
+    return patch_additions == additions and patch_deletions == deletions
+
+
+def adversarial_validation_comment_marker(head_sha: str) -> str:
+    """Return the versioned marker used to deduplicate validation comments."""
+    return f"<!-- auto-coder-adversarial-validation:{ADVERSARIAL_VALIDATION_CACHE_VERSION}:{head_sha} -->"
+
+
+def adversarial_validation_codex_feedback_marker(head_sha: str) -> str:
+    """Return the durable marker for a validation result sent to Codex Cloud."""
+    return f"<!-- auto-coder-adversarial-validation-codex-feedback:{ADVERSARIAL_VALIDATION_CACHE_VERSION}:{head_sha} -->"
+
+
+def count_adversarial_validation_comments(comments: Any) -> int:
+    """Count the number of adversarial validation verdict comments on a PR."""
+    if not comments:
+        return 0
+    items: Iterable[Any]
+    if isinstance(comments, (list, tuple)):
+        items = comments
+    else:
+        try:
+            items = list(comments)
+        except Exception:
+            return 0
+
+    count = 0
+    for comment in items:
+        body = comment.get("body", "") if isinstance(comment, dict) else getattr(comment, "body", "")
+        if not isinstance(body, str):
+            continue
+        if re.search(r"<!--\s*auto-coder-adversarial-validation:(?!codex-feedback)[^>]+-->", body):
+            count += 1
+    return count
+
+
+def _bounded_comment_field(value: str) -> str:
+    """Return redacted, bounded prose without embedding raw Codex JSONL."""
+    text = redact_string(value).strip()
+    event_match = re.search(r'\{"type":"(?:thread|turn|item)\.', text)
+    if event_match:
+        prefix = text[: event_match.start()].rstrip(" :\n")
+        omission = "_Codex CLI event details omitted; see the structured interaction log._"
+        return f"{prefix}.\n\n{omission}" if prefix else omission
+    if len(text) <= ADVERSARIAL_VALIDATION_COMMENT_FIELD_LIMIT:
+        return text
+    omitted = len(text) - ADVERSARIAL_VALIDATION_COMMENT_FIELD_LIMIT
+    return f"{text[:ADVERSARIAL_VALIDATION_COMMENT_FIELD_LIMIT]}... [{omitted} characters omitted]"
+
+
+def format_adversarial_validation_comment(result: AdversarialValidationResult, head_sha: str) -> str:
+    """Render a bounded, human-readable PR comment for a validation result.
+
+    The raw CLI response is intentionally excluded because it can contain a very
+    large event stream.  The parsed summary and every structured finding retain
+    the actionable reviewer output while keeping the GitHub comment usable.
+    """
+    status = ("INCOMPLETE" if result.unverified_local_repairs else "COMPLETE") if result.local_repair_generation_id else result.result.strip().upper() or "ERROR"
+    status_icon = "✅" if result.is_pass else "❌" if result.needs_fix else "⚠️"
+    lines = [
+        f"<!-- auto-coder-local-repair-validation:v1:{result.local_repair_generation_id}{':pending' if result.local_repair_verification_pending else ''}:{head_sha} -->" if result.local_repair_generation_id else adversarial_validation_comment_marker(head_sha),
+        *([f"<!-- auto-coder-adversarial-validation-attempt:v1:{result.attempt_sequence}:{result.attempt_id} -->"] if result.attempt_id else []),
+        *([f"<!-- auto-coder-adversarial-validation-retry-not-before:v1:{result.retry_not_before_epoch} -->"] if result.retry_not_before_epoch is not None else []),
+        f"## {status_icon} Auto-Coder local repair verification: {status}" if result.local_repair_generation_id else f"## {status_icon} Auto-Coder adversarial validation: {status}",
+        "",
+        f"Validated commit: `{head_sha}`",
+        "",
+        _bounded_comment_field(result.summary) or "No validation summary was provided.",
+        *(["", f"Raw model verdict `{result.raw_model_result}` is historical diagnostic evidence only; the effective decision above governs this review."] if result.raw_model_result and result.raw_model_result.strip().upper() != status else []),
+    ]
+
+    if result.local_repair_generation_id:
+        lines.extend(["", f"Repair generation: `{result.local_repair_generation_id}`", "This report verifies only the pending local correction targets. It is not a full PR validation or merge approval."])
+    if result.unverified_local_repairs:
+        lines.extend(["", "### Pending local corrections NOT verified", "", "Independent verification did not complete for the following targets. They remain pending in the repair allowance ledger; STILL_VALID entries for other targets do not settle them."])
+        for pending in result.unverified_local_repairs:
+            lines.extend(["", f"- Blocker `{_bounded_comment_field(pending.blocker_id)}`, thread `{_bounded_comment_field(pending.thread_id) or 'unavailable'}`: {_bounded_comment_field(pending.reason)}"])
+
+    if result.retry_not_before_epoch is not None:
+        retry_at = datetime.fromtimestamp(result.retry_not_before_epoch, tz=timezone.utc).isoformat()
+        lines.extend(["", f"Automatic retry not before: `{retry_at}`"])
+
+    if result.dynamic_check_requested:
+        lines.extend(["", f"Dynamic check requested: `{_bounded_comment_field(result.dynamic_check_requested)}`"])
+
+    if result.requirement_coverage:
+        coverage_by_status: Dict[str, List[str]] = {}
+        for entry in result.requirement_coverage:
+            status = entry.status.strip().upper() or "UNVERIFIED"
+            coverage_by_status.setdefault(status, []).append(entry.requirement_id)
+        counts = ", ".join(f"{status}: {len(requirement_ids)}" for status, requirement_ids in sorted(coverage_by_status.items()))
+        lines.extend(["", f"Issue requirement coverage ({len(result.requirement_coverage)} total): {counts}."])
+        for status, requirement_ids in sorted(coverage_by_status.items()):
+            if status in {"VERIFIED", "IRRELEVANT"}:
+                continue
+            displayed_ids = requirement_ids[:ADVERSARIAL_VALIDATION_COVERAGE_ID_LIMIT]
+            omitted = len(requirement_ids) - len(displayed_ids)
+            suffix = f" (+{omitted} more)" if omitted else ""
+            lines.append(f"- **{status}**: {', '.join(f'`{requirement_id}`' for requirement_id in displayed_ids)}{suffix}")
+
+    if result.findings:
+        lines.extend(["", f"### Findings ({len(result.findings)})"])
+        for index, finding in enumerate(result.findings, start=1):
+            requirement_label = ", ".join(f"`{requirement_id}`" for requirement_id in finding.all_requirement_ids)
+            requirement_label = f"{requirement_label}: " if requirement_label else ""
+            lines.extend(["", f"#### {index}. Violated requirement", f"{requirement_label}{_bounded_comment_field(finding.violated_requirement) or 'Not specified.'}"])
+            if finding.counterexample.strip():
+                lines.extend(["", "**Counterexample**", "", _bounded_comment_field(finding.counterexample)])
+            if finding.reachability.strip():
+                lines.extend(["", "**Reachable path**", "", _bounded_comment_field(finding.reachability)])
+            if finding.evidence.strip():
+                lines.extend(["", "**Demonstrating evidence**", "", _bounded_comment_field(finding.evidence)])
+            if finding.test_gap.strip():
+                lines.extend(["", "**Test gap**", "", _bounded_comment_field(finding.test_gap)])
+            if finding.suggested_regression_scenario.strip():
+                lines.extend(["", "**Suggested regression scenario**", "", _bounded_comment_field(finding.suggested_regression_scenario)])
+
+    if result.open_test_oracle_gaps:
+        lines.extend(
+            [
+                "",
+                f"### Material test-oracle gaps ({len(result.open_test_oracle_gaps)})",
+                "",
+                "These are missing regression protections, not demonstrated production-code violations. " "Automatic merge remains blocked pending the focused tests below.",
+            ]
+        )
+        for index, oracle_gap in enumerate(result.open_test_oracle_gaps, start=1):
+            lines.extend(
+                [
+                    "",
+                    f"#### Gap {index}: `{oracle_gap.gap_id}` (`{oracle_gap.requirement_id}`)",
+                    f"- **Authoritative boundary:** {_bounded_comment_field(oracle_gap.authoritative_boundary)}",
+                    f"- **Invariant:** {_bounded_comment_field(oracle_gap.invariant)}",
+                    f"- **Incorrect implementation that can pass:** {_bounded_comment_field(oracle_gap.plausible_incorrect_implementation)}",
+                    f"- **Why tests remain green:** {_bounded_comment_field(oracle_gap.why_tests_still_pass)}",
+                    f"- **Material consequence:** {_bounded_comment_field(oracle_gap.material_consequence)}",
+                    f"- **Focused regression scenario:** {_bounded_comment_field(oracle_gap.focused_regression_scenario)}",
+                ]
+            )
+
+    if result.specification_gaps:
+        lines.extend(
+            [
+                "",
+                f"### Specification gaps ({len(result.specification_gaps)})",
+                "",
+                "These are not proven implementation defects. The linked Issue does not define the required policy, "
+                "and Auto-Coder did not choose one. Review of all defined requirements continued. Automatic merge is "
+                "disabled while any gap remains; a human may still merge manually and handle specification follow-up separately.",
+            ]
+        )
+        for index, gap in enumerate(result.specification_gaps, start=1):
+            lines.extend(
+                [
+                    "",
+                    f"#### Gap {index}: {_bounded_comment_field(gap.question)}",
+                    f"- **Why the Issue is insufficient:** {_bounded_comment_field(gap.why_existing_issue_is_insufficient)}",
+                    f"- **Observed case:** {_bounded_comment_field(gap.observed_case)}",
+                    f"- **Affected scope:** {_bounded_comment_field(gap.affected_scope)}",
+                ]
+            )
+            if gap.candidate_options:
+                lines.append("- **Neutral candidate options (not requirements):**")
+                lines.extend(f"  - {_bounded_comment_field(option)}" for option in gap.candidate_options)
+
+    if result.diagnostic_category or result.diagnostic_reason:
+        lines.extend(["", "### Diagnostic"])
+        if result.diagnostic_category:
+            lines.append(f"Category: `{result.diagnostic_category}`")
+        if result.diagnostic_reason:
+            lines.append(f"Reason: {_bounded_comment_field(result.diagnostic_reason)}")
+
+    comment = "\n".join(lines)
+    if len(comment) > ADVERSARIAL_VALIDATION_COMMENT_LIMIT:
+        suffix = "\n\n_Comment truncated by Auto-Coder; the complete response remains in the structured LLM interaction log._"
+        comment = comment[: ADVERSARIAL_VALIDATION_COMMENT_LIMIT - len(suffix)].rstrip() + suffix
+    return comment
+
+
+def format_adversarial_review_summary(
+    result: AdversarialValidationResult,
+    head_sha: str,
+    attached_test_oracle_gap_count: Optional[int] = None,
+    attached_finding_count: Optional[int] = None,
+) -> str:
+    """Render review-level metadata without duplicating actionable findings."""
+    summary_result = AdversarialValidationResult(
+        result=result.result,
+        summary=result.summary,
+        dynamic_check_requested=result.dynamic_check_requested,
+        diagnostic_category=result.diagnostic_category,
+        diagnostic_reason=result.diagnostic_reason,
+        requirement_coverage=result.requirement_coverage,
+        specification_gaps=result.specification_gaps,
+        attempt_id=result.attempt_id,
+        attempt_sequence=result.attempt_sequence,
+        raw_model_result=result.raw_model_result,
+        local_repair_generation_id=result.local_repair_generation_id,
+        local_repair_verification_pending=result.local_repair_verification_pending,
+        unverified_local_repairs=result.unverified_local_repairs,
+    )
+    body = format_adversarial_validation_comment(summary_result, head_sha)
+    if result.clarification_reply_fingerprint:
+        body += f"\n{result.clarification_reply_fingerprint}"
+    finding_count = len(result.findings) if attached_finding_count is None else attached_finding_count
+    if finding_count:
+        body += f"\n\n{finding_count} actionable finding thread(s) are attached to this review."
+    elif result.findings:
+        body += f"\n\n{len(result.findings)} actionable finding(s) remain represented by existing review threads."
+    attached_gap_count = len(result.open_test_oracle_gaps) if attached_test_oracle_gap_count is None else attached_test_oracle_gap_count
+    if attached_gap_count:
+        body += f"\n\n{attached_gap_count} focused regression-test request thread(s) are attached to this review."
+    elif result.open_test_oracle_gaps:
+        body += f"\n\n{len(result.open_test_oracle_gaps)} open material test-oracle gap(s) remain represented by existing review threads."
+    if result.unexplained_changes and result.publish_clarification_thread:
+        body += "\n\nOne change-provenance clarification thread is attached to this review."
+    unresolved_dispositions = [disposition for disposition in result.thread_dispositions if disposition.status != "ADDRESSED"]
+    if unresolved_dispositions:
+        body += "\n\n### Unresolved review-thread dispositions"
+        for disposition in unresolved_dispositions:
+            body += "\n\n" + "\n".join(
+                [
+                    f"#### `{_bounded_comment_field(disposition.thread_id)}`: {disposition.status}",
+                    "",
+                    "**Current rationale**",
+                    "",
+                    _bounded_comment_field(disposition.rationale),
+                    "",
+                    "**Current evidence**",
+                    "",
+                    _bounded_comment_field(disposition.evidence),
+                ]
+            )
+    return body
+
+
+def format_change_provenance_clarification(items: List[ChangeProvenanceItem]) -> str:
+    """Render one aggregated, non-defect clarification thread."""
+    lines = [
+        CHANGE_PROVENANCE_CLARIFICATION_MARKER,
+        "### Auto-Coder change-provenance clarification",
+        "",
+        "The Issue requirements were verified, but the reviewer could not independently establish why every material change below belongs to this PR. This is a clarification blocker, not an instruction to change code or create a commit.",
+        "",
+        "Please explain each item and classify it as:",
+        "",
+        "- intentional and directly required by the PR, including the causal reason;",
+        "- generated or mechanically derived from another intentional change, including that causal change; or",
+        "- unrelated or accidental.",
+    ]
+    for index, item in enumerate(items, start=1):
+        paths = ", ".join(f"`{path}`" for path in item.paths)
+        lines.extend(
+            [
+                "",
+                f"{index}. **{_bounded_comment_field(item.change_group)}** — {paths}",
+                f"   - Why clarification is needed: {_bounded_comment_field(item.why_unexplained)}",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "Reply in this thread with the requested provenance. End a material provenance reply with the following marker on its own line so Auto-Coder can independently revalidate this same commit:",
+            "",
+            "`<!-- auto-coder-review-addressed:v1 -->`",
+            "",
+            "Your explanation is an unverified claim and navigation aid; the adversarial reviewer will compare it independently with the diff, repository state, and relevant tests before clearing this blocker.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def format_change_provenance_disposition(disposition: ReviewThreadDisposition, validated_head_sha: str) -> str:
+    """Render an independent unresolved result for the clarification thread."""
+    correction = "The identified accidental or contradicted material change must be removed or corrected before merge." if disposition.status == "STILL_VALID" else "The supplied explanation was insufficient to clear this clarification blocker."
+    return "\n".join(
+        [
+            "<!-- auto-coder-change-provenance-disposition:v1 -->",
+            "### Auto-Coder independent provenance verification",
+            "",
+            f"Validated commit: `{validated_head_sha}`",
+            "",
+            f"Status: **{disposition.status}**",
+            "",
+            correction,
+            "",
+            "**Rationale**",
+            "",
+            disposition.rationale,
+            "",
+            "**Evidence**",
+            "",
+            disposition.evidence,
+        ]
+    )
+
+
+def format_adversarial_finding_comment(finding: AdversarialValidationFinding) -> str:
+    """Render all actionable data for one independently resolvable thread."""
+    requirement_label = ", ".join(f"`{requirement_id}`" for requirement_id in finding.all_requirement_ids)
+    requirement_label = f"{requirement_label}: " if requirement_label else ""
+    lines = [
+        "### Auto-Coder adversarial finding",
+        "",
+        "**Violated requirement**",
+        "",
+        f"{requirement_label}{_bounded_comment_field(finding.requirement_text or finding.violated_requirement) or 'Not specified.'}",
+    ]
+    fields = (
+        ("Required behavior", finding.required_behavior),
+        ("Actual behavior", finding.actual_behavior),
+        ("Counterexample", finding.counterexample),
+        ("Reachable path", finding.reachability),
+        ("Demonstrating evidence", finding.evidence),
+        ("Test gap", finding.test_gap),
+        ("Suggested regression scenario", finding.suggested_regression_scenario),
+    )
+    for heading, value in fields:
+        if value.strip():
+            lines.extend(["", f"**{heading}**", "", _bounded_comment_field(value)])
+    return "\n".join(lines)
+
+
+def format_test_oracle_gap_comment(gap: TestOracleGap) -> str:
+    """Render one independently resolvable focused regression-test request."""
+    return "\n".join(
+        [
+            "### Auto-Coder material test-oracle gap",
+            "",
+            f"Gap identity: `{gap.gap_id}`",
+            "",
+            "This finding does **not** claim that current production behavior violates the Issue. " "It identifies missing regression protection for an explicit material requirement.",
+            "",
+            "**Issue requirement**",
+            "",
+            f"`{gap.requirement_id}`: {_bounded_comment_field(gap.requirement_text)}",
+            "",
+            "**Authoritative boundary**",
+            "",
+            _bounded_comment_field(gap.authoritative_boundary),
+            "",
+            "**Protected invariant**",
+            "",
+            _bounded_comment_field(gap.invariant),
+            "",
+            "**Minimal plausible incorrect implementation**",
+            "",
+            _bounded_comment_field(gap.plausible_incorrect_implementation),
+            "",
+            "**Why the available tests would still pass**",
+            "",
+            _bounded_comment_field(gap.why_tests_still_pass),
+            "",
+            "**Material consequence**",
+            "",
+            _bounded_comment_field(gap.material_consequence),
+            "",
+            "**Focused regression scenario requested**",
+            "",
+            _bounded_comment_field(gap.focused_regression_scenario),
+            "",
+            "Add only the focused regression protection described above; do not change production code unless a separate demonstrated violation requires it.",
+        ]
+    )
+
+
+def is_test_file(file_path: str) -> bool:
+    """Determine whether a file path corresponds to a test file."""
+    path_lower = file_path.lower()
+    return path_lower.startswith("tests/") or path_lower.startswith("test/") or "/tests/" in path_lower or "/test/" in path_lower or path_lower.endswith("_test.py") or path_lower.endswith("test.py") or ".spec." in path_lower or ".test." in path_lower
+
+
+def _decode_git_path_token(token: str) -> str:
+    """Decode a pathname token emitted with Git's ``core.quotePath`` format."""
+    value = token.strip()
+    if not (value.startswith('"') and value.endswith('"')):
+        return value
+
+    try:
+        decoded = ast.literal_eval(value)
+    except (SyntaxError, ValueError):
+        return value
+    if not isinstance(decoded, str):
+        return value
+
+    # Git writes non-ASCII UTF-8 bytes as C-style octal escapes. Python's
+    # string-literal decoder maps each byte to the same Latin-1 code point, so
+    # convert those code points back to bytes before decoding the pathname.
+    try:
+        return decoded.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return decoded
+
+
+def _extract_diff_header_path(line: str) -> Optional[str]:
+    """Extract the destination path from quoted or unquoted ``diff --git`` headers."""
+    prefix = "diff --git "
+    if not line.startswith(prefix):
+        return None
+    payload = line[len(prefix) :]
+
+    if payload.startswith('"'):
+        quoted_pair = re.fullmatch(r'("(?:\\.|[^"\\])*")\s+("(?:\\.|[^"\\])*")', payload)
+        if not quoted_pair:
+            return None
+        destination = _decode_git_path_token(quoted_pair.group(2))
+    else:
+        unquoted_pair = re.fullmatch(r"a/(.*)\s+b/(.*)", payload)
+        if not unquoted_pair:
+            return None
+        destination = f"b/{unquoted_pair.group(2)}"
+
+    return destination[2:] if destination.startswith("b/") else destination
+
+
+def _extract_marker_path(line: str) -> Optional[str]:
+    """Extract a path from a unified diff ``+++`` destination marker."""
+    if not line.startswith("+++ "):
+        return None
+    destination = _decode_git_path_token(line[4:])
+    if destination == "/dev/null":
+        return None
+    return destination[2:] if destination.startswith("b/") else destination
+
+
+def extract_all_changed_files(pr_diff: str) -> List[str]:
+    """Extract all modified or added file paths from a unified diff string.
+
+    Args:
+        pr_diff: Unified diff string
+
+    Returns:
+        List of all changed file paths
+    """
+    if not pr_diff:
+        return []
+
+    files = [file_patch.path for file_patch in _split_diff_by_file(pr_diff)]
+    if files:
+        return files
+
+    # Retain support for a bare unified patch without ``diff --git`` headers.
+    for line in pr_diff.splitlines():
+        path = _extract_marker_path(line)
+        if path and path not in files:
+            files.append(path)
+
+    return files
+
+
+def extract_changed_test_files(pr_diff: str) -> List[str]:
+    """Extract test file paths modified or added in the PR diff.
+
+    Args:
+        pr_diff: Unified diff string
+
+    Returns:
+        List of changed test file paths
+    """
+    all_files = extract_all_changed_files(pr_diff)
+    return [f for f in all_files if is_test_file(f)]
+
+
+def extract_issue_requirements(issue_context: str) -> List[IssueRequirement]:
+    """Create stable, machine-checkable requirement units from the Issue oracle.
+
+    Every substantive oracle line is included, so a reviewer cannot silently omit
+    a requirement-bearing prose line. Non-requirement background may be marked
+    IRRELEVANT by the reviewer, but it still needs an explicit coverage entry.
+    """
+    requirements: List[IssueRequirement] = []
+    seen: set[str] = set()
+    ignored_labels = {"issue description:", "parent issue description:"}
+    for raw_line in issue_context.splitlines():
+        text = raw_line.strip()
+        if not text or text.lower() in ignored_labels:
+            continue
+        normalized = re.sub(r"^#{1,6}\s+", "", text)
+        normalized = re.sub(r"^(?:[-*+]\s+|\d+[.)]\s+|\[[ xX]\]\s+)", "", normalized).strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        digest = hashlib.sha256(normalized.encode("utf-8", errors="replace")).hexdigest()[:10]
+        requirement_id = f"REQ-{len(requirements) + 1:03d}-{digest}"
+        requirements.append(IssueRequirement(requirement_id=requirement_id, text=normalized))
+    return requirements
+
+
+def _explicit_requirements_section(issue: VerifiedIssueOracle) -> tuple[bool, List[tuple[str, str]], Optional[str]]:
+    """Adapt the shared contract oracle to the adversarial manifest builder."""
+    manifest = build_normative_issue_manifest(issue.number, issue.title, issue.body)
+    entries = [(entry.requirement_id, entry.text) for entry in manifest.requirements]
+    return manifest.explicit_contract_present, entries, manifest.error
+
+
+def build_issue_requirement_manifest(resolution: IssueOracleResolution) -> IssueRequirementManifest:
+    """Build a contract from direct Issue bodies, using legacy extraction only when needed."""
+    parsed: List[tuple[VerifiedIssueOracle, bool, List[tuple[str, str]]]] = []
+    modes: set[str] = set()
+    for issue in resolution.issues:
+        explicit, entries, error = _explicit_requirements_section(issue)
+        if error:
+            return IssueRequirementManifest(mode="explicit-contract", error=error)
+        if explicit:
+            modes.add("explicit-contract")
+            parsed.append((issue, True, entries))
+        else:
+            modes.add("legacy-extraction")
+            legacy = [(requirement.requirement_id, requirement.text) for requirement in extract_issue_requirements(issue.body)]
+            parsed.append((issue, False, legacy))
+
+    requirements: List[IssueRequirement] = []
+    for issue, explicit, entries in parsed:
+        for requirement_id, requirement_text in entries:
+            validator_id = f"#{issue.number}/{requirement_id}" if explicit else requirement_id
+            requirements.append(IssueRequirement(requirement_id=validator_id, text=requirement_text))
+    mode = "mixed" if len(modes) > 1 else next(iter(modes), "legacy-extraction")
+    return IssueRequirementManifest(requirements=requirements, mode=mode)
+
+
+def _split_diff_by_file(pr_diff: str) -> List[FileDiffEvidence]:
+    """Split a unified Git diff into ordered per-file patches."""
+    matches = list(re.finditer(r"^diff --git .*$", pr_diff, re.MULTILINE))
+    evidence: List[FileDiffEvidence] = []
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(pr_diff)
+        patch = pr_diff[match.start() : end].rstrip()
+        path = next((_extract_marker_path(line) for line in patch.splitlines() if _extract_marker_path(line)), None)
+        path = path or _extract_diff_header_path(match.group(0)) or f"<unparsed diff header at character {match.start()}>"
+        evidence.append(FileDiffEvidence(path=path, patch=patch, original_size=len(patch)))
+    return evidence
+
+
+def _render_complete_file_evidence(file_patch: FileDiffEvidence) -> str:
+    """Render one completely covered file patch."""
+    return f"### Changed file: {file_patch.path}\nCoverage: COMPLETE ({file_patch.original_size}/{file_patch.original_size} patch characters supplied)\n{file_patch.patch}"
+
+
+def _format_path_manifest(paths: List[str], empty_message: str) -> str:
+    """Render a complete path manifest with no local character bound.
+
+    REQ-001/REQ-002: every path Auto-Coder already retrieved must reach the
+    reviewer; a local character budget must never omit, truncate, or sample
+    the changed-file manifest.
+    """
+    if not paths:
+        return empty_message
+    return "\n".join(f"- {path}" for path in paths)
+
+
+def build_file_aware_diff(pr_diff: str) -> tuple[str, List[str]]:
+    """Render complete, per-file diff evidence for every retrieved changed file.
+
+    REQ-001/REQ-002: a local character budget must never convert already
+    retrieved patch evidence into unverified evidence, so every file
+    ``_split_diff_by_file`` can identify is rendered with its complete,
+    untruncated patch. The unverified-files return value is always empty
+    here; only a genuine upstream retrieval gap (see
+    ``build_adversarial_validation_context``) may report a path as
+    unverified.
+    """
+    file_patches = _split_diff_by_file(pr_diff)
+    if not file_patches:
+        return pr_diff, []
+
+    complete_blocks = [_render_complete_file_evidence(file_patch) for file_patch in file_patches]
+    return "\n\n".join(complete_blocks), []
+
+
+def build_adversarial_validation_context(
+    repo_name: str,
+    pr_data: Dict[str, Any],
+    config: AutomationConfig,
+    github_client: Optional[Any] = None,
+    bypass_cache: bool = False,
+) -> AdversarialValidationContext:
+    """Compile issue specification, PR diff, and changed tests for validation.
+
+    Recovers oracle/specification from PR body, title, branch name, and session.
+    Every changed-file patch that GitHub's diff endpoint returns is supplied in
+    full; no Auto-Coder-local character budget hides or samples a file.
+
+    Args:
+        repo_name: Repository name in 'owner/repo' format
+        pr_data: Pull request metadata dictionary
+        config: AutomationConfig instance
+        github_client: Optional GitHubClient instance
+        bypass_cache: Force genuinely cache-bypassing retrieval of the diff,
+            changed-file listing, and linked Issue body instead of the
+            ordinary cached lookups. Use only to reconfirm a validation
+            snapshot is still current; the general path stays cached.
+
+    Returns:
+        AdversarialValidationContext populated with review data
+    """
+    pr_number = pr_data.get("number", 0)
+    pr_title = pr_data.get("title", "Unknown")
+    pr_body = pr_data.get("body") or ""
+
+    client = github_client
+    if client is None:
+        try:
+            client = GitHubClient.get_instance()
+        except Exception:
+            client = None
+
+    # Retrieve complete diff evidence and the authoritative changed-file count through
+    # independent endpoints so GitHub's own raw-diff retrieval gap cannot authorize a
+    # large PR. No Auto-Coder-local character budget is applied to either (REQ-001,
+    # REQ-002): a path only becomes unverified when the authoritative changed-file
+    # count exceeds what the raw diff actually returned (a genuine upstream gap).
+    pr_diff = ""
+    raw_diff = ""
+    is_diff_truncated = False
+    all_changed_files: List[str] = []
+    unverified_files: List[str] = []
+    evidence_retrieval_error: Optional[str] = None
+    requires_human_review = False
+    changed_file_records: List[Dict[str, Any]] = []
+    controller_file_evidence: List[FileDiffEvidence] = []
+    unresolvable_file_count = 0
+
+    def _select_retrieval(strict_name: str, cached: Any) -> Any:
+        # Check the class, not the instance: an unconfigured test double
+        # (e.g. a bare MagicMock) auto-vivifies any instance attribute as a
+        # callable, which would silently select a strict method nobody
+        # configured. A real GitHubClient defines these methods on the class.
+        if bypass_cache and callable(getattr(type(client), strict_name, None)):
+            return getattr(client, strict_name)
+        return cached
+
+    if client:
+        get_diff = _select_retrieval("get_pr_diff_strict", client.get_pr_diff)
+        get_changed_file_count = _select_retrieval("get_pr_changed_file_count_strict", client.get_pr_changed_file_count)
+        get_changed_files = _select_retrieval("get_pr_changed_files_strict", client.get_pr_changed_files)
+
+        raw_diff = ""
+        diff_changed_files: List[str] = []
+        try:
+            raw_diff = get_diff(repo_name, pr_number)
+            if raw_diff:
+                diff_changed_files = extract_all_changed_files(raw_diff)
+                pr_diff, unverified_files = build_file_aware_diff(raw_diff)
+        except Exception as e:
+            logger.warning(f"Could not retrieve diff for PR #{pr_number}: {e}")
+
+        all_changed_files = diff_changed_files
+        try:
+            changed_file_count = get_changed_file_count(repo_name, pr_number)
+            if changed_file_count > 300:
+                requires_human_review = True
+            elif changed_file_count > len(diff_changed_files):
+                try:
+                    records = get_changed_files(repo_name, pr_number)
+                except PartialPRChangedFilesError as partial_error:
+                    # Retain every successfully fetched record instead of
+                    # discarding it: this per-path evidence still reaches the
+                    # bounded completion round. The unaccounted remainder
+                    # (files whose names were never learned) is tracked
+                    # separately in unresolvable_file_count so a final PASS
+                    # remains impossible without silently blocking this
+                    # round's use of the evidence that was retrieved.
+                    records = [dict(record) for record in partial_error.partial_records if isinstance(record, dict)]
+                    unresolvable_file_count = changed_file_count - len(records)
+                    logger.warning(f"PR #{pr_number} changed-file pagination failed on page {partial_error.failed_page}; retrieved {len(records)} of {changed_file_count} files ({partial_error.original_error})")
+                else:
+                    if not isinstance(records, list) or len(records) != changed_file_count:
+                        raise ValueError("authoritative changed-file listing was incomplete")
+                changed_file_records = [dict(record) for record in records]
+                listed_paths = [str(record.get("filename", "")).strip() for record in changed_file_records]
+                if any(not path for path in listed_paths):
+                    raise ValueError("authoritative changed-file listing contained an unnamed path")
+                raw_paths = set(diff_changed_files)
+                all_changed_files = listed_paths if not unresolvable_file_count else sorted(raw_paths | set(listed_paths))
+                unverified_files = [path for path in listed_paths if path not in raw_paths]
+                by_path = {str(record["filename"]): record for record in changed_file_records}
+                for path in unverified_files:
+                    record = by_path[path]
+                    complete = _github_file_record_has_complete_patch(record)
+                    evidence = json.dumps(record, sort_keys=True, default=str)
+                    controller_file_evidence.append(FileDiffEvidence(path=path, patch=evidence, original_size=len(evidence), is_complete=complete))
+            elif changed_file_count == len(diff_changed_files):
+                raw_digest = hashlib.sha256(pr_diff.encode()).hexdigest()
+                changed_file_records = [{"filename": path, "raw_diff_sha256": raw_digest} for path in diff_changed_files]
+        except Exception as e:
+            evidence_retrieval_error = f"Authoritative changed-file count retrieval failed: {e}"
+            logger.warning(f"Could not retrieve authoritative changed-file count for PR #{pr_number}: {e}")
+
+        is_diff_truncated = bool(unverified_files)
+
+    # Extract linked issues context (from body, title, branch name, session)
+    resolution = resolve_issue_oracles(client, repo_name, pr_data=pr_data, pr_body=pr_body, bypass_cache=bypass_cache)
+    issue_context = get_linked_issues_context(client, repo_name, pr_body=pr_body, pr_data=pr_data, resolution=resolution)
+    manifest = build_issue_requirement_manifest(resolution)
+    if not bypass_cache:
+        # A cache-bypassing call only reconfirms a snapshot; the first construction is what the reviewer consumes.
+        validation_evidence.observe_context_inputs(repo_name, pr_body, resolution, issue_context, pr_data.get("updated_at"))
+
+    # Extract changed test files from diff or all_changed_files
+    changed_tests = [f for f in all_changed_files if is_test_file(f)] if all_changed_files else extract_changed_test_files(pr_diff)
+
+    return AdversarialValidationContext(
+        repo_name=repo_name,
+        pr_number=pr_number,
+        pr_title=pr_title,
+        pr_body=pr_body,
+        pr_diff=pr_diff,
+        all_changed_files=all_changed_files,
+        changed_tests=changed_tests,
+        issue_context=issue_context,
+        is_diff_truncated=is_diff_truncated,
+        unverified_files=unverified_files,
+        issue_requirements=manifest.requirements,
+        requirement_manifest_mode=manifest.mode,
+        requirement_manifest_error=manifest.error,
+        evidence_retrieval_error=evidence_retrieval_error,
+        requires_human_review=requires_human_review,
+        validation_snapshot=_snapshot_digest(repo_name, pr_data, changed_file_records, manifest.requirements, raw_diff),
+        controller_file_evidence=controller_file_evidence,
+        unresolvable_file_count=unresolvable_file_count,
+        file_change_identities={str(record.get("filename", "")): identity for record in changed_file_records if str(record.get("filename", "")) and (identity := _complete_file_change_identity(record))},
+        requirement_manifest_identity=_requirement_manifest_identity(manifest.requirements),
+    )
+
+
+def validation_snapshot_is_current(
+    repo_name: str,
+    pr_data: Dict[str, Any],
+    config: AutomationConfig,
+    github_client: Any,
+    expected_snapshot: str,
+) -> bool:
+    """Reconfirm every authoritative validation input without using caches."""
+    if not expected_snapshot:
+        return False
+    try:
+        pr_number = int(pr_data.get("number", 0))
+        getter = getattr(type(github_client), "get_pull_request_metadata_strict", None)
+        if callable(getter):
+            live_pr_data = github_client.get_pull_request_metadata_strict(repo_name, pr_number)
+            if not isinstance(live_pr_data, dict):
+                return False
+        else:
+            live_pr_data = pr_data
+        refreshed = build_adversarial_validation_context(repo_name, live_pr_data, config, github_client, bypass_cache=True)
+    except Exception:
+        return False
+    return refreshed.validation_snapshot == expected_snapshot
+
+
+def _extract_finding_from_dict(f: Dict[str, Any]) -> Optional[AdversarialValidationFinding]:
+    """Helper to parse an AdversarialValidationFinding from a dictionary."""
+    req = str(f.get("violated_requirement", "")).strip()
+    ce = str(f.get("counterexample", "")).strip()
+    gap = str(f.get("test_gap", "")).strip()
+    scen = str(f.get("suggested_regression_scenario", "")).strip()
+
+    if req or ce or gap or scen:
+        return AdversarialValidationFinding(
+            violated_requirement=req or "Specification requirement violated",
+            counterexample=ce or "Specification violation identified",
+            test_gap=gap or "Existing tests do not assert this condition",
+            suggested_regression_scenario=scen or "Add regression test covering counterexample",
+        )
+    return None
+
+
+def _extract_thread_dispositions(raw_value: Any) -> List[ReviewThreadDisposition]:
+    """Parse review-thread dispositions leniently: a malformed entry is dropped.
+
+    A thread disposition is orthogonal metadata (REQ-005): a malformed or
+    incomplete entry must never corrupt the PR-level PASS/NEEDS_FIX verdict.
+    Dropping it simply means that thread receives no valid disposition and
+    therefore stays unresolved (REQ-004, REQ-008) rather than failing the
+    entire validator response closed.
+    """
+    if not isinstance(raw_value, list):
+        return []
+
+    # Count raw thread_id occurrences BEFORE per-entry validation. A duplicate
+    # thread_id must invalidate that thread even when one of the duplicates is
+    # itself malformed (e.g. one valid ADDRESSED entry plus a second, invalid
+    # entry for the same ID) — otherwise the malformed entry would be dropped
+    # first and the single remaining valid entry would wrongly survive
+    # (REQ-006, REQ-008).
+    raw_thread_id_counts: Dict[str, int] = {}
+    for item in raw_value:
+        if not isinstance(item, dict):
+            continue
+        raw_thread_id = str(item.get("thread_id", "")).strip()
+        if raw_thread_id:
+            raw_thread_id_counts[raw_thread_id] = raw_thread_id_counts.get(raw_thread_id, 0) + 1
+    duplicate_thread_ids = {thread_id for thread_id, count in raw_thread_id_counts.items() if count > 1}
+
+    dispositions: List[ReviewThreadDisposition] = []
+    for item in raw_value:
+        if not isinstance(item, dict):
+            logger.warning("Dropping malformed thread_dispositions entry: not an object")
+            continue
+        thread_id = str(item.get("thread_id", "")).strip()
+        if thread_id in duplicate_thread_ids:
+            # Fail closed: invalidate every entry for this thread rather than
+            # keeping whichever valid one happened to parse (REQ-006, REQ-008).
+            logger.warning(f"Dropping thread_dispositions entry for thread_id={thread_id!r}: {raw_thread_id_counts[thread_id]} contradictory/duplicate raw entries")
+            continue
+        status = str(item.get("status", "")).strip().upper()
+        rationale = str(item.get("rationale", "")).strip()
+        evidence = str(item.get("evidence", "")).strip()
+        if not thread_id or status not in VALID_REVIEW_THREAD_DISPOSITION_STATUSES or not rationale or not evidence:
+            logger.warning(f"Dropping malformed thread_dispositions entry for thread_id={thread_id!r}: incomplete or invalid fields")
+            continue
+        raw_blocker_id = item.get("blocker_id")
+        blocker_id = str(raw_blocker_id).strip() if raw_blocker_id is not None and str(raw_blocker_id).strip() else None
+        raw_concern_ids = item.get("concern_ids")
+        concern_ids: tuple[str, ...] = ()
+        if isinstance(raw_concern_ids, list):
+            concern_ids = tuple(str(c).strip() for c in raw_concern_ids if str(c).strip())
+        elif isinstance(raw_concern_ids, str) and raw_concern_ids.strip():
+            concern_ids = (raw_concern_ids.strip(),)
+        dispositions.append(
+            ReviewThreadDisposition(
+                thread_id=thread_id,
+                status=status,
+                rationale=rationale,
+                evidence=evidence,
+                blocker_id=blocker_id,
+                concern_ids=concern_ids,
+            )
+        )
+    return dispositions
+
+
+def _optional_positive_int(value: Any) -> Optional[int]:
+    """Normalize an optional positive line anchor from an LLM response."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError("review anchor lines must be positive integers")
+    if isinstance(value, str):
+        if not re.fullmatch(r"[1-9][0-9]*", value):
+            raise ValueError("review anchor lines must be positive integers")
+        return int(value)
+    if not isinstance(value, int) or value < 1:
+        raise ValueError("review anchor lines must be positive integers")
+    return value
+
+
+def _bounded_response_preview(response: str) -> str:
+    """Return a redacted, bounded response preview suitable for normal logs."""
+    redacted = redact_string(response)
+    if len(redacted) <= ADVERSARIAL_RESPONSE_PREVIEW_LIMIT:
+        return redacted
+    omitted = len(redacted) - ADVERSARIAL_RESPONSE_PREVIEW_LIMIT
+    return f"{redacted[:ADVERSARIAL_RESPONSE_PREVIEW_LIMIT]}... [{omitted} characters omitted]"
+
+
+def _parse_error(response: str, category: str, summary: str, reason: str) -> AdversarialValidationResult:
+    """Create and diagnose a fail-closed adversarial parse result."""
+    response_length = len(response)
+    state = "empty" if not response.strip() else "non-empty"
+    preview = _bounded_response_preview(response) if response else "<empty>"
+    logger.warning(
+        "Adversarial validator response failed parsing: category={}, reason={}, " "response_state={}, response_length={}, preview={!r}; failing closed to ERROR",
+        category,
+        reason,
+        state,
+        response_length,
+        preview,
+    )
+    return AdversarialValidationResult(
+        result="ERROR",
+        summary=summary,
+        raw_response=response,
+        diagnostic_category=category,
+        diagnostic_reason=reason,
+    )
+
+
+def _log_contextual_parse_diagnostics(
+    result: AdversarialValidationResult,
+    response: str,
+    backend_manager: BackendManager,
+    pr_number: int,
+    attempt: str,
+) -> None:
+    """Log a bounded parse diagnostic correlated to a validation attempt."""
+    if result.result != "ERROR" or not result.diagnostic_category:
+        return
+
+    backend: Optional[str] = None
+    model: Optional[str] = None
+    interaction_log: Optional[str] = None
+    try:
+        backend_value, model_value = backend_manager.get_last_backend_and_model()
+        backend = backend_value if isinstance(backend_value, str) else None
+        model = model_value if isinstance(model_value, str) else None
+    except Exception:
+        pass
+    try:
+        log_path = backend_manager.get_last_interaction_log_path()
+        interaction_log = log_path if isinstance(log_path, str) else None
+    except Exception:
+        pass
+
+    response_state = "empty" if not response.strip() else "non-empty"
+    preview = _bounded_response_preview(response) if response else "<empty>"
+    details = {
+        "result": result.result,
+        "attempt": attempt,
+        "backend": backend or "unknown",
+        "model": model or "unknown",
+        "response_state": response_state,
+        "response_length": len(response),
+        "response_preview": preview,
+        "diagnostic_category": result.diagnostic_category,
+        "diagnostic_reason": result.diagnostic_reason or result.summary,
+        "interaction_log": interaction_log or "unavailable",
+    }
+    logger.warning(
+        "Adversarial validation parse failure for PR #{} (attempt={}, backend={}, model={}): " "category={}, reason={}, response_state={}, response_length={}, preview={!r}, " "full_response_log={}",
+        pr_number,
+        attempt,
+        details["backend"],
+        details["model"],
+        details["diagnostic_category"],
+        details["diagnostic_reason"],
+        response_state,
+        len(response),
+        preview,
+        details["interaction_log"],
+    )
+    get_trace_logger().log(
+        "Adversarial Validation Parse Failure",
+        f"Validator response parsing failed for PR #{pr_number} ({attempt})",
+        item_type="pr",
+        item_number=pr_number,
+        details=details,
+    )
+
+
+def _stable_test_oracle_gap_id(requirement_id: str, authoritative_boundary: str, invariant: str) -> str:
+    """Derive a stable identity from the authoritative missing-oracle scope."""
+    normalized = "\0".join(re.sub(r"\s+", " ", value.strip()).casefold() for value in (requirement_id, authoritative_boundary, invariant))
+    return f"TOG-{hashlib.sha256(normalized.encode('utf-8')).hexdigest()[:12]}"
+
+
+def _populate_test_oracle_gap_requirement_text(
+    gaps: List[TestOracleGap],
+    requirements: List[IssueRequirement],
+) -> None:
+    """Attach authoritative manifest text to gaps with known stable IDs."""
+    requirement_text_by_id = {requirement.requirement_id: requirement.text for requirement in requirements}
+    for gap in gaps:
+        if gap.requirement_id in requirement_text_by_id:
+            gap.requirement_text = requirement_text_by_id[gap.requirement_id]
+
+
+def _extract_test_oracle_gaps(
+    raw_value: object,
+    raw_response: str,
+    recorded_gaps: Sequence[TestOracleGap] = (),
+) -> tuple[List[TestOracleGap], Optional[AdversarialValidationResult]]:
+    """Parse and consolidate the distinct material test-oracle-gap schema."""
+    if not isinstance(raw_value, list):
+        return [], _parse_error(raw_response, "schema_error", "Malformed validator schema: test_oracle_gaps must be a list", "test_oracle_gaps must be a list")
+
+    gaps: List[TestOracleGap] = []
+    recorded_by_id = {gap.gap_id: gap for gap in recorded_gaps}
+    updates_by_id: dict[str, TestOracleGap] = {}
+    required_fields = (
+        "requirement_id",
+        "authoritative_boundary",
+        "invariant",
+        "plausible_incorrect_implementation",
+        "why_tests_still_pass",
+        "material_consequence",
+        "focused_regression_scenario",
+        "anchor_path",
+    )
+    for item in raw_value:
+        if not isinstance(item, dict):
+            return [], _parse_error(raw_response, "schema_error", "Malformed test-oracle gap entry", "test-oracle gap entries must be objects")
+        supplied_id_value = item.get("gap_id", "")
+        if not isinstance(supplied_id_value, str):
+            return [], _parse_error(raw_response, "schema_error", "Malformed test-oracle gap identity", "gap_id must be a string")
+        supplied_id = supplied_id_value.strip()
+        recorded = recorded_by_id.get(supplied_id) if supplied_id else None
+
+        # A recorded ID is an authoritative reference, not a request for the
+        # reviewer to reconstruct its scope.  Hydrate the immutable scope before
+        # validating the lifecycle projection so compact and paraphrased updates
+        # are adjudicated identically.
+        if supplied_id and recorded is None and recorded_by_id:
+            return [], _parse_error(raw_response, "schema_error", "Unknown recorded test-oracle gap", f"gap_id {supplied_id} is not present in the accepted reviewer-state snapshot")
+
+        status_value = item.get("status", "OPEN")
+        if not isinstance(status_value, str):
+            return [], _parse_error(raw_response, "schema_error", "Malformed test-oracle gap status", "status must be a string")
+        status = status_value.strip().upper()
+        if status not in TEST_ORACLE_GAP_STATUSES:
+            return [], _parse_error(raw_response, "schema_error", "Malformed test-oracle gap status", f"unsupported test-oracle gap status: {status}")
+        resolution_value = item.get("resolution_evidence", "")
+        if not isinstance(resolution_value, str):
+            return [], _parse_error(raw_response, "schema_error", "Malformed test-oracle gap evidence", "resolution_evidence must be a string")
+        resolution_evidence = resolution_value.strip()
+        if status in {"RESOLVED", "INVALID"} and not resolution_evidence:
+            return [], _parse_error(raw_response, "schema_error", "Resolved test-oracle gap lacks evidence", f"{status} requires resolution_evidence")
+
+        if recorded is not None:
+            explicit_requirement = item.get("requirement_id")
+            if explicit_requirement is not None and (not isinstance(explicit_requirement, str) or explicit_requirement.strip() != recorded.requirement_id):
+                return [], _parse_error(raw_response, "schema_error", "Conflicting recorded test-oracle gap requirement", f"gap_id {supplied_id} belongs to {recorded.requirement_id}")
+            if str(item.get("correction_identity", "")).startswith(CANONICAL_CORRECTION_PREFIX) and item.get("authoritative_boundary", recorded.authoritative_boundary) != recorded.authoritative_boundary:
+                return [], _parse_error(raw_response, "correction_reference_invalid", "Conflicting recorded correction boundary", f"gap_id {supplied_id} contradicts its recorded authoritative boundary")
+            update = replace(
+                recorded,
+                status=status,
+                resolution_evidence=resolution_evidence,
+                correction_identity=str(item.get("correction_identity", "")).strip(),
+                correction_scope_fingerprint=str(item.get("correction_scope_fingerprint", "")).strip(),
+                correction_context_fingerprint=str(item.get("correction_context_fingerprint", "")).strip(),
+            )
+            previous = updates_by_id.get(supplied_id)
+            if previous is not None:
+                if (previous.correction_identity, previous.correction_scope_fingerprint, previous.correction_context_fingerprint) != (update.correction_identity, update.correction_scope_fingerprint, update.correction_context_fingerprint):
+                    return [], _parse_error(raw_response, "correction_reference_invalid", "Conflicting recorded correction bindings", f"gap_id {supplied_id} has contradictory canonical references")
+                if (previous.status, previous.resolution_evidence, previous.requirement_id) != (update.status, update.resolution_evidence, update.requirement_id):
+                    return [], _parse_error(raw_response, "schema_error", "Conflicting recorded test-oracle gap updates", f"gap_id {supplied_id} has conflicting lifecycle updates")
+                continue
+            updates_by_id[supplied_id] = update
+            gaps.append(update)
+            continue
+
+        values = {name: str(item.get(name, "")).strip() for name in required_fields}
+        missing = [name for name, value in values.items() if not value]
+        if missing:
+            return [], _parse_error(raw_response, "schema_error", "Malformed test-oracle gap entry", f"test-oracle gap is missing: {', '.join(missing)}")
+
+        phase = str(item.get("discovery_phase", "INITIAL")).strip().upper()
+        exception_reason = str(item.get("rereview_exception_reason", "NONE")).strip().upper()
+        exception_evidence = str(item.get("rereview_exception_evidence", "")).strip()
+        if phase not in {"INITIAL", "REREVIEW"}:
+            return [], _parse_error(raw_response, "schema_error", "Malformed test-oracle gap discovery phase", f"unsupported discovery phase: {phase}")
+        derived_id = _stable_test_oracle_gap_id(values["requirement_id"], values["authoritative_boundary"], values["invariant"])
+        if status in {"RESOLVED", "INVALID"} and not supplied_id:
+            return [], _parse_error(
+                raw_response,
+                "schema_error",
+                "Resolved test-oracle gap lacks its stored identity",
+                f"{status} requires an explicit gap_id",
+            )
+        if supplied_id and supplied_id != derived_id:
+            return [], _parse_error(raw_response, "schema_error", "Unstable test-oracle gap identity", f"gap_id must be {derived_id} for the supplied scope")
+        new_gap = TestOracleGap(
+            gap_id=derived_id,
+            correction_identity=str(item.get("correction_identity", "")).strip(),
+            correction_scope_fingerprint=str(item.get("correction_scope_fingerprint", "")).strip(),
+            correction_context_fingerprint=str(item.get("correction_context_fingerprint", "")).strip(),
+            **values,
+            anchor_line=_optional_positive_int(item.get("anchor_line")),
+            anchor_side=str(item.get("anchor_side", "RIGHT")).strip().upper(),
+            anchor_start_line=_optional_positive_int(item.get("anchor_start_line")),
+            discovery_phase=phase,
+            rereview_exception_reason=exception_reason,
+            rereview_exception_evidence=exception_evidence,
+            status=status,
+            resolution_evidence=resolution_evidence,
+        )
+        previous = updates_by_id.get(derived_id)
+        if previous is not None:
+            if previous != new_gap:
+                return [], _parse_error(raw_response, "schema_error", "Conflicting test-oracle gap updates", f"gap_id {derived_id} has conflicting entries")
+            continue
+        updates_by_id[derived_id] = new_gap
+        gaps.append(new_gap)
+    return gaps, None
+
+
+def parse_adversarial_validation_response(
+    response: str,
+    recorded_test_oracle_gaps: Sequence[TestOracleGap] = (),
+    closure_input: Optional[ReviewExecutionInput] = None,
+    reviewer_provenance: str = "",
+) -> AdversarialValidationResult:
+    """Parse the strong model's adversarial validation output.
+
+    Fail-closed policy:
+    - Entire response schema must be strictly valid and consistent.
+    - PASS requires raw_result == "PASS" and findings to be strictly empty ([] or None).
+    - Demonstrated, reachable findings override labels and normalize to NEEDS_FIX.
+    - Explicitly unverified suspicions are discarded as findings and produce INCONCLUSIVE.
+    - Malformed or empty finding elements fail closed to ERROR.
+    - NEEDS_FIX requires at least one finding with a concrete counterexample; missing counterexamples are never synthesized.
+    - Malformed or unparseable schemas fail closed to ERROR.
+
+    Args:
+        response: Raw LLM response string
+
+    Returns:
+        Parsed AdversarialValidationResult
+    """
+    if not response or not response.strip():
+        return _parse_error(
+            response or "",
+            "empty_response",
+            "Empty response received from validator; validation incomplete",
+            "validator returned no non-whitespace content",
+        )
+
+    raw_response = response
+    jsonl_detected, extracted_message, jsonl_error = extract_codex_jsonl_message(raw_response)
+    if jsonl_detected and jsonl_error:
+        return _parse_error(
+            raw_response,
+            "cli_event_stream_error",
+            f"Invalid Codex validator event stream: {jsonl_error}",
+            jsonl_error,
+        )
+    if not jsonl_detected:
+        jsonl_detected, extracted_message, jsonl_error = extract_claude_jsonl_result(raw_response)
+        if jsonl_detected and jsonl_error:
+            return _parse_error(
+                raw_response,
+                "cli_event_stream_error",
+                f"Invalid Claude validator event stream: {jsonl_error}",
+                jsonl_error,
+            )
+    if not jsonl_detected:
+        jsonl_detected, extracted_message, jsonl_error = extract_muse_jsonl_result(raw_response)
+        if jsonl_detected and jsonl_error:
+            return _parse_error(
+                raw_response,
+                "cli_event_stream_error",
+                f"Invalid Muse validator event stream: {jsonl_error}",
+                jsonl_error,
+            )
+    effective_response = extracted_message if jsonl_detected and extracted_message is not None else raw_response
+    validation_evidence.observe_semantic_payload(raw_response, effective_response)
+    cleaned_response = effective_response.strip()
+
+    # 1. Try parsing JSON block from markdown codeblock or direct JSON
+    json_str = ""
+    json_block_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", cleaned_response, re.DOTALL)
+    if json_block_match:
+        json_str = json_block_match.group(1)
+    else:
+        bare_match = re.search(r"(\{[\s\S]*\})", cleaned_response)
+        if bare_match:
+            json_str = bare_match.group(1)
+
+    json_failure_reason: Optional[str] = None
+    if json_str:
+        try:
+            parsed = json.loads(json_str, object_pairs_hook=_retain_duplicate_json_members)
+            if isinstance(parsed, dict):
+                raw_result = str(parsed.get("result", "")).strip().upper()
+                validation_evidence.observe_model_verdict(raw_result)
+                summary = str(parsed.get("summary", "")).strip()
+                dynamic_check = parsed.get("dynamic_check_requested")
+                if dynamic_check:
+                    dynamic_check = str(dynamic_check).strip()
+
+                raw_specification_gaps = parsed.get("specification_gaps", [])
+                if not isinstance(raw_specification_gaps, list):
+                    return _parse_error(raw_response, "schema_error", "Malformed validator schema: specification_gaps must be a list", "specification_gaps must be a list")
+                specification_gaps: List[SpecificationGap] = []
+                for item in raw_specification_gaps:
+                    if not isinstance(item, dict):
+                        return _parse_error(raw_response, "schema_error", "Malformed specification gap entry", "specification gap entries must be objects")
+                    values = {name: str(item.get(name, "")).strip() for name in ("question", "why_existing_issue_is_insufficient", "observed_case", "affected_scope")}
+                    options = item.get("candidate_options", [])
+                    if any(not value for value in values.values()) or not isinstance(options, list) or any(not isinstance(option, str) or not option.strip() for option in options):
+                        return _parse_error(raw_response, "schema_error", "Malformed specification gap entry", "each specification gap requires all four descriptive fields and candidate_options must be a list of non-empty strings")
+                    specification_gaps.append(SpecificationGap(**values, candidate_options=[option.strip() for option in options]))
+
+                test_oracle_gaps, gap_parse_error = _extract_test_oracle_gaps(
+                    parsed.get("test_oracle_gaps", []),
+                    raw_response,
+                    recorded_test_oracle_gaps,
+                )
+                if gap_parse_error is not None:
+                    return gap_parse_error
+
+                raw_unexplained_changes = parsed.get("unexplained_changes", [])
+                if not isinstance(raw_unexplained_changes, list):
+                    return _parse_error(raw_response, "schema_error", "Malformed validator schema: unexplained_changes must be a list", "unexplained_changes must be a list")
+                unexplained_changes: List[ChangeProvenanceItem] = []
+                for item in raw_unexplained_changes:
+                    if not isinstance(item, dict):
+                        return _parse_error(raw_response, "schema_error", "Malformed unexplained change entry", "unexplained change entries must be objects")
+                    paths = item.get("paths", [])
+                    change_group = str(item.get("change_group", "")).strip()
+                    why_unexplained = str(item.get("why_unexplained", "")).strip()
+                    if not isinstance(paths, list) or not paths or any(not isinstance(path, str) or not path.strip() for path in paths) or not change_group or not why_unexplained:
+                        return _parse_error(raw_response, "schema_error", "Malformed unexplained change entry", "each unexplained change requires paths, change_group, and why_unexplained")
+                    unexplained_changes.append(
+                        ChangeProvenanceItem(
+                            paths=[path.strip() for path in paths],
+                            change_group=change_group,
+                            why_unexplained=why_unexplained,
+                        )
+                    )
+
+                raw_requirement_coverage = parsed.get("requirement_coverage", [])
+                if not isinstance(raw_requirement_coverage, list):
+                    return _parse_error(
+                        raw_response,
+                        "schema_error",
+                        "Malformed validator schema: requirement_coverage must be a list",
+                        f"requirement_coverage must be a list, got {type(raw_requirement_coverage).__name__}",
+                    )
+                validation_evidence.observe_returned_coverage(raw_requirement_coverage)
+                requirement_coverage: List[RequirementCoverageEntry] = []
+                seen_requirement_ids: set[str] = set()
+                valid_coverage_statuses = {"VERIFIED", "VIOLATED", "IRRELEVANT", "UNVERIFIED"}
+                for item in raw_requirement_coverage:
+                    if not isinstance(item, dict):
+                        return _parse_error(
+                            raw_response,
+                            "schema_error",
+                            "Malformed requirement coverage entry",
+                            "requirement coverage entries must be objects",
+                        )
+                    requirement_id = str(item.get("requirement_id", "")).strip()
+                    status = str(item.get("status", "")).strip().upper()
+                    evidence = str(item.get("evidence", "")).strip()
+                    if not requirement_id or status not in valid_coverage_statuses or not evidence:
+                        return _parse_error(
+                            raw_response,
+                            "schema_error",
+                            "Malformed requirement coverage entry",
+                            "each coverage entry requires a unique requirement_id, valid status, and non-empty evidence",
+                        )
+                    if requirement_id in seen_requirement_ids:
+                        return _parse_error(
+                            raw_response,
+                            "schema_error",
+                            "Duplicate requirement coverage entry",
+                            f"requirement_id {requirement_id} appears more than once",
+                        )
+                    seen_requirement_ids.add(requirement_id)
+                    requirement_coverage.append(
+                        RequirementCoverageEntry(
+                            requirement_id=requirement_id,
+                            status=status,
+                            evidence=evidence,
+                        )
+                    )
+
+                raw_recovery = parsed.get("evidence_recovery", [])
+                if not isinstance(raw_recovery, list) or len(raw_recovery) > ADVERSARIAL_EVIDENCE_RECOVERY_BUDGET:
+                    return _parse_error(raw_response, "schema_error", "Malformed evidence recovery report", f"evidence_recovery must contain at most {ADVERSARIAL_EVIDENCE_RECOVERY_BUDGET} entries")
+                evidence_recovery: List[EvidenceRecoveryEntry] = []
+                seen_recovery_paths: set[str] = set()
+                for item in raw_recovery:
+                    if not isinstance(item, dict):
+                        return _parse_error(raw_response, "schema_error", "Malformed evidence recovery entry", "evidence recovery entries must be objects")
+                    path = str(item.get("path", "")).strip()
+                    source = str(item.get("source", "")).strip()
+                    status = str(item.get("status", "")).strip().upper()
+                    evidence = str(item.get("evidence", "")).strip()
+                    requirement_ids = item.get("requirement_ids", [])
+                    if not path or not source or status not in {"RECOVERED", "UNAVAILABLE", "IRRELEVANT"} or not evidence or not isinstance(requirement_ids, list) or any(not isinstance(value, str) or not value.strip() for value in requirement_ids):
+                        return _parse_error(raw_response, "schema_error", "Malformed evidence recovery entry", "each recovery entry requires path, supported source, status, evidence, and requirement_ids")
+                    if path in seen_recovery_paths:
+                        return _parse_error(
+                            raw_response,
+                            "schema_error",
+                            "Duplicate evidence recovery entry",
+                            f"path {path} appears more than once in evidence_recovery; a contradictory or repeated status cannot be adjudicated",
+                        )
+                    seen_recovery_paths.add(path)
+                    evidence_recovery.append(EvidenceRecoveryEntry(path=path, source=source, status=status, evidence=evidence, requirement_ids=[value.strip() for value in requirement_ids]))
+
+                raw_gaps = parsed.get("decision_critical_evidence_gaps", [])
+                if not isinstance(raw_gaps, list):
+                    return _parse_error(raw_response, "schema_error", "Malformed decision-critical evidence gaps", "decision_critical_evidence_gaps must be a list")
+                decision_gaps: List[DecisionCriticalEvidenceGap] = []
+                for item in raw_gaps:
+                    if not isinstance(item, dict):
+                        return _parse_error(raw_response, "schema_error", "Malformed decision-critical evidence gap", "evidence gap entries must be objects")
+                    requirement_id = str(item.get("requirement_id", "")).strip()
+                    evidence_needed = str(item.get("evidence_needed", "")).strip()
+                    attempts = item.get("recovery_attempts", [])
+                    if not requirement_id or not evidence_needed or not isinstance(attempts, list) or not attempts or any(not isinstance(value, str) or not value.strip() for value in attempts):
+                        return _parse_error(raw_response, "schema_error", "Malformed decision-critical evidence gap", "each gap requires one requirement, concrete evidence, and attempted recovery sources")
+                    decision_gaps.append(DecisionCriticalEvidenceGap(requirement_id=requirement_id, evidence_needed=evidence_needed, recovery_attempts=[value.strip() for value in attempts]))
+
+                raw_findings = parsed.get("findings")
+                findings: List[AdversarialValidationFinding] = []
+                unverified_suspicion = False
+
+                if raw_findings is not None:
+                    if not isinstance(raw_findings, list):
+                        return _parse_error(
+                            raw_response,
+                            "schema_error",
+                            "Malformed validator schema: findings must be a list",
+                            f"findings must be a list, got {type(raw_findings).__name__}",
+                        )
+
+                    for item in raw_findings:
+                        if not isinstance(item, dict):
+                            # Non-dict item in findings list is malformed schema
+                            return _parse_error(
+                                raw_response,
+                                "schema_error",
+                                "Malformed finding entry in validator response",
+                                f"finding entry must be an object, got {type(item).__name__}",
+                            )
+
+                        if not item:
+                            # Empty dict in findings is malformed
+                            return _parse_error(
+                                raw_response,
+                                "schema_error",
+                                "Malformed empty finding entry in validator response",
+                                "finding entry must not be empty",
+                            )
+
+                        classification = str(item.get("evidence_classification", "")).strip().upper()
+                        if classification not in {"DEMONSTRATED", "UNVERIFIED"}:
+                            return _parse_error(
+                                raw_response,
+                                "schema_error",
+                                "Reviewer finding lacks a valid evidence classification",
+                                "evidence_classification must be DEMONSTRATED or UNVERIFIED",
+                            )
+
+                        if classification == "UNVERIFIED":
+                            unverified_suspicion = True
+                            continue
+
+                        required_fields = {
+                            "finding_identity": str(item.get("finding_identity", "")).strip(),
+                            "correction_identity": str(item.get("correction_identity", "")).strip(),
+                            "violated_requirement": str(item.get("violated_requirement", "")).strip(),
+                            "reachability": str(item.get("reachability", "")).strip(),
+                            "required_behavior": str(item.get("required_behavior", "")).strip(),
+                            "actual_behavior": str(item.get("actual_behavior", "")).strip(),
+                            "evidence": str(item.get("evidence", "")).strip(),
+                            "counterexample": str(item.get("counterexample", "")).strip(),
+                            "anchor_path": str(item.get("anchor_path", "")).strip(),
+                        }
+                        raw_finding_requirement_ids = item.get("requirement_ids", [])
+                        if not isinstance(raw_finding_requirement_ids, list):
+                            return _parse_error(raw_response, "schema_error", "Malformed finding requirement IDs", "requirement_ids must be a list")
+                        finding_requirement_ids = list(
+                            dict.fromkeys(
+                                requirement_id
+                                for requirement_id in [
+                                    str(item.get("requirement_id", "")).strip(),
+                                    *(str(value).strip() for value in raw_finding_requirement_ids),
+                                ]
+                                if requirement_id
+                            )
+                        )
+                        if not finding_requirement_ids:
+                            required_fields["requirement_ids"] = ""
+                        missing_fields = [name for name, value in required_fields.items() if not value]
+                        if missing_fields:
+                            return _parse_error(
+                                raw_response,
+                                "schema_error",
+                                "Reviewer reported a blocking defect without demonstrated reachability evidence",
+                                f"DEMONSTRATED finding is missing: {', '.join(missing_fields)}",
+                            )
+
+                        req = required_fields["violated_requirement"]
+                        ce = required_fields["counterexample"]
+                        gap = str(item.get("test_gap", "")).strip() or "Existing tests do not assert this condition"
+                        scen = str(item.get("suggested_regression_scenario", "")).strip() or "Add regression test covering counterexample"
+
+                        findings.append(
+                            AdversarialValidationFinding(
+                                requirement_id=finding_requirement_ids[0],
+                                requirement_ids=finding_requirement_ids,
+                                finding_identity=required_fields["finding_identity"],
+                                correction_identity=required_fields["correction_identity"],
+                                correction_scope_fingerprint=str(item.get("correction_scope_fingerprint", "")).strip(),
+                                correction_context_fingerprint=str(item.get("correction_context_fingerprint", "")).strip(),
+                                violated_requirement=req,
+                                reachability=required_fields["reachability"],
+                                required_behavior=required_fields["required_behavior"],
+                                actual_behavior=required_fields["actual_behavior"],
+                                evidence=required_fields["evidence"],
+                                evidence_classification=classification,
+                                counterexample=ce,
+                                test_gap=gap,
+                                suggested_regression_scenario=scen,
+                                anchor_path=required_fields["anchor_path"],
+                                anchor_line=_optional_positive_int(item.get("anchor_line")),
+                                anchor_side=str(item.get("anchor_side", "RIGHT")).strip().upper(),
+                                anchor_start_line=_optional_positive_int(item.get("anchor_start_line")),
+                            )
+                        )
+
+                # A finding is a concrete counterexample, not a requirement
+                # perspective. Compact duplicate perspectives while retaining
+                # independent findings whose observable path or fix differs.
+                compacted_findings: List[AdversarialValidationFinding] = []
+                findings_by_counterexample: Dict[tuple[str, ...], AdversarialValidationFinding] = {}
+                for finding in findings:
+                    # Structured identities, rather than reviewer prose, decide
+                    # grouping. The correction identity prevents one root label
+                    # from collapsing independently actionable fixes.
+                    identity = (finding.finding_identity, finding.correction_identity)
+                    existing = findings_by_counterexample.get(identity)
+                    if existing is None:
+                        findings_by_counterexample[identity] = finding
+                        compacted_findings.append(finding)
+                        continue
+                    if (existing.correction_scope_fingerprint, existing.correction_context_fingerprint) != (finding.correction_scope_fingerprint, finding.correction_context_fingerprint):
+                        return _parse_error(raw_response, "correction_reference_invalid", "Conflicting canonical correction bindings", "Repeated correction identity has contradictory scope or context bindings")
+                    if finding.correction_identity.startswith(CANONICAL_CORRECTION_PREFIX) and (existing.anchor_path != finding.anchor_path or set(existing.all_requirement_ids) != set(finding.all_requirement_ids)):
+                        return _parse_error(raw_response, "correction_reference_invalid", "Conflicting canonical correction scope", "Repeated canonical correction has contradictory boundary or qualified requirements")
+                    existing.requirement_ids = list(dict.fromkeys([*existing.all_requirement_ids, *finding.all_requirement_ids]))
+                    for field_name in (
+                        "violated_requirement",
+                        "reachability",
+                        "required_behavior",
+                        "actual_behavior",
+                        "evidence",
+                        "counterexample",
+                        "test_gap",
+                        "suggested_regression_scenario",
+                    ):
+                        merged_values = list(dict.fromkeys(value for value in [getattr(existing, field_name), getattr(finding, field_name)] if value))
+                        setattr(existing, field_name, "\n\n".join(merged_values))
+                findings = compacted_findings
+
+                if unverified_suspicion and not findings:
+                    for entry in requirement_coverage:
+                        if entry.status == "VIOLATED":
+                            entry.status = "UNVERIFIED"
+
+                # Determine result - enforce consistency and fail-closed
+                has_open_test_oracle_gaps = any(gap.status == "OPEN" for gap in test_oracle_gaps)
+                if raw_result == "PASS":
+                    # Valid concrete findings outrank the contradictory top-level
+                    # label. Malformed findings have already failed schema parsing.
+                    result_val = "NEEDS_FIX" if findings else "INCONCLUSIVE" if unverified_suspicion else "NEEDS_TESTS" if has_open_test_oracle_gaps else "PASS"
+                elif raw_result == "NEEDS_FIX":
+                    if not findings:
+                        if unverified_suspicion:
+                            result_val = "INCONCLUSIVE"
+                        else:
+                            # A bare NEEDS_FIX remains malformed and fails closed.
+                            return _parse_error(
+                                raw_response,
+                                "schema_error",
+                                "Reviewer claimed NEEDS_FIX without supplying demonstrated behavioral counterexamples",
+                                "NEEDS_FIX requires at least one DEMONSTRATED finding",
+                            )
+                    else:
+                        result_val = "NEEDS_FIX"
+                elif raw_result == "NEEDS_TESTS":
+                    if findings:
+                        result_val = "NEEDS_FIX"
+                    elif not has_open_test_oracle_gaps:
+                        return _parse_error(
+                            raw_response,
+                            "schema_error",
+                            "Reviewer claimed NEEDS_TESTS without an open material test-oracle gap",
+                            "NEEDS_TESTS requires at least one OPEN test_oracle_gaps entry",
+                        )
+                    else:
+                        result_val = "NEEDS_TESTS"
+                elif raw_result in ("INCONCLUSIVE", "BLOCKED"):
+                    # A proven counterexample outranks uncertainty or an
+                    # infrastructure diagnostic. Never discard concrete findings.
+                    result_val = "NEEDS_FIX" if findings else raw_result
+                else:
+                    return _parse_error(
+                        raw_response,
+                        "schema_error",
+                        f"Unrecognized validator result: {raw_result or '<missing>'}",
+                        "result must be PASS, NEEDS_FIX, NEEDS_TESTS, INCONCLUSIVE, or BLOCKED",
+                    )
+
+                thread_dispositions = _extract_thread_dispositions(parsed.get("thread_dispositions", []))
+
+                result_object = AdversarialValidationResult(
+                    result=result_val,
+                    summary=summary or ("Validation passed" if result_val == "PASS" else f"Validation status: {result_val}"),
+                    findings=findings,
+                    raw_response=raw_response,
+                    dynamic_check_requested=dynamic_check,
+                    requirement_coverage=requirement_coverage,
+                    evidence_recovery=evidence_recovery,
+                    decision_critical_evidence_gaps=decision_gaps,
+                    specification_gaps=specification_gaps,
+                    test_oracle_gaps=test_oracle_gaps,
+                    thread_dispositions=thread_dispositions,
+                    unexplained_changes=unexplained_changes,
+                )
+                if closure_input is not None:
+                    unavailable_reason = _closure_input_unavailable_reason(closure_input)
+                    assessment = parsed.get("closure_assessment")
+                    if unavailable_reason:
+                        result_object.closure_assessment_diagnostic = f"Closure context unavailable: {unavailable_reason}"
+                    elif not isinstance(assessment, dict):
+                        result_object.closure_assessment_diagnostic = "Closure assessment is absent or malformed"
+                    elif isinstance(assessment, _DuplicateAwareDict) and assessment.duplicate_keys:
+                        duplicate_names = ", ".join(dict.fromkeys(assessment.duplicate_keys))
+                        result_object.closure_assessment_diagnostic = f"Closure assessment contains duplicate JSON members: {duplicate_names}"
+                    else:
+                        bound_assessment = dict(assessment)
+                        identities = {
+                            "round_id": closure_input.round_id,
+                            "attempt_id": closure_input.attempt_id,
+                            "head_sha": closure_input.head_sha,
+                            "base_sha": closure_input.base_sha,
+                            "contract_identity": closure_input.contract.identity,
+                            "policy_identity": closure_input.policy.identity,
+                            "finding_set_revision": closure_input.finding_set_revision,
+                            "repository": closure_input.repository,
+                            "pr_number": closure_input.pr_number,
+                            "open_epoch": closure_input.open_epoch,
+                            "attempt_sequence": closure_input.attempt_sequence,
+                            "audited_head_sha": closure_input.audited_head_sha,
+                        }
+                        contradiction = next(
+                            (key for key, value in identities.items() if key in bound_assessment and bound_assessment[key] != value),
+                            None,
+                        )
+                        if contradiction is not None:
+                            result_object.closure_assessment_diagnostic = f"Closure assessment contradicts controller-owned {contradiction}"
+                        else:
+                            bound_assessment.update(identities)
+                            try:
+                                closure_result = parse_review_result(
+                                    json.dumps(bound_assessment),
+                                    closure_input,
+                                    reviewer_provenance or "unavailable",
+                                )
+                            except (TypeError, ValueError) as exc:
+                                result_object.closure_assessment_diagnostic = f"Malformed closure assessment: {exc}"
+                            else:
+                                result_object.closure_assessment = closure_result
+                                result_object.closure_assessment_diagnostic = closure_result.diagnostic
+                return result_object
+            else:
+                return _parse_error(
+                    raw_response,
+                    "schema_error",
+                    "Malformed validator schema: JSON root must be an object",
+                    f"JSON root must be an object, got {type(parsed).__name__}",
+                )
+        except json.JSONDecodeError as exc:
+            json_failure_reason = f"{exc.msg} at line {exc.lineno}, column {exc.colno}"
+        except (TypeError, ValueError) as exc:
+            # Schema normalization belongs to this response boundary.  Invalid
+            # anchors must become a structured ERROR rather than escaping into
+            # generic PR-processing exception handling.
+            return _parse_error(
+                raw_response,
+                "schema_error",
+                "Malformed validator review anchor",
+                str(exc),
+            )
+
+    # 2. Fallback: Parse structured text markers
+    violated_req = ""
+    counterexample = ""
+    test_gap = ""
+    suggested_reg = ""
+
+    for line in cleaned_response.splitlines():
+        line_str = line.strip()
+        if line_str.upper().startswith("VIOLATED_REQUIREMENT:") or line_str.upper().startswith("VIOLATED REQUIREMENT:"):
+            violated_req = line.split(":", 1)[1].strip()
+        elif line_str.upper().startswith("COUNTEREXAMPLE:"):
+            counterexample = line.split(":", 1)[1].strip()
+        elif line_str.upper().startswith("TEST_GAP:") or line_str.upper().startswith("WHY_TESTS_PASS:"):
+            test_gap = line.split(":", 1)[1].strip()
+        elif line_str.upper().startswith("SUGGESTED_REGRESSION_SCENARIO:") or line_str.upper().startswith("SUGGESTED_REGRESSION:"):
+            suggested_reg = line.split(":", 1)[1].strip()
+
+    has_text_findings = bool(violated_req or counterexample or test_gap or suggested_reg)
+
+    if re.search(r"^\s*RESULT\s*:\s*NEEDS_FIX", cleaned_response, re.MULTILINE | re.IGNORECASE):
+        return _parse_error(
+            raw_response,
+            "schema_error",
+            "Legacy text finding cannot demonstrate the required reachable counterexample evidence",
+            "blocking findings must use the structured JSON evidence schema",
+        )
+
+    if re.search(r"^\s*RESULT\s*:\s*PASS", cleaned_response, re.MULTILINE | re.IGNORECASE):
+        if has_text_findings:
+            return _parse_error(
+                raw_response,
+                "schema_error",
+                "Legacy text finding cannot demonstrate the required reachable counterexample evidence",
+                "blocking findings must use the structured JSON evidence schema",
+            )
+        return AdversarialValidationResult(
+            result="PASS",
+            summary="Validation passed",
+            findings=[],
+            raw_response=raw_response,
+        )
+
+    if re.search(r"^\s*RESULT\s*:\s*INCONCLUSIVE", cleaned_response, re.MULTILINE | re.IGNORECASE):
+        return AdversarialValidationResult(
+            result="INCONCLUSIVE",
+            summary="Validation inconclusive",
+            findings=[],
+            raw_response=raw_response,
+        )
+
+    if re.search(r"^\s*RESULT\s*:\s*BLOCKED", cleaned_response, re.MULTILINE | re.IGNORECASE):
+        return AdversarialValidationResult(
+            result="BLOCKED",
+            summary="Validation blocked by infrastructure or evidence failure",
+            raw_response=raw_response,
+        )
+
+    if json_failure_reason:
+        return _parse_error(
+            raw_response,
+            "json_parse_error",
+            f"Invalid JSON in validator response: {json_failure_reason}",
+            json_failure_reason,
+        )
+
+    return _parse_error(
+        raw_response,
+        "unrecognized_format",
+        "Unparseable validator response; validation incomplete",
+        "response contained neither a JSON object nor a recognized RESULT marker",
+    )
+
+
+def is_valid_test_oracle_resolution_evidence(evidence: str) -> bool:
+    """Return whether test-oracle gap resolution evidence asserts the required invariant.
+
+    Accepts different valid test techniques that assert the required behavioral
+    invariant across the component boundary, while rejecting tests that only assert
+    source text or use empty inputs that do not exercise the production path (REQ-003).
+    """
+    normalized = evidence.strip().lower()
+    if not normalized:
+        return False
+
+    # Reject source-text inspection / AST assertions that do not execute behavior
+    source_text_cues = (
+        "source text",
+        "source-text",
+        "inspect source",
+        "file content",
+        "file contents",
+        "assert in file",
+        "ast.parse",
+        "ast inspection",
+        "string inspection",
+        "literal match",
+    )
+    if any(cue in normalized for cue in source_text_cues):
+        return False
+
+    # Reject empty/trivial inputs that do not cross the production boundary
+    empty_input_cues = (
+        "empty input",
+        "empty dict",
+        "empty list",
+        "empty string",
+        "trivial input",
+        "noop test",
+        "does not exercise production",
+        "does not cross boundary",
+    )
+    if any(cue in normalized for cue in empty_input_cues):
+        return False
+
+    return True
+
+
+def _same_test_oracle_gap_scope(left: TestOracleGap, right: TestOracleGap) -> bool:
+    """Return whether two lifecycle entries describe the same missing oracle."""
+    return left.gap_id == right.gap_id and left.requirement_id == right.requirement_id
+
+
+def _reconcile_test_oracle_gap_lifecycle(
+    result: AdversarialValidationResult,
+    stored_session: Optional[ReviewerSession],
+    head_sha: str,
+    addressed_gap_evidence: Optional[dict[str, str]] = None,
+    accepted_open_gap_ids: frozenset[str] = frozenset(),
+) -> AdversarialValidationResult:
+    """Enforce bounded initial discovery and deterministic rereview convergence.
+
+    ``accepted_open_gap_ids`` names representations of accepted, still-unresolved
+    Strong findings. Their closure is owned by the review-cycle lifecycle, so a
+    model RESOLVED/INVALID entry, a paraphrase or a disposition can never close
+    them here, and their original scope is never rewritten.
+    """
+    if stored_session is None:
+        for gap in result.test_oracle_gaps:
+            gap.discovery_phase = "INITIAL"
+            gap.rereview_exception_reason = "NONE"
+            gap.rereview_exception_evidence = ""
+            gap.status = "OPEN"
+            gap.resolution_evidence = ""
+        return result
+
+    # Reconciliation is speculative until deterministic coverage/provenance
+    # checks establish an authoritative lifecycle result. Never mutate the
+    # registry-owned checkpoint objects during that speculative phase.
+    prior_by_id = {gap.gap_id: replace(gap) for gap in stored_session.test_oracle_gaps}
+    current_by_id = {gap.gap_id: gap for gap in result.test_oracle_gaps}
+    addressed_gap_evidence = addressed_gap_evidence or {}
+    reconciled: List[TestOracleGap] = []
+    rejected_new_ids: List[str] = []
+
+    for gap_id, prior in prior_by_id.items():
+        current = current_by_id.pop(gap_id, None)
+        if gap_id in accepted_open_gap_ids:
+            prior.status = "OPEN"
+            prior.resolution_evidence = ""
+            prior.resolution_head_sha = ""
+            reconciled.append(prior)
+            continue
+        accepted_head = prior.resolution_head_sha or stored_session.last_head_sha
+        same_head = accepted_head == head_sha
+        current_matches = current is not None and _same_test_oracle_gap_scope(prior, current)
+        if prior.status in {"RESOLVED", "INVALID"} and not same_head:
+            prior.resolution_head_sha = accepted_head
+            prior.historical_resolution_head_sha = accepted_head
+            prior.historical_resolution_evidence = prior.resolution_evidence
+            if gap_id in addressed_gap_evidence:
+                prior.status = "RESOLVED"
+                prior.resolution_evidence = addressed_gap_evidence[gap_id]
+                prior.resolution_head_sha = head_sha
+                reconciled.append(prior)
+                continue
+            if current_matches and current is not None and current.status in {"RESOLVED", "INVALID"}:
+                if current.status == "RESOLVED" and not is_valid_test_oracle_resolution_evidence(current.resolution_evidence):
+                    prior.status = "OPEN"
+                    prior.resolution_evidence = ""
+                    prior.resolution_head_sha = ""
+                else:
+                    prior.status = current.status
+                    prior.resolution_evidence = current.resolution_evidence
+                    prior.resolution_head_sha = head_sha
+                reconciled.append(prior)
+                continue
+            if current_matches and current is not None and current.status == "OPEN":
+                prior.status = "OPEN"
+                prior.resolution_evidence = ""
+                prior.resolution_head_sha = ""
+                reconciled.append(prior)
+                continue
+            # The old closure remains historical evidence, but omission is not
+            # affirmative proof that protection remains on a different head.
+            result.result = "BLOCKED"
+            result.diagnostic_category = "test_oracle_gap_current_head_evidence_missing"
+            result.diagnostic_reason = f"Current-head protection was not adjudicated for {gap_id} at {head_sha}"
+            reconciled.append(prior)
+            continue
+        if current is None or not current_matches:
+            if prior.status == "OPEN" and gap_id in addressed_gap_evidence:
+                prior.status = "RESOLVED"
+                prior.resolution_evidence = addressed_gap_evidence[gap_id]
+                prior.resolution_head_sha = head_sha
+            reconciled.append(prior)
+            continue
+        if prior.status in {"RESOLVED", "INVALID"}:
+            # An accepted closure remains reusable after unchanged-head
+            # confirmation; omission and stale OPEN echoes cannot revoke it.
+            reconciled.append(prior)
+            continue
+        current.discovery_phase = prior.discovery_phase
+        current.rereview_exception_reason = prior.rereview_exception_reason
+        current.rereview_exception_evidence = prior.rereview_exception_evidence
+        # Descriptive prose may be paraphrased by the reviewer. Preserve the
+        # original authoritative scope while applying only lifecycle evidence.
+        if prior.status == "OPEN" and gap_id in addressed_gap_evidence:
+            # A disposition adjudicates the persisted finding, whereas the gap
+            # list is only the reviewer's lifecycle projection.  In particular,
+            # an OPEN echo must not undo an independently proven disposition for
+            # the exact thread represented by this gap.
+            prior.status = "RESOLVED"
+            prior.resolution_evidence = addressed_gap_evidence[gap_id]
+            prior.resolution_head_sha = head_sha
+        else:
+            if current.status == "RESOLVED" and not is_valid_test_oracle_resolution_evidence(current.resolution_evidence):
+                prior.status = "OPEN"
+                prior.resolution_evidence = ""
+                prior.resolution_head_sha = ""
+            else:
+                prior.status = current.status
+                prior.resolution_evidence = current.resolution_evidence
+                if current.status in {"RESOLVED", "INVALID"}:
+                    prior.resolution_head_sha = head_sha
+        reconciled.append(prior)
+
+    for gap in current_by_id.values():
+        if gap.status != "OPEN" or gap.discovery_phase != "REREVIEW" or gap.rereview_exception_reason not in TEST_ORACLE_GAP_REREVIEW_EXCEPTIONS or not gap.rereview_exception_evidence:
+            rejected_new_ids.append(gap.gap_id)
+            continue
+        reconciled.append(gap)
+
+    result.test_oracle_gaps = reconciled
+    if result.result not in {"ERROR", "INCONCLUSIVE", "BLOCKED"}:
+        if result.findings:
+            result.result = "NEEDS_FIX"
+        elif result.open_test_oracle_gaps:
+            result.result = "NEEDS_TESTS"
+        elif result.result == "NEEDS_TESTS":
+            result.result = "PASS"
+    if rejected_new_ids:
+        note = "Rereview discarded newly invented test-oracle gaps without a permitted corrective-diff or required-revalidation exception: " + ", ".join(sorted(rejected_new_ids))
+        result.summary = f"{result.summary.rstrip()} {note}".strip()
+    return result
+
+
+def _ordinary_gap_completion_ids(
+    recorded_gaps: Sequence[TestOracleGap],
+    result: AdversarialValidationResult,
+    current_decision_ids: frozenset[str],
+    accepted_gap_ids: frozenset[str],
+    head_sha: str,
+) -> tuple[str, ...]:
+    """Return recorded ordinary gaps still missing a decision for this target.
+
+    The reviewer must explicitly adjudicate a recorded gap on every changed
+    target.  Reconciled historical state is deliberately not treated as a
+    current decision, while an explicit current OPEN decision is.
+    """
+    resulting = {gap.gap_id: gap for gap in result.test_oracle_gaps}
+    missing: list[str] = []
+    for recorded in recorded_gaps:
+        if recorded.gap_id in accepted_gap_ids or recorded.gap_id in current_decision_ids:
+            continue
+        current = resulting.get(recorded.gap_id)
+        if current is not None and current.status in {"RESOLVED", "INVALID"} and current.resolution_head_sha == head_sha:
+            continue
+        missing.append(recorded.gap_id)
+    return tuple(missing)
+
+
+def _merge_gap_completion(
+    prior: AdversarialValidationResult,
+    completion: AdversarialValidationResult,
+) -> AdversarialValidationResult:
+    """Keep independently established blockers when applying focused gap facts."""
+    updates = {gap.gap_id: gap for gap in completion.test_oracle_gaps}
+    prior.test_oracle_gaps = [updates.pop(gap.gap_id, gap) for gap in prior.test_oracle_gaps] + list(updates.values())
+    if prior.result == "NEEDS_TESTS" and not prior.open_test_oracle_gaps:
+        prior.result = "PASS"
+    finding_keys = {(finding.finding_identity, tuple(finding.requirement_ids)) for finding in prior.findings}
+    prior.findings.extend(finding for finding in completion.findings if (finding.finding_identity, tuple(finding.requirement_ids)) not in finding_keys)
+    if completion.specification_gaps:
+        prior.specification_gaps.extend(gap for gap in completion.specification_gaps if gap not in prior.specification_gaps)
+    if completion.unexplained_changes:
+        prior.unexplained_changes.extend(item for item in completion.unexplained_changes if item not in prior.unexplained_changes)
+    if completion.thread_dispositions:
+        prior.thread_dispositions = completion.thread_dispositions
+    if prior.diagnostic_category == "test_oracle_gap_current_head_evidence_missing":
+        prior.result = "INCONCLUSIVE" if any(entry.status == "UNVERIFIED" for entry in prior.requirement_coverage) else "PASS"
+        prior.diagnostic_category = None
+        prior.diagnostic_reason = None
+    return prior
+
+
+def _valid_focused_terminal_gap_evidence(gap: TestOracleGap) -> bool:
+    """Require completion terminal evidence to identify the exact required proof."""
+    evidence = gap.resolution_evidence.strip().lower()
+    if gap.status == "RESOLVED":
+        boundary_name = gap.authoritative_boundary.rsplit(".", 1)[-1].lower()
+        assertion_cues = ("assert", "verif", "prov", "exercis", "checks that", "expects")
+        invariant_terms = {term for term in re.findall(r"[a-z][a-z0-9_]+", gap.invariant.lower()) if len(term) >= 5}
+        return is_valid_test_oracle_resolution_evidence(evidence) and "test" in evidence and boundary_name in evidence and any(cue in evidence for cue in assertion_cues) and ("recorded invariant" in evidence or bool(invariant_terms.intersection(re.findall(r"[a-z][a-z0-9_]+", evidence))))
+    if gap.status == "INVALID":
+        failed_criterion_cues = (
+            "outside every explicit requirement",
+            "outside the explicit requirement",
+            "no connection to an explicit requirement",
+            "unreachable authoritative boundary",
+            "authoritative boundary is not reachable",
+            "no plausible incorrect implementation",
+            "no material consequence",
+            "no focused regression oracle",
+            "fails the material-gap criterion",
+        )
+        return any(cue in evidence for cue in failed_criterion_cues)
+    return gap.status == "OPEN"
+
+
+def _dispositioned_test_oracle_gap_ids(
+    result: AdversarialValidationResult,
+    claimed_review_threads: Sequence["ClaimedReviewThread"],
+    recorded_gaps: Sequence[TestOracleGap],
+    status: str,
+) -> dict[str, "ReviewThreadDisposition"]:
+    """Map exact material-gap threads to this run's evidenced disposition of ``status``."""
+    dispositions = {disposition.thread_id: disposition for disposition in result.thread_dispositions if disposition.status == status and disposition.rationale and disposition.evidence}
+    gaps_by_id = {gap.gap_id: gap for gap in (*recorded_gaps, *result.test_oracle_gaps)}
+    by_gap: dict[str, "ReviewThreadDisposition"] = {}
+    for thread in claimed_review_threads:
+        disposition = dispositions.get(thread.thread_id)
+        if disposition is None:
+            continue
+        gap_match = re.search(r"^Gap identity:\s*`(TOG-[^`]+)`\s*$", thread.original_finding, re.MULTILINE)
+        requirement_match = re.search(r"^`((?:#\d+/)?REQ-[^`]+)`:\s*\S", thread.original_finding, re.MULTILINE)
+        current_gap = gaps_by_id.get(gap_match.group(1)) if gap_match else None
+        if gap_match and requirement_match and current_gap is not None and current_gap.requirement_id == requirement_match.group(1):
+            by_gap[gap_match.group(1)] = disposition
+    return by_gap
+
+
+def _addressed_test_oracle_gap_evidence(
+    result: AdversarialValidationResult,
+    claimed_review_threads: Sequence["ClaimedReviewThread"],
+    recorded_gaps: Sequence[TestOracleGap] = (),
+) -> dict[str, str]:
+    """Map exact material-gap threads independently proven addressed this run."""
+    return {gap_id: f"{disposition.rationale}\nEvidence: {disposition.evidence}" for gap_id, disposition in _dispositioned_test_oracle_gap_ids(result, claimed_review_threads, recorded_gaps, "ADDRESSED").items() if is_valid_test_oracle_resolution_evidence(disposition.evidence)}
+
+
+def _upheld_test_oracle_gap_ids(
+    result: AdversarialValidationResult,
+    claimed_review_threads: Sequence["ClaimedReviewThread"],
+    recorded_gaps: Sequence[TestOracleGap] = (),
+    projection: Optional[AcceptedFindingProjection] = None,
+) -> frozenset[str]:
+    """Gap identities this run's independent STILL_VALID disposition currently upholds.
+
+    A disposition is associated with an accepted gap either through the ordinary gap
+    prose of its thread or through the exact native root the accepted finding was
+    published under. A root shared by several accepted gaps is ambiguous and
+    upholds none of them.
+    """
+    upheld = set(_dispositioned_test_oracle_gap_ids(result, claimed_review_threads, recorded_gaps, "STILL_VALID"))
+    if projection is not None:
+        gaps_by_root: dict[int, set[str]] = {}
+        for record in projection.records:
+            if record.known_gap_id:
+                for root in record.root_comment_ids:
+                    gaps_by_root.setdefault(root, set()).add(record.known_gap_id)
+        threads = {thread.thread_id: thread for thread in claimed_review_threads}
+        for disposition in result.thread_dispositions:
+            thread = threads.get(disposition.thread_id)
+            if thread is None or thread.root_comment_database_id is None or disposition.status != "STILL_VALID" or not disposition.rationale or not disposition.evidence:
+                continue
+            candidates = gaps_by_root.get(thread.root_comment_database_id, set())
+            if len(candidates) == 1:
+                upheld |= candidates
+    return frozenset(upheld)
+
+
+def _enforce_inconclusive_recovery_contract(
+    result: AdversarialValidationResult,
+    incomplete_requirement_ids: List[str],
+) -> AdversarialValidationResult:
+    """Reject a final INCONCLUSIVE verdict without scoped recovery evidence."""
+    if result.result.strip().upper() != "INCONCLUSIVE" or result.dynamic_check_requested:
+        return result
+
+    missing_contract_parts: List[str] = []
+    if not result.decision_critical_evidence_gaps:
+        missing_contract_parts.append("a decision-critical evidence gap")
+    if missing_contract_parts:
+        reason = f"INCONCLUSIVE requires {', '.join(missing_contract_parts)}"
+        result.result = "ERROR"
+        result.summary = f"Invalid validator response: {reason}"
+        result.diagnostic_category = "inconclusive_without_exhausted_evidence_recovery"
+        result.diagnostic_reason = reason
+        return result
+
+    incomplete_ids = set(incomplete_requirement_ids)
+    gap_ids = {gap.requirement_id for gap in result.decision_critical_evidence_gaps}
+    requirements_without_gap = sorted(incomplete_ids - gap_ids)
+    gaps_for_verified_requirements = sorted(gap_ids - incomplete_ids)
+    if requirements_without_gap or gaps_for_verified_requirements:
+        scope_errors: List[str] = []
+        if requirements_without_gap:
+            scope_errors.append(f"requirements without decision-critical gaps: {', '.join(requirements_without_gap)}")
+        if gaps_for_verified_requirements:
+            scope_errors.append(f"gaps for already-decided requirements: {', '.join(gaps_for_verified_requirements)}")
+        reason = "; ".join(scope_errors)
+        result.result = "ERROR"
+        result.summary = "Invalid validator response: INCONCLUSIVE evidence was not scoped to undecided requirements"
+        result.diagnostic_category = "inconclusive_evidence_scope_mismatch"
+        result.diagnostic_reason = reason
+    return result
+
+
+def _reusable_recovered_evidence(
+    stored_session: Optional[ReviewerSession],
+    context: AdversarialValidationContext,
+    head_sha: str,
+) -> List[RecoveredFileEvidence]:
+    """Select entries whose complete change and contract identities still match.
+
+    IRRELEVANT is deliberately re-adjudicated on every snapshot: file identity
+    cannot prove that its context-dependent scope basis remains valid after
+    another file changes. Legacy entries remain readable but fail closed.
+    """
+    if stored_session is None:
+        return []
+    reusable: List[RecoveredFileEvidence] = []
+    for entry in stored_session.recovered_file_evidence:
+        current_identity = context.file_change_identities.get(entry.path, "")
+        if entry.status == "RECOVERED" and entry.identity_version == RECOVERED_FILE_IDENTITY_VERSION and bool(current_identity) and entry.change_identity == current_identity and entry.requirement_manifest_identity == context.requirement_manifest_identity:
+            reusable.append(entry)
+    return reusable
+
+
+def _reconcile_reusable_recovered_evidence(
+    result: AdversarialValidationResult,
+    stored_session: Optional[ReviewerSession],
+    context: AdversarialValidationContext,
+    head_sha: str,
+) -> AdversarialValidationResult:
+    """Install only independently proven equivalent file recovery evidence."""
+    if result.result == "ERROR":
+        return result
+    authoritative_ids = {requirement.requirement_id for requirement in context.issue_requirements}
+    if any(requirement_id not in authoritative_ids for entry in result.evidence_recovery for requirement_id in entry.requirement_ids):
+        # Coverage validation must see invalid current references; retained
+        # evidence must never erase them by replacing the current entry.
+        return result
+    current_by_path = {entry.path: entry for entry in result.evidence_recovery}
+    for persisted in _reusable_recovered_evidence(stored_session, context, head_sha):
+        current = current_by_path.get(persisted.path)
+        if current is not None and current.status in {"RECOVERED", "IRRELEVANT"}:
+            continue
+        retained = EvidenceRecoveryEntry(
+            path=persisted.path,
+            source=f"reused equivalent evidence from {persisted.source}",
+            status=persisted.status,
+            evidence=persisted.evidence,
+            requirement_ids=list(persisted.requirement_ids),
+            provenance="REUSED_EQUIVALENT",
+            origin_head_sha=persisted.origin_head_sha or stored_session.evidence_head_sha if stored_session else "",
+        )
+        if current is None:
+            result.evidence_recovery.append(retained)
+        else:
+            result.evidence_recovery[result.evidence_recovery.index(current)] = retained
+        current_by_path[persisted.path] = retained
+    return result
+
+
+def _build_recovery_ledger(
+    result: AdversarialValidationResult,
+    stored_session: Optional[ReviewerSession],
+    context: AdversarialValidationContext,
+    head_sha: str,
+) -> List[RecoveredFileEvidence]:
+    """Build a diagnostic ledger without letting invalid history cover files."""
+    prior_by_path = {entry.path: entry for entry in stored_session.recovered_file_evidence} if stored_session else {}
+    current_by_path = {entry.path: entry for entry in result.evidence_recovery if entry.status in {"RECOVERED", "IRRELEVANT"}}
+    ledger: List[RecoveredFileEvidence] = []
+    ledger_paths = list(dict.fromkeys([*context.unverified_files, *prior_by_path]))
+    for path in ledger_paths:
+        current = current_by_path.get(path)
+        prior = prior_by_path.get(path)
+        current_identity = context.file_change_identities.get(path, "")
+        reusable = current is not None and current.provenance == "REUSED_EQUIVALENT"
+        if current is None:
+            if prior is None:
+                continue
+            invalidated = replace(prior)
+            invalidated.status = "INVALIDATED"
+            invalidated.disposition = "INVALIDATED"
+            invalidated.last_consumed_head_sha = ""
+            invalidated.transition_reason = "Current file, Requirement manifest, or IRRELEVANT scope identity was changed or unverifiable"
+            ledger.append(invalidated)
+            continue
+        if reusable and prior is not None:
+            retained = replace(prior)
+            retained.source = current.source
+            retained.last_consumed_head_sha = head_sha
+            retained.disposition = "REUSED_EQUIVALENT"
+            retained.transition_reason = "Authoritative file-change and Requirement-manifest identities remained equivalent"
+            ledger.append(retained)
+            continue
+        readjudicated = prior is not None
+        ledger.append(
+            RecoveredFileEvidence(
+                path=current.path,
+                source=current.source,
+                status=current.status,
+                evidence=current.evidence,
+                requirement_ids=list(current.requirement_ids),
+                identity_version=RECOVERED_FILE_IDENTITY_VERSION,
+                change_identity=current_identity,
+                requirement_manifest_identity=context.requirement_manifest_identity,
+                origin_head_sha=head_sha,
+                origin_validation_snapshot=context.validation_snapshot,
+                scope_basis_identity=_stable_digest(current.evidence) if current.status == "IRRELEVANT" else "",
+                last_consumed_head_sha=head_sha,
+                disposition="READJUDICATED" if readjudicated else "FRESH",
+                previous_origin_head_sha=prior.origin_head_sha if prior else "",
+                previous_origin_validation_snapshot=prior.origin_validation_snapshot if prior else "",
+                transition_reason=("Prior classification was invalidated and independently re-adjudicated for the current snapshot" if readjudicated else ""),
+            )
+        )
+    return ledger
+
+
+def _carry_forward_current_run_recovered_evidence(
+    result: AdversarialValidationResult,
+    recovered_evidence: List[EvidenceRecoveryEntry],
+) -> AdversarialValidationResult:
+    """Preserve successful recovery when a dynamic follow-up replaces the result."""
+    if result.result == "ERROR":
+        return result
+    current_by_path = {entry.path: entry for entry in result.evidence_recovery}
+    for entry in recovered_evidence:
+        current = current_by_path.get(entry.path)
+        if current is not None and current.status in {"RECOVERED", "IRRELEVANT"}:
+            continue
+        retained = replace(entry, requirement_ids=list(entry.requirement_ids))
+        if current is None:
+            result.evidence_recovery.append(retained)
+        else:
+            result.evidence_recovery[result.evidence_recovery.index(current)] = retained
+        current_by_path[entry.path] = retained
+    return result
+
+
+def _remaining_unverified_paths(result: AdversarialValidationResult, context: AdversarialValidationContext) -> List[str]:
+    """Return exact paths not discharged by valid reviewer accounting."""
+    accounted = {entry.path for entry in result.evidence_recovery if entry.status in {"RECOVERED", "IRRELEVANT"}}
+    return [path for path in context.unverified_files if path not in accounted]
+
+
+def _continue_reviewer_session(
+    backend_manager: BackendManager,
+    session_id: str,
+    prompt: str,
+    *,
+    retained_local: Optional[bool] = None,
+) -> str:
+    """Authorize retained local workspace reuse before continuing a reviewer session."""
+    is_retained_local = retained_local if retained_local is not None else bool(getattr(backend_manager, "has_retained_local_session", lambda _sid: False)(session_id))
+    if is_retained_local:
+        backend_manager.authorize_retained_local_session_reuse(session_id)
+    return backend_manager.continue_session(session_id, prompt, is_noedit=True)
+
+
+def _complete_changed_file_evidence(
+    result: AdversarialValidationResult,
+    context: AdversarialValidationContext,
+    backend_manager: BackendManager,
+    requirement_manifest: str,
+    head_sha: str,
+    recorded_test_oracle_gaps: Sequence[TestOracleGap] = (),
+    closure_input: Optional[ReviewExecutionInput] = None,
+    reviewer_provenance: str = "",
+) -> AdversarialValidationResult:
+    """Perform the one controller-driven, same-session coverage continuation."""
+    unresolved = _remaining_unverified_paths(result, context)
+    if result.result != "PASS" or result.findings or result.open_test_oracle_gaps or not unresolved:
+        return result
+    evidence_by_path = {entry.path: entry for entry in context.controller_file_evidence}
+    retrievals = []
+    for path in unresolved:
+        evidence = evidence_by_path.get(path)
+        retrievals.append(
+            {
+                "path": path,
+                "status": "COMPLETE" if evidence is not None and evidence.is_complete else "UNAVAILABLE",
+                "source": "GitHub REST pull-request files representation",
+                "evidence": evidence.patch if evidence is not None else "Authoritative per-path retrieval failed or was incomplete",
+            }
+        )
+    session_id = getattr(backend_manager, "_last_session_id", None)
+    if not isinstance(session_id, str) or not session_id:
+        return AdversarialValidationResult(
+            result="ERROR",
+            summary="Changed-file evidence completion could not continue the reviewer session",
+            diagnostic_category="changed_file_completion_session_unavailable",
+            diagnostic_reason=f"Unresolved paths: {', '.join(unresolved)}",
+        )
+    prior_recovery = list(result.evidence_recovery)
+    prior_by_path = {entry.path: entry for entry in prior_recovery}
+    prompt = render_prompt(
+        "pr.adversarial_validation_evidence_completion",
+        validation_snapshot=context.validation_snapshot,
+        head_sha=head_sha,
+        unresolved_paths=json.dumps(unresolved, indent=2),
+        requirement_manifest=requirement_manifest,
+        prior_adjudication=result.raw_response or result.summary,
+        prior_test_oracle_gaps=json.dumps([gap.__dict__ for gap in recorded_test_oracle_gaps], indent=2, sort_keys=True),
+        controller_retrievals=json.dumps(retrievals, indent=2),
+    ) + _closure_prompt_extension(closure_input, context.issue_requirements)
+    initial_identity = backend_manager.get_current_backend_identity()
+    validation_evidence.observe_prompt("evidence_completion", prompt, _manifest_input(context))
+    try:
+        response = _continue_reviewer_session(backend_manager, session_id, prompt)
+        current_identity = backend_manager.get_current_backend_identity()
+    except Exception as exc:
+        return AdversarialValidationResult(
+            result="ERROR",
+            summary="Changed-file evidence completion could not continue the reviewer session",
+            diagnostic_category="changed_file_completion_session_discontinuity",
+            diagnostic_reason=f"Evidence completion failed during session continuation: {exc}",
+        )
+    if not getattr(backend_manager, "_last_continue_session_resumed", False) or current_identity != initial_identity:
+        return AdversarialValidationResult(
+            result="ERROR",
+            summary="Changed-file evidence completion could not continue the reviewer session",
+            diagnostic_category="changed_file_completion_session_discontinuity",
+            diagnostic_reason=f"Backend started a fresh session or switched identity instead of resuming the original reviewer session while completing: {', '.join(unresolved)}",
+        )
+    completion = _parse_reviewer_response(
+        "evidence_completion",
+        response,
+        recorded_test_oracle_gaps,
+        closure_input,
+        reviewer_provenance,
+    )
+    _log_contextual_parse_diagnostics(completion, response, backend_manager, context.pr_number, "evidence_completion")
+    supplied_complete = {item["path"] for item in retrievals if item["status"] == "COMPLETE"}
+    # Only this round's entries (for paths that were actually unresolved coming
+    # in) are validated against the controller retrieval and accounting rules.
+    # An entry that merely echoes a path already resolved in a prior round is
+    # neither invalid nor required here; it must not cause a previously
+    # recovered path to be discarded or rejected (REQ-003).
+    round_entries = [entry for entry in completion.evidence_recovery if entry.path in unresolved]
+    invalid_recovered = [entry.path for entry in round_entries if entry.status == "RECOVERED" and entry.path not in supplied_complete]
+    accounted = {entry.path for entry in round_entries}
+    # Only a path already successfully resolved (RECOVERED/IRRELEVANT) before
+    # this round must stay stable; a path that was still open (e.g.
+    # UNAVAILABLE) is exactly what this round exists to resolve, so its
+    # status is expected to change and must not be treated as a contradiction.
+    already_accounted_paths = {entry.path for entry in prior_recovery if entry.status in {"RECOVERED", "IRRELEVANT"}}
+    contradicted_prior = [entry.path for entry in completion.evidence_recovery if entry.path in already_accounted_paths and prior_by_path[entry.path].status != entry.status]
+    if invalid_recovered or accounted != set(unresolved) or contradicted_prior:
+        return AdversarialValidationResult(
+            result="ERROR",
+            summary="Invalid or incomplete changed-file evidence completion response",
+            diagnostic_category="invalid_changed_file_completion",
+            diagnostic_reason=(f"Invalid recovered paths: {invalid_recovered}; unaccounted paths: {sorted(set(unresolved) - accounted)}; contradicted prior recovery: {contradicted_prior}"),
+            evidence_recovery=completion.evidence_recovery,
+            requirement_coverage=completion.requirement_coverage,
+            test_oracle_gaps=completion.test_oracle_gaps,
+            thread_dispositions=completion.thread_dispositions,
+            source_response_id=completion.source_response_id,
+        )
+    # Round entries are the authoritative, current-round decision for every
+    # path they cover (including a previously UNAVAILABLE path now resolved),
+    # so they replace any stale prior entry for the same path rather than
+    # being skipped in its favor.
+    round_paths = {entry.path for entry in round_entries}
+    completion.evidence_recovery = [entry for entry in prior_recovery if entry.path not in round_paths] + round_entries
+    return completion
+
+
+# A denylist of absence-only phrasings is an unwinnable arms race against
+# paraphrase (a bare "This path is irrelevant." has no absence clause to
+# match at all, yet offers no independent basis either). Instead this
+# requires an affirmative, recognized independent-scope signal to be
+# present; anything else -- however phrased -- is treated as insufficient,
+# per REQ-004's requirement that IRRELEVANT rest on a concrete same-snapshot
+# scope basis rather than the reviewer's bare assertion.
+#
+# A bare file-category label ("this is generated code") is itself just an
+# unverified assertion -- exactly as bare as "this path is irrelevant" -- so
+# it cannot grant basis on its own. Only a marker describing how irrelevance
+# was actually established (a citation, comparison, or verification action)
+# does. Category labels are still recognized (in the combined pattern below)
+# so their own wording can be masked out of the negation search -- see
+# `_lacks_independent_irrelevance_scope_basis` -- they just never satisfy the
+# basis check by themselves.
+#
+# A bare claim of a verification action ("Already reviewed.") is equally
+# unverifiable if it never names what was checked: it says an action
+# happened, not what independent thing it was checked against. So every
+# action/comparison marker here requires the marker's own preposition
+# (via/by/to/from/per) to be followed by an actual token -- some concrete
+# object -- rather than standing on its own. The lookahead deliberately does
+# not consume that object: it must remain visible to the clause-level negation
+# check (for example, "verified by no independent evidence"). A concrete
+# artifact reference (.gitattributes/.gitignore) is an exception: naming the
+# artifact itself already is the citation.
+_VERIFICATION_SCOPE_EVIDENCE_PATTERN = re.compile(
+    r"(?:(?:confirmed|verified)\s+(?:via|by)(?=\s+\S)" r"|cross[- ]referenced\s+(?:with|against|to)(?=\s+\S)" r"|\.gitattributes|\.gitignore" r"|(?:identical\s+to|unchanged\s+from|byte[- ]identical\s+(?:to|with))(?=\s+\S)" r"|out\s+of\s+scope\s+per(?=\s+\S))",
+    re.IGNORECASE,
+)
+_CATEGORY_LABEL_PATTERN = re.compile(
+    r"(?:generated\s+(?:file|code|lock\s*file)|auto-?generated|build\s+artifact|compiled\s+output" r"|binary\s+asset|vendored|symlink|no\s+reviewable\s+logic|not\s+source\s+code" r"|pattern[- ]matching|renamed\s+without\s+content\s+change|already\s+reviewed)",
+    re.IGNORECASE,
+)
+_INDEPENDENT_SCOPE_EVIDENCE_PATTERN = re.compile(f"(?:{_VERIFICATION_SCOPE_EVIDENCE_PATTERN.pattern}|{_CATEGORY_LABEL_PATTERN.pattern})", re.IGNORECASE)
+# A negation cue anywhere in a matched marker's own clause -- whether it
+# precedes the marker ("no .gitattributes ...") or follows it ("...gitattributes
+# ... was not obtained") -- means the marker was invoked to say the evidence
+# is ABSENT, not that it was affirmatively found.
+_NEGATION_CUE_PATTERN = re.compile(r"\b(?:no|not|none|never|without|neither|nor|n't|lack(?:s|ing)?\s+of|absen(?:t|ce)\s+of)\b", re.IGNORECASE)
+_CLAUSE_BOUNDARY_PATTERN = re.compile(r"[.;]|,\s+(?:and|but)\b", re.IGNORECASE)
+
+
+def _lacks_independent_irrelevance_scope_basis(evidence: str) -> bool:
+    """Return True when IRRELEVANT lacks a concrete independent scope basis.
+
+    REQ-004/REQ-005 forbid discharging a path, or deciding a materially
+    dependent Requirement, from missing evidence or the reviewer's bare
+    assertion alone. An IRRELEVANT classification needs a concrete
+    same-snapshot scope basis independent of the absence itself: this
+    requires an affirmative, recognized *verification* marker (a citation,
+    comparison, or verification action -- not merely a file-category label,
+    which is itself just as bare an assertion as "this path is irrelevant")
+    to be present rather than trying to enumerate every way of asserting
+    irrelevance without one.
+
+    A marker mentioned only to say it was NOT obtained (e.g. "no
+    .gitattributes ... was obtained", or equally "the .gitattributes file was
+    not obtained") is not affirmative evidence: each match is checked against
+    the negation cues anywhere in its own clause -- both before and after the
+    marker, back and forward to the nearest clause boundary. One recognized
+    marker can itself contain a generic negation word as an idiom (e.g. "no
+    reviewable logic"), which must not be read as negating a *different*
+    marker sharing the same clause (e.g. "..., confirmed via ..."), so every
+    matched span (verification or category) is masked out of the text used
+    for the negation search -- only text outside any recognized marker can
+    negate a given match.
+    """
+    text = evidence.strip()
+    if not text:
+        return True
+    spans = [match.span() for match in _INDEPENDENT_SCOPE_EVIDENCE_PATTERN.finditer(text)]
+    masked = list(text)
+    for start, end in spans:
+        for index in range(start, end):
+            masked[index] = " "
+    masked_text = "".join(masked)
+    for match in _VERIFICATION_SCOPE_EVIDENCE_PATTERN.finditer(text):
+        start, end = match.span()
+        clause_start = 0
+        for boundary in _CLAUSE_BOUNDARY_PATTERN.finditer(text, 0, start):
+            clause_start = boundary.end()
+        end_boundary = _CLAUSE_BOUNDARY_PATTERN.search(text, end)
+        clause_end = end_boundary.start() if end_boundary else len(text)
+        clause = masked_text[clause_start:clause_end]
+        if not _NEGATION_CUE_PATTERN.search(clause):
+            return False
+    return True
+
+
+def _populate_finding_requirement_text(
+    findings: List[AdversarialValidationFinding],
+    requirements: List[IssueRequirement],
+) -> None:
+    """Attach authoritative manifest text to findings with known stable IDs."""
+    requirement_text_by_id = {requirement.requirement_id: requirement.text for requirement in requirements}
+    for finding in findings:
+        valid_ids = [rid for rid in finding.all_requirement_ids if rid in requirement_text_by_id]
+        if valid_ids:
+            finding.requirement_ids = valid_ids
+            if finding.requirement_id not in requirement_text_by_id:
+                finding.requirement_id = valid_ids[0]
+            authoritative_text = "\n\n".join(requirement_text_by_id[rid] for rid in valid_ids)
+            finding.requirement_text = authoritative_text
+            if not finding.violated_requirement:
+                finding.violated_requirement = authoritative_text
+
+
+def _is_retired_artifact_objection(finding: AdversarialValidationFinding) -> bool:
+    """Return whether finding objects to the removal/omission of retired artifacts."""
+    target_text = " ".join(
+        [
+            finding.anchor_path,
+            finding.violated_requirement,
+            finding.required_behavior,
+            finding.actual_behavior,
+            finding.evidence,
+            finding.counterexample,
+        ]
+    ).lower()
+    return "docs/client-features.yaml" in target_text
+
+
+def _is_objective_or_scenario_demand(
+    finding: AdversarialValidationFinding,
+    expected_requirement_ids: set[str],
+) -> bool:
+    """Return whether finding demands an outcome mentioned only in Objective or Acceptance Scenario."""
+    req_id = finding.requirement_id.strip().upper()
+    if req_id.startswith(("OBJECTIVE", "CONTEXT", "AS-", "SCENARIO-")) or req_id in {"OBJECTIVE", "CONTEXT"}:
+        return True
+    target_text = " ".join(
+        [
+            finding.finding_identity,
+            finding.correction_identity,
+            finding.violated_requirement,
+            finding.required_behavior,
+            finding.actual_behavior,
+            finding.counterexample,
+        ]
+    ).lower()
+    cues = (
+        "objective-only",
+        "only mentioned in the objective",
+        "mentioned only in the objective",
+        "only in the objective",
+        "scenario-only",
+        "only in acceptance scenario",
+        "acceptance scenario only",
+        "only in the acceptance scenario",
+        "acceptance-scenario-only",
+    )
+    if any(cue in target_text for cue in cues):
+        return True
+    return False
+
+
+def _is_documentation_defect(finding: AdversarialValidationFinding) -> bool:
+    """Return whether finding describes a documentation defect (e.g. false claim)."""
+    target_text = " ".join(
+        [
+            finding.anchor_path,
+            finding.finding_identity,
+            finding.correction_identity,
+            finding.violated_requirement,
+            finding.required_behavior,
+            finding.actual_behavior,
+            finding.counterexample,
+        ]
+    ).lower()
+    doc_cues = (
+        "documentation",
+        "doc defect",
+        "false claim",
+        "falsely claims",
+        "inaccurate documentation",
+        "untruthful documentation",
+        "docs/",
+    )
+    return any(cue in target_text for cue in doc_cues) and (finding.anchor_path.startswith("docs/") or "docs" in finding.anchor_path or "documentation" in finding.actual_behavior.lower() or "falsely claims" in finding.actual_behavior.lower() or "false claim" in finding.actual_behavior.lower())
+
+
+def _is_missing_test_finding(finding: AdversarialValidationFinding) -> bool:
+    """Return whether a finding merely reports missing tests/regression protection."""
+    if _is_documentation_defect(finding):
+        return False
+    target_text = " ".join(
+        [
+            finding.finding_identity,
+            finding.actual_behavior,
+            finding.counterexample,
+            finding.evidence,
+        ]
+    ).lower()
+    missing_test_cues = (
+        "missing test",
+        "no test",
+        "untested",
+        "tests do not cover",
+        "lack of test",
+        "test is missing",
+        "no regression test",
+        "missing regression",
+        "not tested",
+        "no test asserts",
+        "tests pass without testing",
+        "lacks test",
+        "no automated test",
+        "missing dedicated test",
+        "missing negative-control",
+        "no test coverage",
+        "lacks regression test",
+    )
+    return any(cue in target_text for cue in missing_test_cues)
+
+
+def _gap_establishes_missing_deliverable(gap: TestOracleGap) -> bool:
+    """Return whether a TOG's evidence asserts an observed absent test artifact."""
+    evidence = " ".join((gap.invariant, gap.why_tests_still_pass, gap.material_consequence, gap.focused_regression_scenario, gap.resolution_evidence)).casefold()
+    unavailable = ("could not inspect", "unable to inspect", "evidence unavailable", "not inspected", "unknown whether")
+    absence = ("missing", "no committed test", "no test", "tests do not", "tests only", "tests pass without", "lacks", "not covered", "does not cover", "absent")
+    return not any(cue in evidence for cue in unavailable) and any(cue in evidence for cue in absence)
+
+
+def _deliverable_finding_from_gap(gap: TestOracleGap, requirement_text: str) -> AdversarialValidationFinding:
+    """Promote an evidenced explicit test obligation while retaining its identity."""
+    return AdversarialValidationFinding(
+        requirement_id=gap.requirement_id,
+        finding_identity=gap.gap_id,
+        correction_identity=gap.correction_identity or gap.gap_id,
+        correction_scope_fingerprint=gap.correction_scope_fingerprint,
+        correction_context_fingerprint=gap.correction_context_fingerprint,
+        violated_requirement=requirement_text,
+        requirement_text=requirement_text,
+        reachability=gap.authoritative_boundary,
+        required_behavior=requirement_text,
+        actual_behavior=f"The explicitly required regression deliverable is absent: {gap.invariant}",
+        evidence=gap.why_tests_still_pass,
+        counterexample=(f"At {gap.authoritative_boundary}, the requirement mandates a committed regression deliverable, " f"but current tests omit it: {gap.invariant}. {gap.why_tests_still_pass}"),
+        test_gap=gap.why_tests_still_pass,
+        suggested_regression_scenario=gap.focused_regression_scenario,
+        anchor_path=gap.authoritative_boundary if gap.correction_identity.startswith(CANONICAL_CORRECTION_PREFIX) else gap.anchor_path,
+        anchor_line=gap.anchor_line,
+        anchor_side=gap.anchor_side,
+        anchor_start_line=gap.anchor_start_line,
+    )
+
+
+def _same_test_correction(finding: AdversarialValidationFinding, gap: TestOracleGap) -> bool:
+    """Match duplicate category encodings without collapsing by requirement ID."""
+    if gap.requirement_id not in finding.all_requirement_ids:
+        return False
+    if gap.gap_id in {finding.finding_identity, finding.correction_identity}:
+        return True
+    if gap.correction_identity.startswith(CANONICAL_CORRECTION_PREFIX) and gap.correction_identity == finding.correction_identity:
+        return True
+    finding_scope = " ".join((finding.reachability, finding.required_behavior, finding.actual_behavior, finding.suggested_regression_scenario)).casefold()
+    gap_scope = " ".join((gap.authoritative_boundary, gap.invariant, gap.focused_regression_scenario)).casefold()
+    significant = lambda value: {word for word in re.findall(r"[a-z0-9_]+", value) if len(word) > 3}
+    shared = significant(finding_scope) & significant(gap_scope)
+    return bool(shared) and (gap.authoritative_boundary.casefold() in finding_scope or len(shared) >= 4)
+
+
+def _normalize_findings_and_gaps(
+    result: AdversarialValidationResult,
+    context: AdversarialValidationContext,
+) -> None:
+    """Normalize findings and gaps against the authoritative Issue manifest.
+
+    1. Populates authoritative requirement text for findings citing valid IDs (REQ-008).
+    2. Reclassifies retired-artifact and objective/scenario demands as SpecificationGaps (REQ-004, REQ-005).
+    3. Isolates findings citing unknown or sibling-only requirement IDs without discarding
+       unrelated valid findings (REQ-008).
+    4. Deduplicates overlapping categories between findings and test-oracle gaps (REQ-006).
+    """
+    expected_requirement_ids = {r.requirement_id for r in context.issue_requirements}
+    req_text_by_id = {r.requirement_id: r.text for r in context.issue_requirements}
+    if not expected_requirement_ids:
+        return
+
+    # 1. Populate authoritative requirement text
+    _populate_finding_requirement_text(result.findings, context.issue_requirements)
+
+    # 2. Reclassify SpecificationGaps
+    retained_findings: List[AdversarialValidationFinding] = []
+    for finding in result.findings:
+        if _is_retired_artifact_objection(finding):
+            gap = SpecificationGap(
+                question="Should docs/client-features.yaml be maintained alongside standalone documentation fragments?",
+                why_existing_issue_is_insufficient="The Issue requirements do not mandate maintaining the retired docs/client-features.yaml artifact during standalone fragment migration.",
+                observed_case=finding.actual_behavior or finding.counterexample or "docs/client-features.yaml was deleted or omitted.",
+                affected_scope=finding.anchor_path or "docs/client-features.yaml",
+                candidate_options=[
+                    "Permit deletion of docs/client-features.yaml in favor of standalone fragments",
+                    "Retain docs/client-features.yaml",
+                ],
+            )
+            result.specification_gaps.append(gap)
+            for entry in result.requirement_coverage:
+                if entry.requirement_id in finding.all_requirement_ids and entry.status == "VIOLATED":
+                    entry.status = "VERIFIED"
+                    entry.evidence = (entry.evidence + "; retired artifact objection tracked as specification_gap").strip("; ")
+            continue
+
+        if _is_objective_or_scenario_demand(finding, expected_requirement_ids):
+            gap = SpecificationGap(
+                question=f"Should the outcome '{finding.required_behavior or finding.violated_requirement}' be required?",
+                why_existing_issue_is_insufficient="The behavior is mentioned only in the Objective or Acceptance Scenario and is not specified in the explicit Requirements manifest.",
+                observed_case=finding.actual_behavior or finding.counterexample or "Outcome mentioned only in Objective or Acceptance Scenario was not implemented.",
+                affected_scope=finding.anchor_path or "Specification and implementation scope",
+                candidate_options=[
+                    "Add explicit Requirement to target Issue",
+                    "Treat as optional or out-of-scope for this Issue",
+                ],
+            )
+            result.specification_gaps.append(gap)
+            continue
+
+        retained_findings.append(finding)
+
+    # 3. Isolate unknown / sibling-only findings if valid findings exist
+    surviving_findings: List[AdversarialValidationFinding] = []
+    unknown_findings: List[AdversarialValidationFinding] = []
+    for finding in retained_findings:
+        if any(rid in expected_requirement_ids for rid in finding.all_requirement_ids):
+            surviving_findings.append(finding)
+        else:
+            unknown_findings.append(finding)
+
+    if surviving_findings:
+        retained_findings = surviving_findings
+        if unknown_findings:
+            logger.warning(f"Isolated {len(unknown_findings)} finding(s) referencing unknown or sibling-only requirement IDs " f"({', '.join(f.requirement_id for f in unknown_findings)}) without discarding valid findings.")
+    else:
+        retained_findings = unknown_findings
+
+    # 4. Promote evidenced gap-only reports for affirmative test deliverables.
+    promoted_gap_ids: set[str] = set()
+    for oracle_gap in result.test_oracle_gaps:
+        requirement_text = req_text_by_id.get(oracle_gap.requirement_id, "")
+        # A retained OPEN accepted gap is a lifecycle obligation awaiting closure; its original
+        # absence prose is historical. It becomes a current violation only when this attempt's
+        # independent disposition upholds it.
+        pending_closure = oracle_gap.gap_id in context.accepted_known_gap_ids and oracle_gap.gap_id not in context.accepted_upheld_gap_ids
+        if oracle_gap.status == "OPEN" and not pending_closure and is_explicit_test_deliverable(requirement_text) and _gap_establishes_missing_deliverable(oracle_gap):
+            if not any(_same_test_correction(finding, oracle_gap) for finding in retained_findings):
+                retained_findings.append(_deliverable_finding_from_gap(oracle_gap, requirement_text))
+            promoted_gap_ids.add(oracle_gap.gap_id)
+            for entry in result.requirement_coverage:
+                if entry.requirement_id == oracle_gap.requirement_id:
+                    entry.status = "VIOLATED"
+                    entry.evidence = f"Explicit regression deliverable absent: {oracle_gap.invariant}"
+
+    # 5. Category deduplication between findings and test-oracle gaps
+    final_findings: List[AdversarialValidationFinding] = []
+    retained_gaps: List[TestOracleGap] = [gap for gap in result.test_oracle_gaps if gap.gap_id not in promoted_gap_ids]
+
+    for finding in retained_findings:
+        is_deliverable = any(is_explicit_test_deliverable(req_text_by_id.get(rid, "")) for rid in finding.all_requirement_ids if rid in expected_requirement_ids)
+        if is_deliverable:
+            final_findings.append(finding)
+            # An accepted gap is a distinct durable obligation: only its own identity may collapse into
+            # a finding, never a lexical overlap with another concern under the same Requirement.
+            retained_gaps = [gap for gap in retained_gaps if not _same_test_correction(finding, gap) or (gap.gap_id in context.accepted_known_gap_ids and gap.gap_id not in {finding.finding_identity, finding.correction_identity})]
+        else:
+            if _is_missing_test_finding(finding):
+                has_matching_gap = any(_same_test_correction(finding, gap) for gap in retained_gaps)
+                if not has_matching_gap:
+                    primary_req = finding.requirement_id if finding.requirement_id in expected_requirement_ids else (finding.requirement_ids[0] if finding.requirement_ids else "")
+                    boundary = finding.anchor_path if finding.correction_identity.startswith(CANONICAL_CORRECTION_PREFIX) else finding.reachability or finding.anchor_path or "runtime_boundary"
+                    invariant = finding.required_behavior or req_text_by_id.get(primary_req, "Runtime invariant")
+                    new_gap = TestOracleGap(
+                        gap_id=_stable_test_oracle_gap_id(primary_req, boundary, invariant),
+                        correction_identity=finding.correction_identity if finding.correction_identity.startswith(CANONICAL_CORRECTION_PREFIX) else "",
+                        correction_scope_fingerprint=finding.correction_scope_fingerprint,
+                        correction_context_fingerprint=finding.correction_context_fingerprint,
+                        requirement_id=primary_req,
+                        requirement_text=req_text_by_id.get(primary_req, ""),
+                        authoritative_boundary=boundary,
+                        invariant=invariant,
+                        plausible_incorrect_implementation=finding.actual_behavior or "Omit required runtime behavior",
+                        why_tests_still_pass=finding.test_gap or "No test asserts this runtime invariant",
+                        material_consequence=finding.actual_behavior or "Regression risk for runtime behavior",
+                        focused_regression_scenario=finding.suggested_regression_scenario or f"Add regression test asserting {invariant}",
+                        anchor_path=finding.anchor_path,
+                        anchor_line=finding.anchor_line,
+                        anchor_side=finding.anchor_side,
+                        anchor_start_line=finding.anchor_start_line,
+                        status="OPEN",
+                    )
+                    retained_gaps.append(new_gap)
+                for entry in result.requirement_coverage:
+                    if entry.requirement_id in finding.all_requirement_ids and entry.status == "VIOLATED":
+                        entry.status = "VERIFIED"
+                        entry.evidence = (entry.evidence + "; regression protection tracked in test_oracle_gaps").strip("; ")
+            else:
+                final_findings.append(finding)
+
+    result.findings = final_findings
+    result.test_oracle_gaps = retained_gaps
+
+    if not result.findings and result.result == "NEEDS_FIX":
+        if any(gap.status == "OPEN" for gap in result.test_oracle_gaps):
+            result.result = "NEEDS_TESTS"
+        else:
+            result.result = "PASS"
+            result.summary = "Defined requirements pass."
+
+
+def assemble_adversarial_repair_prompt(
+    result: AdversarialValidationResult,
+    target: Any,
+    repo_name: str,
+    pr_number: int,
+    head_sha: str,
+    *,
+    bundle: Optional[Any] = None,
+    original_objective: Optional[str] = None,
+) -> str:
+    """Assemble repair prompt containing only valid findings and material test-oracle gaps.
+
+    Ensures specification gaps are not converted into code-repair instructions,
+    and older summaries do not reintroduce rejected or duplicate obligations (REQ-009).
+    Uses bounded bundle semantics and preserves fixed Objective (REQ-001..REQ-003, REQ-009).
+    """
+    from .bounded_repair_bundle import (
+        BoundedBlockerHandoff,
+        RepairHandoffBundle,
+        compute_bundle_id,
+        render_bounded_repair_payload,
+    )
+    from .canonical_pr_blocker_ledger import QualifiedRequirement
+    from .pr_repair import build_existing_pr_repair_prompt
+
+    if bundle is not None:
+        return build_existing_pr_repair_prompt(target, render_bounded_repair_payload(bundle), bundle=bundle)
+
+    handoff_blockers = []
+    for finding in result.findings:
+        qrs = tuple(QualifiedRequirement(issue_number=pr_number, requirement_id=rid) for rid in finding.all_requirement_ids)
+        req_texts = tuple((finding.requirement_text or finding.violated_requirement) for _ in qrs)
+        oracle = f"{finding.evidence}. Counterexample: {finding.counterexample}" if finding.counterexample else finding.evidence
+        handoff_blockers.append(
+            BoundedBlockerHandoff(
+                blocker_id=finding.finding_identity,
+                category="IMPLEMENTATION",
+                authoritative_boundary=finding.anchor_path,
+                qualified_requirements=qrs,
+                requirement_texts=req_texts,
+                original_correction_scope=finding.required_behavior,
+                owned_concern_ids=(finding.correction_identity,) if finding.correction_identity else (finding.finding_identity,),
+                required_corrective_outcome=f"{finding.required_behavior}. Observed: {finding.actual_behavior}",
+                production_boundary_oracle=oracle,
+                reviewed_head_sha=head_sha,
+                current_evidence=finding.evidence,
+            )
+        )
+    for gap in result.open_test_oracle_gaps:
+        qrs = (QualifiedRequirement(issue_number=pr_number, requirement_id=gap.requirement_id),)
+        req_texts = (gap.requirement_text or "",)
+        oracle = f"Missing test protection for {gap.invariant}. Minimal plausible incorrect implementation: {gap.plausible_incorrect_implementation}" if gap.plausible_incorrect_implementation else gap.invariant
+        handoff_blockers.append(
+            BoundedBlockerHandoff(
+                blocker_id=gap.gap_id,
+                category="TEST_ORACLE",
+                authoritative_boundary=gap.authoritative_boundary,
+                qualified_requirements=qrs,
+                requirement_texts=req_texts,
+                original_correction_scope=gap.invariant,
+                owned_concern_ids=(gap.gap_id,),
+                required_corrective_outcome=gap.focused_regression_scenario or gap.invariant,
+                production_boundary_oracle=oracle,
+                reviewed_head_sha=head_sha,
+                current_evidence=gap.resolution_evidence,
+            )
+        )
+
+    if not handoff_blockers:
+        from string import Template
+
+        from .prompt_loader import get_prompt_template
+
+        details = Template(get_prompt_template("pr.adversarial_validation_fix")).safe_substitute(
+            repo_name=repo_name,
+            pr_number=pr_number,
+            head_sha=head_sha,
+            validation_report="(No actionable adversarial findings)",
+        )
+        return build_existing_pr_repair_prompt(target, details)
+
+    bundle_id = compute_bundle_id(
+        api_origin="https://api.github.com",
+        repo_name=repo_name,
+        pr_number=pr_number,
+        head_branch=target.head_branch,
+        base_branch=target.base_branch,
+        reviewed_head_sha=head_sha,
+        requirement_manifest_revision="",
+        blockers=handoff_blockers,
+        original_objective=original_objective,
+    )
+    synth_bundle = RepairHandoffBundle(
+        bundle_id=bundle_id,
+        api_origin="https://api.github.com",
+        repo_name=repo_name,
+        pr_number=pr_number,
+        head_branch=target.head_branch,
+        base_branch=target.base_branch,
+        reviewed_head_sha=head_sha,
+        requirement_manifest_revision="",
+        original_objective=original_objective,
+        blockers=tuple(handoff_blockers),
+        is_failed_correction=False,
+    )
+    rendered_payload = render_bounded_repair_payload(synth_bundle)
+    return build_existing_pr_repair_prompt(target, rendered_payload, bundle=synth_bundle)
+
+
+def _manifest_input(context: AdversarialValidationContext) -> validation_evidence.ManifestInput:
+    return validation_evidence.ManifestInput(mode=context.requirement_manifest_mode, entries=[(requirement.requirement_id, requirement.text) for requirement in context.issue_requirements], validation_snapshot=context.validation_snapshot)
+
+
+def _parse_reviewer_response(
+    stage: str,
+    response: str,
+    recorded_test_oracle_gaps: Sequence[TestOracleGap] = (),
+    closure_input: Optional[ReviewExecutionInput] = None,
+    reviewer_provenance: str = "",
+) -> AdversarialValidationResult:
+    """Parse one semantic reviewer response, giving it its own diagnostic identity."""
+    with validation_evidence.response_parse(stage, response) as scope:
+        result = parse_adversarial_validation_response(response, recorded_test_oracle_gaps, closure_input, reviewer_provenance)
+        if scope is not None:
+            scope.result = result
+    return result
+
+
+def _apply_coverage_and_verdict_precedence(
+    result: AdversarialValidationResult,
+    context: AdversarialValidationContext,
+) -> AdversarialValidationResult:
+    """Apply deterministic finding-first and complete-coverage verdict rules.
+
+    The interpretation is recorded as diagnostic evidence bound to the response
+    the result came from; recording never alters the verdict.
+    """
+    manifest = _manifest_input(context)
+    skip = result.result == "ERROR" and bool(result.diagnostic_category)
+    handle = validation_evidence.observe_coverage_check_begin(
+        result.source_response_id,
+        manifest,
+        [entry.requirement_id for entry in result.requirement_coverage],
+        result.result,
+        "result_already_error_with_diagnostic" if skip else None,
+    )
+    checked = _enforce_coverage_and_verdict_precedence(result, context)
+    validation_evidence.observe_coverage_check_end(handle, checked.result, checked.diagnostic_category, checked.diagnostic_reason)
+    return checked
+
+
+def _enforce_coverage_and_verdict_precedence(
+    result: AdversarialValidationResult,
+    context: AdversarialValidationContext,
+) -> AdversarialValidationResult:
+    if result.result == "ERROR" and result.diagnostic_category:
+        return result
+
+    result.correction_reference_context = context.correction_reference_context
+    observations: list[AdversarialValidationFinding | TestOracleGap] = [*result.findings, *result.open_test_oracle_gaps]
+    for observation in observations:
+        is_finding = isinstance(observation, AdversarialValidationFinding)
+        _, reference_error = validate_correction_reference(
+            context.correction_reference_context,
+            observation.correction_identity,
+            observation.correction_scope_fingerprint,
+            observation.correction_context_fingerprint,
+            observation.all_requirement_ids if isinstance(observation, AdversarialValidationFinding) else [observation.requirement_id],
+            observation.anchor_path if isinstance(observation, AdversarialValidationFinding) else observation.authoritative_boundary,
+            "IMPLEMENTATION" if is_finding else "TEST_ORACLE",
+        )
+        if reference_error:
+            # A malformed binding invalidates this response's authority. Keep
+            # the raw answer for diagnosis, but do not let its findings reach
+            # reconciliation or its closure claims resolve historical threads.
+            return replace(
+                result,
+                result="ERROR",
+                raw_model_result=result.raw_model_result or result.result,
+                summary="Invalid validator response: correction reference could not be authenticated; independent validation must be repeated",
+                diagnostic_category="correction_reference_invalid",
+                diagnostic_reason=reference_error,
+                findings=[],
+                test_oracle_gaps=[],
+                thread_dispositions=[],
+                closure_assessment=None,
+                closure_assessment_diagnostic="Closure claims withheld because the response contains an invalid correction reference",
+                dynamic_check_requested=None,
+                unexplained_changes=[],
+                publish_clarification_thread=False,
+            )
+
+    _normalize_findings_and_gaps(result, context)
+
+    expected_requirement_ids = {requirement.requirement_id for requirement in context.issue_requirements}
+    recovery_requirement_ids = {requirement_id for entry in result.evidence_recovery for requirement_id in entry.requirement_ids}
+    evidence_gap_requirement_ids = {gap.requirement_id for gap in result.decision_critical_evidence_gaps}
+    unknown_evidence_requirement_ids = sorted((recovery_requirement_ids | evidence_gap_requirement_ids) - expected_requirement_ids)
+    if unknown_evidence_requirement_ids:
+        result.result = "ERROR"
+        result.summary = "Invalid validator response: evidence recovery referenced unknown stable requirement IDs"
+        result.diagnostic_category = "unknown_evidence_recovery_requirement_id"
+        result.diagnostic_reason = f"Evidence recovery references IDs outside the deterministic manifest: {', '.join(unknown_evidence_requirement_ids)}"
+        return result
+    recovered_paths = {entry.path for entry in result.evidence_recovery if entry.status in {"RECOVERED", "IRRELEVANT"} and entry.path in context.unverified_files}
+    remaining_unverified_files = [path for path in context.unverified_files if path not in recovered_paths]
+    coverage_by_id = {entry.requirement_id: entry for entry in result.requirement_coverage}
+    unknown_requirement_ids = sorted(coverage_by_id.keys() - expected_requirement_ids)
+    missing_requirement_ids = sorted(expected_requirement_ids - coverage_by_id.keys())
+    unresolved_requirement_ids = sorted(requirement_id for requirement_id in expected_requirement_ids & coverage_by_id.keys() if coverage_by_id[requirement_id].status not in {"VERIFIED", "IRRELEVANT"})
+    incomplete_requirement_ids = missing_requirement_ids + unresolved_requirement_ids
+    violated_requirement_ids = sorted(requirement_id for requirement_id in expected_requirement_ids & coverage_by_id.keys() if coverage_by_id[requirement_id].status == "VIOLATED")
+    finding_requirement_ids = {requirement_id for finding in result.findings for requirement_id in finding.all_requirement_ids}
+    unknown_finding_requirement_ids = sorted(finding_requirement_ids - expected_requirement_ids)
+    gap_requirement_ids = {gap.requirement_id for gap in result.test_oracle_gaps}
+    unknown_gap_requirement_ids = sorted(gap_requirement_ids - expected_requirement_ids)
+    invalid_gap_anchors = sorted({gap.anchor_path for gap in result.open_test_oracle_gaps if gap.anchor_path not in context.all_changed_files and gap.gap_id not in context.accepted_known_gap_ids})
+
+    unavailable_requirement_ids = {requirement_id for entry in result.evidence_recovery if entry.status == "UNAVAILABLE" and entry.path in remaining_unverified_files for requirement_id in entry.requirement_ids}
+    incompatible_verified_ids = sorted(requirement_id for requirement_id in unavailable_requirement_ids if requirement_id in coverage_by_id and coverage_by_id[requirement_id].status in {"VERIFIED", "IRRELEVANT"})
+    if incompatible_verified_ids:
+        result.result = "ERROR"
+        result.summary = "Invalid validator response: unavailable evidence was declared for already-decided requirements"
+        result.diagnostic_category = "requirement_evidence_claim_mismatch"
+        result.diagnostic_reason = "Correctness-relevant changed-file evidence is unavailable while dependent requirements " f"are marked decided: {', '.join(incompatible_verified_ids)}"
+        return result
+
+    unavailable_controller_paths = {evidence.path for evidence in context.controller_file_evidence if not evidence.is_complete}
+    absence_only_irrelevant_paths = sorted(entry.path for entry in result.evidence_recovery if entry.status == "IRRELEVANT" and entry.path in unavailable_controller_paths and _lacks_independent_irrelevance_scope_basis(entry.evidence))
+    if absence_only_irrelevant_paths:
+        result.result = "ERROR"
+        result.summary = "Invalid validator response: IRRELEVANT lacked an independent scope basis"
+        result.diagnostic_category = "absence_only_irrelevance_rejected"
+        result.diagnostic_reason = f"Paths marked IRRELEVANT without a recognized independent scope basis while their evidence is unavailable: {', '.join(absence_only_irrelevant_paths)}"
+        return result
+
+    if unknown_finding_requirement_ids:
+        if not result.findings or all(f.requirement_id in unknown_finding_requirement_ids for f in result.findings):
+            reason = f"Findings reference IDs outside the deterministic manifest: {', '.join(unknown_finding_requirement_ids)}"
+            result.result = "ERROR"
+            result.summary = "Invalid validator response: findings referenced unknown stable requirement IDs"
+            result.findings = []
+            result.diagnostic_category = "unknown_finding_requirement_id"
+            result.diagnostic_reason = reason
+            return result
+        else:
+            result.findings = [f for f in result.findings if any(rid in expected_requirement_ids for rid in f.all_requirement_ids)]
+
+    if unknown_gap_requirement_ids:
+        result.test_oracle_gaps = [gap for gap in result.test_oracle_gaps if gap.requirement_id in expected_requirement_ids]
+        if not result.findings and not result.test_oracle_gaps:
+            reason = f"Test-oracle gaps reference IDs outside the deterministic manifest: {', '.join(unknown_gap_requirement_ids)}"
+            result.result = "ERROR"
+            result.summary = "Invalid validator response: test-oracle gaps referenced unknown stable requirement IDs"
+            result.diagnostic_category = "unknown_test_oracle_gap_requirement_id"
+            result.diagnostic_reason = reason
+            return result
+
+    # The stable ID is the model's only requirement reference.  Once that ID
+    # has passed the fail-closed manifest check above, attach authoritative
+    # display text locally instead of trusting an echoed copy from the model.
+    _populate_test_oracle_gap_requirement_text(result.test_oracle_gaps, context.issue_requirements)
+
+    if invalid_gap_anchors:
+        reason = f"Open test-oracle gaps must anchor to changed files: {', '.join(invalid_gap_anchors)}"
+        result.result = "ERROR"
+        result.summary = "Invalid validator response: test-oracle gaps used invalid changed-file anchors"
+        result.test_oracle_gaps = [gap for gap in result.test_oracle_gaps if gap.anchor_path in context.all_changed_files]
+        result.diagnostic_category = "invalid_test_oracle_gap_anchor"
+        result.diagnostic_reason = reason
+        return result
+
+    if unknown_requirement_ids and not result.findings:
+        reason = f"Requirement coverage contains IDs outside the deterministic manifest: {', '.join(unknown_requirement_ids)}"
+        result.result = "ERROR"
+        result.summary = "Invalid validator response: requirement coverage referenced unknown stable IDs"
+        result.diagnostic_category = "unknown_requirement_coverage_id"
+        result.diagnostic_reason = reason
+        return result
+
+    if violated_requirement_ids and not result.findings:
+        reason = f"VIOLATED requirement coverage lacks a concrete counterexample finding: {', '.join(violated_requirement_ids)}"
+        result.result = "ERROR"
+        result.summary = "Contradictory validator response: violated requirements were reported without concrete findings"
+        result.diagnostic_category = "violated_requirement_without_finding"
+        result.diagnostic_reason = reason
+        return result
+
+    unrepresented_violated_ids = sorted(set(violated_requirement_ids) - finding_requirement_ids)
+    if unrepresented_violated_ids:
+        result.result = "ERROR"
+        result.summary = "Contradictory validator response: violated requirements lacked a matching concrete finding"
+        result.diagnostic_category = "violated_requirement_without_matching_finding"
+        result.diagnostic_reason = f"No finding references: {', '.join(unrepresented_violated_ids)}"
+        return result
+
+    if result.findings:
+        result.unexplained_changes = []
+        result.result = "NEEDS_FIX"
+        incomplete_coverage: List[str] = []
+        coverage_details: List[str] = []
+        if remaining_unverified_files:
+            incomplete_coverage.append(f"{len(remaining_unverified_files)} changed file(s)")
+            coverage_details.append(f"changed files: {', '.join(remaining_unverified_files)}")
+        if context.unresolvable_file_count:
+            incomplete_coverage.append(f"{context.unresolvable_file_count} unidentified changed file(s)")
+            coverage_details.append(f"{context.unresolvable_file_count} changed file(s) could not be identified after pagination retries")
+        if not expected_requirement_ids:
+            incomplete_coverage.append("Issue requirement manifest was empty")
+            coverage_details.append("Issue requirement manifest was empty")
+        elif incomplete_requirement_ids:
+            incomplete_coverage.append(f"{len(incomplete_requirement_ids)} Issue requirement(s)")
+            coverage_details.append(f"Issue requirement IDs: {', '.join(incomplete_requirement_ids)}")
+        if unknown_requirement_ids:
+            incomplete_coverage.append(f"{len(unknown_requirement_ids)} unknown requirement ID(s)")
+            coverage_details.append(f"unknown requirement IDs: {', '.join(unknown_requirement_ids)}")
+        if incomplete_coverage:
+            coverage_note = f"Review coverage also remains incomplete for {', '.join(incomplete_coverage)}."
+            if coverage_note not in result.summary:
+                result.summary = f"{result.summary.rstrip()} {coverage_note}".strip()
+            result.diagnostic_category = result.diagnostic_category or "incomplete_evidence_coverage"
+            result.diagnostic_reason = result.diagnostic_reason or "; ".join(coverage_details)
+        return result
+
+    if result.open_test_oracle_gaps and result.result in {"PASS", "NEEDS_TESTS"}:
+        result.result = "NEEDS_TESTS"
+        gap_details: List[str] = []
+        if remaining_unverified_files:
+            gap_details.append(f"changed files: {', '.join(remaining_unverified_files)}")
+        if context.unresolvable_file_count:
+            gap_details.append(f"{context.unresolvable_file_count} changed file(s) could not be identified after pagination retries")
+        if not expected_requirement_ids or incomplete_requirement_ids:
+            gap_details.append("The deterministic Issue requirement manifest was empty" if not expected_requirement_ids else f"Material Issue requirement IDs remain unverified: {', '.join(incomplete_requirement_ids)}")
+        if gap_details:
+            result.diagnostic_category = "incomplete_evidence_coverage" if (remaining_unverified_files or context.unresolvable_file_count) else "incomplete_requirement_coverage"
+            result.diagnostic_reason = "; ".join(gap_details)
+
+    if not remaining_unverified_files and expected_requirement_ids and not incomplete_requirement_ids and result.unexplained_changes:
+        result.result = "INCONCLUSIVE"
+        result.diagnostic_category = "change_provenance_clarification"
+        result.diagnostic_reason = "Material changed-file purpose or provenance requires implementer clarification"
+        # Provenance clarification is an orthogonal merge gate after all Issue
+        # requirements and file evidence are complete, not an evidence-recovery
+        # failure for an undecidable requirement.
+        return result
+
+    if result.unexplained_changes:
+        # A provenance question is only authoritative after the Issue contract
+        # itself is completely adjudicated. Other missing evidence retains its
+        # existing diagnostic and must not be mislabeled as implementer provenance.
+        result.unexplained_changes = []
+
+    if result.result.strip().upper() == "PASS" and remaining_unverified_files:
+        reason = f"Material changed-file evidence was incomplete after bounded recovery for: {', '.join(remaining_unverified_files)}"
+        result.result = "ERROR"
+        result.summary = "Invalid validator response: PASS conflicts with unresolved changed-file evidence"
+        result.diagnostic_category = "pass_with_unresolved_changed_file_evidence"
+        result.diagnostic_reason = reason
+        return result
+
+    if result.result.strip().upper() == "PASS" and context.unresolvable_file_count:
+        result.result = "ERROR"
+        result.summary = "Invalid validator response: PASS conflicts with an unresolvable changed-file accounting gap"
+        result.diagnostic_category = "pass_with_unresolvable_changed_file_count"
+        result.diagnostic_reason = f"Authoritative changed-file pagination could not identify {context.unresolvable_file_count} file(s) after retries; PASS cannot be authorized without accounting for every changed file"
+        return result
+
+    if result.result.strip().upper() == "PASS" and (not expected_requirement_ids or incomplete_requirement_ids):
+        if not expected_requirement_ids:
+            reason = "The deterministic Issue requirement manifest was empty"
+        else:
+            reason = f"Material Issue requirement IDs remain unverified: {', '.join(incomplete_requirement_ids)}"
+        result.result = "ERROR"
+        result.summary = "Invalid validator response: PASS conflicts with incomplete Issue requirement coverage"
+        result.diagnostic_category = "pass_with_incomplete_requirement_coverage"
+        result.diagnostic_reason = reason
+        return result
+    return _enforce_inconclusive_recovery_contract(result, incomplete_requirement_ids)
+
+
+def _closure_prompt_extension(closure_input: Optional[ReviewExecutionInput], ordinary_requirements: Sequence[IssueRequirement]) -> str:
+    """Render optional closure work without changing ordinary-only prompts."""
+    if closure_input is None:
+        return ""
+    unavailable_reason = _closure_input_unavailable_reason(closure_input)
+    if unavailable_reason:
+        return "\n\n" + render_prompt("pr.adversarial_validation_closure_unavailable", reason=unavailable_reason)
+    return "\n\n" + render_prompt(
+        "pr.adversarial_validation_closure_extension",
+        review_prompt=build_review_prompt(closure_input, embedded_closure=True),
+        ordinary_requirement_ids=json.dumps([requirement.requirement_id for requirement in ordinary_requirements]),
+    )
+
+
+def default_accepted_finding_bridge(repo_name: str) -> AcceptedFindingBridge:
+    from .canonical_pr_blocker_ledger import CanonicalPRBlockerLedger
+    from .pr_review_cycle import PrReviewCycleRepository
+
+    return AcceptedFindingBridge(PrReviewCycleRepository(repo_name), CanonicalPRBlockerLedger())
+
+
+def observed_roots_from_claimed_threads(claimed_review_threads: Sequence["ClaimedReviewThread"]) -> RootObservation:
+    """Roots of claimed threads were already filtered to the eligible reviewer identity."""
+    roots = tuple(ObservedRoot(comment_id=thread.root_comment_database_id, body=thread.original_finding, authenticated=True, thread_id=thread.thread_id) for thread in claimed_review_threads if thread.root_comment_database_id is not None)
+    return RootObservation(roots=roots, complete=False)
+
+
+def project_accepted_findings(
+    bridge: AcceptedFindingBridge,
+    target: ProjectionTarget,
+    claimed_review_threads: Sequence["ClaimedReviewThread"],
+    dispositions: Sequence[OrdinaryDisposition] = (),
+) -> AcceptedFindingProjection:
+    try:
+        return bridge.project(target, observed_roots_from_claimed_threads(claimed_review_threads), dispositions)
+    except Exception as exc:  # the bridge must never turn a store fault into "no findings"
+        logger.warning(f"Accepted-finding projection failed for PR #{target.pr_number}: {exc}")
+        return AcceptedFindingProjection(target=target, complete=False, diagnostics=(BridgeDiagnostic("projection_failed", "", str(exc)),))
+
+
+def _lifecycle_session_with_accepted_gaps(
+    lifecycle_session: Optional[ReviewerSession],
+    stored_session: Optional[ReviewerSession],
+    accepted_gaps: Sequence[TestOracleGap],
+    repo_name: str,
+    pr_number: int,
+    fallback_head_sha: str,
+) -> Optional[ReviewerSession]:
+    """Add accepted-finding representations without mutating registry-owned state."""
+    if not accepted_gaps:
+        return lifecycle_session
+    base = lifecycle_session or stored_session or ReviewerSession(repository=repo_name, pr_number=pr_number)
+    known = {gap.gap_id for gap in base.test_oracle_gaps}
+    merged = [replace(gap) for gap in base.test_oracle_gaps] + [gap for gap in accepted_gaps if gap.gap_id not in known]
+    return replace(base, last_head_sha=base.last_head_sha or fallback_head_sha, test_oracle_gaps=merged)
+
+
+def accepted_finding_dispositions(
+    result: AdversarialValidationResult,
+    claimed_review_threads: Sequence["ClaimedReviewThread"],
+    projection: AcceptedFindingProjection,
+    head_sha: str,
+) -> List[OrdinaryDisposition]:
+    """Ordinary dispositions addressed to roots that carry (or are associated with) an accepted finding."""
+    known_roots = {root for record in projection.records for root in record.root_comment_ids}
+    threads = {thread.thread_id: thread for thread in claimed_review_threads}
+    selected: List[OrdinaryDisposition] = []
+    for disposition in result.thread_dispositions:
+        thread = threads.get(disposition.thread_id)
+        if thread is None or thread.root_comment_database_id is None:
+            continue
+        if thread.root_comment_database_id not in known_roots and FINDING_ROOT_MARKER.search(thread.original_finding) is None:
+            continue
+        selected.append(
+            OrdinaryDisposition(
+                status=disposition.status,
+                rationale=disposition.rationale,
+                evidence=disposition.evidence,
+                head_sha=head_sha,
+                root_comment_id=thread.root_comment_database_id,
+                thread_id=thread.thread_id,
+            )
+        )
+    return selected
+
+
+def run_adversarial_validation(
+    repo_name: str,
+    pr_data: Dict[str, Any],
+    config: AutomationConfig,
+    github_client: Optional[Any] = None,
+    backend_manager: Optional[BackendManager] = None,
+    session_registry: Optional[ReviewerSessionRegistry] = None,
+    claimed_review_threads_section: Optional[str] = None,
+    claimed_review_threads: Sequence["ClaimedReviewThread"] = (),
+    execution_cwd: Optional[str] = None,
+    defer_session_persistence: bool = False,
+    ci_status: Optional["GitHubActionsStatusResult"] = None,
+    refresh_ci_status: Optional[Callable[[], "GitHubActionsStatusResult"]] = None,
+    closure_input: Optional[ReviewExecutionInput] = None,
+    accepted_finding_bridge: Optional[AcceptedFindingBridge] = None,
+) -> AdversarialValidationResult:
+    """Run strong-model adversarial validation on a green PR.
+
+    Treats the issue specification & acceptance criteria as the test oracle,
+    inspects the PR diff and changed tests, and attempts to falsify the implementation.
+
+    Fail-closed protections:
+    - If issue context cannot be retrieved (missing oracle), blocks merge (BLOCKED).
+    - If no strong backend is available, blocks merge (BLOCKED).
+    - If a dynamic check's exact execution revision cannot be proved, blocks merge.
+    - If dynamic check passes, re-queries reviewer with test execution result for final decision.
+
+    Args:
+        repo_name: Repository name ('owner/repo')
+        pr_data: Pull request metadata dictionary
+        config: AutomationConfig instance
+        github_client: Optional GitHubClient instance
+        backend_manager: Optional BackendManager (defaults to strong model manager)
+
+    Returns:
+        AdversarialValidationResult indicating validation outcome
+    """
+    pr_number = pr_data.get("number", 0)
+    head_sha = str((pr_data.get("head") or {}).get("sha") or pr_data.get("head_sha") or "")
+
+    def verify_execution_target(boundary: str) -> None:
+        if execution_cwd is None:
+            return
+        target = Path(execution_cwd)
+        verification = CommandExecutor.run_command(["git", "rev-parse", "HEAD"], cwd=str(target))
+        actual = verification.stdout.strip().lower()
+        if not target.is_dir() or not verification.success or not head_sha or actual != head_sha.lower():
+            detail = actual or verification.stderr.strip() or "unavailable"
+            raise RuntimeError(f"Adversarial validation execution target mismatch at {boundary}: expected {head_sha}, found {detail}")
+
+    verify_execution_target("context collection")
+    logger.info(f"Starting strong-model adversarial validation for PR #{pr_number}")
+    get_trace_logger().log("Adversarial Validation", f"Validating PR #{pr_number} against specification", item_type="pr", item_number=pr_number)
+
+    # 1. Build validation context
+    context = build_adversarial_validation_context(repo_name, pr_data, config, github_client)
+
+    # Oracle acquisition check: If no specification context exists, fail closed
+    if not context.issue_context or not context.issue_context.strip():
+        logger.warning(f"PR #{pr_number} has no linked issue specification / oracle. Blocking merge.")
+        return AdversarialValidationResult(
+            result="BLOCKED",
+            summary=f"Oracle acquisition failed for PR #{pr_number}: no linked issue specification found to falsify against",
+        )
+
+    if context.evidence_retrieval_error:
+        logger.warning(f"PR #{pr_number} evidence retrieval failed. Blocking merge: {context.evidence_retrieval_error}")
+        return AdversarialValidationResult(
+            result="BLOCKED",
+            summary=context.evidence_retrieval_error,
+            diagnostic_category="evidence_retrieval_failure",
+            diagnostic_reason=context.evidence_retrieval_error,
+        )
+
+    if context.requirement_manifest_error:
+        logger.warning(f"PR #{pr_number} has an invalid Issue requirement contract: {context.requirement_manifest_error}")
+        return AdversarialValidationResult(
+            result="BLOCKED",
+            summary=context.requirement_manifest_error,
+            diagnostic_category="invalid_requirement_contract",
+            diagnostic_reason=context.requirement_manifest_error,
+        )
+
+    if context.requires_human_review:
+        reason = "PR has more than 300 changed files; automated adversarial validation cannot authorize merge and human review is required"
+        logger.warning(f"PR #{pr_number} exceeds the raw-diff coverage limit. Blocking automatic merge.")
+        return AdversarialValidationResult(
+            result="BLOCKED",
+            summary=reason,
+            diagnostic_category="human_review_required",
+            diagnostic_reason=reason,
+        )
+
+    # Diff accessibility check: If PR diff could not be retrieved, fail closed
+    if not context.pr_diff or not context.pr_diff.strip():
+        logger.warning(f"PR #{pr_number} has no accessible diff. Blocking merge.")
+        return AdversarialValidationResult(
+            result="BLOCKED",
+            summary=f"Diff retrieval failed for PR #{pr_number}: no PR diff available for adversarial validation",
+        )
+
+    # 2. Select strong backend manager
+    if backend_manager is None:
+        from .cli_helpers import resolve_adversarial_validation_availability
+
+        # The established adversarial validator is the ordinary PR review
+        # path. Independent strong audits use pr_review_execution and the
+        # separately resolved ``strong_pr`` route.
+        availability = resolve_adversarial_validation_availability(validation_kind="pr")
+        backend_manager = availability.backend_manager
+
+        if backend_manager is None and availability.exhausted:
+            # Every otherwise-valid backend is confirmed quota/usage exhausted
+            # (REQ-001, REQ-003, REQ-004): this is a temporary, self-recovering
+            # non-result, not a configuration/capability failure, so it must not
+            # collapse into the generic fail-closed BLOCKED below.
+            logger.warning(f"Adversarial validation backends are quota/usage exhausted for PR #{pr_number}; deferring to automatic retry.")
+            return AdversarialValidationResult(
+                result="EXHAUSTED",
+                summary="Every otherwise-valid adversarial-validation backend is currently quota/usage exhausted; an automatic retry is deferred until capacity is expected to recover",
+                diagnostic_category="adversarial_validation_backend_exhausted",
+                retry_not_before_epoch=availability.retry_not_before_epoch,
+            )
+
+    if backend_manager is None:
+        logger.error("No strong adversarial validation backend configured or available. Blocking merge.")
+        return AdversarialValidationResult(
+            result="BLOCKED",
+            summary="No strong adversarial validation backend configured or available",
+        )
+
+    # 3. Render adversarial validation prompt with complete manifests and
+    # deterministic file-evidence coverage metadata.
+    changed_tests_str = _format_path_manifest(context.changed_tests, "(No test files detected in diff)")
+    changed_files_str = _format_path_manifest(context.all_changed_files, "(No changed files detected)")
+    requirement_entries = "\n".join(f"- {requirement.requirement_id}: {requirement.text}" for requirement in context.issue_requirements)
+    requirement_manifest = f"Manifest mode: {context.requirement_manifest_mode}\n{requirement_entries}" if requirement_entries else f"Manifest mode: {context.requirement_manifest_mode}\n(Requirement manifest extraction failed; PASS is forbidden.)"
+    if context.has_complete_file_coverage:
+        coverage_status = "COMPLETE: every changed file has complete patch evidence."
+    else:
+        coverage_prefix = "INCOMPLETE: PASS is forbidden. Partial/unavailable file evidence:\n"
+        coverage_status = coverage_prefix + _format_path_manifest(
+            context.unverified_files,
+            "(Unverified path metadata unavailable)",
+        )
+    registry = session_registry or ReviewerSessionRegistry()
+
+    def manager_identity() -> tuple[str, str, str]:
+        identity = backend_manager.get_current_backend_identity()
+        if not isinstance(identity, tuple) or len(identity) != 3:
+            return "", "", ""
+        return str(identity[0]), str(identity[1]), str(identity[2])
+
+    backend_name, backend_type, model_name = manager_identity()
+    stored_session = registry.get(repo_name, pr_number, backend_name, backend_type, model_name) if backend_name else None
+    # A local session can be resumed only while this manager still owns the
+    # exact private worktree in which the provider created it.
+    stored_session_retained_local = bool(stored_session is not None and backend_type.lower() not in CLOUD_BACKEND_TYPES and backend_manager.has_retained_local_session(stored_session.session_id))
+    can_continue_stored_session = backend_type.lower() in CLOUD_BACKEND_TYPES or stored_session_retained_local
+    if stored_session is not None:
+        _populate_test_oracle_gap_requirement_text(stored_session.test_oracle_gaps, context.issue_requirements)
+        persisted_resolved_paths = {entry.path for entry in _reusable_recovered_evidence(stored_session, context, head_sha)}
+        unresolved_paths = [path for path in context.unverified_files if path not in persisted_resolved_paths]
+        if not unresolved_paths:
+            coverage_status = "COMPLETE: every initially incomplete changed file has fresh or proven-equivalent recovered evidence for this validation snapshot."
+        elif persisted_resolved_paths:
+            coverage_prefix = "INCOMPLETE: PASS is forbidden. Partial/unavailable file evidence after equivalent-evidence reuse:\n"
+            coverage_status = coverage_prefix + _format_path_manifest(unresolved_paths, "(Unverified path metadata unavailable)")
+    lifecycle_session = stored_session if stored_session is not None and stored_session.last_head_sha else None
+    # Accepted Strong findings are known findings independently of reviewer-session
+    # identity, so they join the lifecycle snapshot before prompt assembly.
+    bridge = accepted_finding_bridge or default_accepted_finding_bridge(repo_name)
+    projection_target = ProjectionTarget(repository=repo_name, pr_number=pr_number, head_sha=head_sha, base_sha=str((pr_data.get("base") or {}).get("sha") or ""))
+    accepted_projection = project_accepted_findings(bridge, projection_target, claimed_review_threads)
+    try:
+        reference_snapshot = bridge.ledger.get_snapshot(projection_target.api_origin, repo_name, pr_number, require_retained_state=True)
+        context.correction_reference_context = build_correction_reference_context(
+            reference_snapshot,
+            head_sha,
+            projection_target.base_sha,
+            context.validation_snapshot,
+            context.requirement_manifest_identity,
+        )
+    except Exception as exc:
+        # An unavailable source supplies no references; an asserted reference
+        # will fail closed instead of becoming a new observation label. Retain
+        # the invocation binding even before the first ordinary owner exists.
+        logger.warning(f"Canonical correction context unavailable for PR #{pr_number}: {exc}")
+        context.correction_reference_context = CanonicalCorrectionContext(
+            api_origin=projection_target.api_origin,
+            repository=repo_name,
+            pr_number=pr_number,
+            head_sha=head_sha,
+            base_sha=projection_target.base_sha,
+            validation_snapshot=context.validation_snapshot,
+            requirement_manifest_identity=context.requirement_manifest_identity,
+        )
+    accepted_known_gaps = [known_gap_from_record(record) for record in accepted_projection.known_gap_records]
+    accepted_gap_ids = frozenset(gap.gap_id for gap in accepted_known_gaps)
+    context.accepted_known_gap_ids = accepted_gap_ids
+    lifecycle_session = _lifecycle_session_with_accepted_gaps(lifecycle_session, stored_session, accepted_known_gaps, repo_name, pr_number, accepted_projection.records[0].originating_head_sha if accepted_projection.records else "")
+    if lifecycle_session is not None:
+        # A previous invocation's reference proves retained identity, not a new
+        # current observation. The ledger supplies fresh references separately.
+        lifecycle_session = replace(lifecycle_session, test_oracle_gaps=[replace(gap, correction_identity="", correction_scope_fingerprint="", correction_context_fingerprint="") for gap in lifecycle_session.test_oracle_gaps])
+    # The accepted review lifecycle selects review policy. Provider-session
+    # resumability only selects the transport used below; a fresh invocation
+    # must still adjudicate the same recorded obligations incrementally.
+    if lifecycle_session is not None:
+        review_policy = render_prompt(
+            "pr.adversarial_validation_rereview",
+            previous_head_sha=lifecycle_session.last_head_sha,
+            current_head_sha=head_sha,
+        )
+    else:
+        review_policy = render_prompt("pr.adversarial_validation_initial_review")
+
+    prior_test_oracle_gaps = "(No material test-oracle gaps have been recorded for this PR.)"
+    if lifecycle_session and lifecycle_session.test_oracle_gaps:
+        prior_test_oracle_gaps = json.dumps(
+            [gap.__dict__ for gap in lifecycle_session.test_oracle_gaps],
+            indent=2,
+            sort_keys=True,
+        )
+
+    closure_extension = _closure_prompt_extension(closure_input, context.issue_requirements)
+    prompt = render_prompt(
+        "pr.adversarial_validation",
+        review_policy=review_policy,
+        repo_name=repo_name,
+        pr_number=pr_number,
+        pr_title=context.pr_title,
+        pr_body=context.pr_body[: config.MAX_PROMPT_SIZE * 2],
+        pr_diff=context.pr_diff,
+        linked_issues_context=context.issue_context,
+        changed_tests=changed_tests_str,
+        changed_files=changed_files_str,
+        coverage_status=coverage_status,
+        requirement_manifest=requirement_manifest,
+        claimed_review_threads=claimed_review_threads_section or "(No claimed-addressed review threads for this run.)",
+        ordinary_requirement_ids=json.dumps([requirement.requirement_id for requirement in context.issue_requirements]),
+        prior_test_oracle_gaps=prior_test_oracle_gaps,
+        accepted_strong_findings=render_accepted_findings(accepted_projection),
+        correction_references=json.dumps({"context_fingerprint": context.correction_reference_context.fingerprint, **asdict(context.correction_reference_context)}, indent=2) if context.correction_reference_context is not None else "null",
+        ci_execution_evidence=format_ci_execution_evidence(ci_status),
+        adjacent_exploration_budget=ADVERSARIAL_ADJACENT_EXPLORATION_BUDGET,
+        evidence_recovery_budget=ADVERSARIAL_EVIDENCE_RECOVERY_BUDGET,
+        closure_extension=closure_extension,
+    )
+    validation_evidence.observe_prompt("initial", prompt, _manifest_input(context), context.pr_body[: config.MAX_PROMPT_SIZE * 2])
+
+    # 4. Invoke the strong model
+    with ProgressStage("Adversarial validation"):
+        verify_execution_target("LLM invocation")
+        if stored_session and stored_session.session_id and can_continue_stored_session:
+            response = _continue_reviewer_session(
+                backend_manager,
+                stored_session.session_id,
+                prompt,
+                retained_local=stored_session_retained_local,
+            )
+            was_resumed = getattr(backend_manager, "_last_continue_session_resumed", False)
+        else:
+            response = run_llm_prompt(prompt, backend_manager=backend_manager, is_noedit=True)
+            was_resumed = False
+    verify_execution_target("LLM completion")
+
+    used_backend, used_type, used_model = manager_identity()
+    provider_session_id = getattr(backend_manager, "_last_session_id", None)
+    # Conversational continuity and the accepted review lifecycle are separate
+    # authorities.  A continuation fallback must not reuse execution evidence
+    # from the old provider session, but it still adjudicates the lifecycle
+    # snapshot selected before this invocation.
+    effective_stored_session = stored_session if was_resumed else None
+    effective_lifecycle_session = lifecycle_session
+
+    # 5. Parse response
+    canonical_recorded_gaps = effective_lifecycle_session.test_oracle_gaps if effective_lifecycle_session else ()
+    reviewer_provenance = "/".join(part for part in (used_backend, used_type, used_model) if part) or "unavailable"
+    result = _parse_reviewer_response("initial", response, canonical_recorded_gaps, closure_input, reviewer_provenance)
+    current_gap_decision_ids = frozenset(gap.gap_id for gap in result.test_oracle_gaps)
+    _log_contextual_parse_diagnostics(result, response, backend_manager, pr_number, "initial")
+    result = _reconcile_reusable_recovered_evidence(result, effective_stored_session, context, head_sha)
+    context.accepted_upheld_gap_ids = accepted_gap_ids & _upheld_test_oracle_gap_ids(result, claimed_review_threads, canonical_recorded_gaps, accepted_projection)
+    result = _reconcile_test_oracle_gap_lifecycle(
+        result,
+        effective_lifecycle_session,
+        head_sha,
+        _addressed_test_oracle_gap_evidence(
+            result,
+            claimed_review_threads,
+            effective_lifecycle_session.test_oracle_gaps if effective_lifecycle_session else (),
+        ),
+        accepted_gap_ids,
+    )
+    result = _complete_changed_file_evidence(
+        result,
+        context,
+        backend_manager,
+        requirement_manifest,
+        head_sha,
+        result.test_oracle_gaps,
+        closure_input,
+        reviewer_provenance,
+    )
+    result = _apply_coverage_and_verdict_precedence(result, context)
+    current_run_recovered_evidence = [replace(entry, requirement_ids=list(entry.requirement_ids)) for entry in result.evidence_recovery if entry.status in {"RECOVERED", "IRRELEVANT"} and (entry.path in context.unverified_files or entry.provenance == "REUSED_EQUIVALENT")]
+
+    initial_thread_dispositions = result.thread_dispositions
+
+    # 6. Dynamic validation on suspicion (if requested)
+    if result.dynamic_check_requested and result.dynamic_check_requested.strip() and not result.needs_fix and not result.needs_tests:
+        check_target = result.dynamic_check_requested.strip()
+        logger.info(f"Adversarial reviewer requested dynamic validation check: {check_target}")
+        # The initial reviewer round trip is an external-work boundary.  Never
+        # use the carried observation to suppress execution unless production
+        # can freshly prove it is still current.
+        if refresh_ci_status is not None:
+            ci_status = refresh_ci_status()
+        target_error = validate_dynamic_check_target(check_target, Path(execution_cwd).resolve()) if execution_cwd else None
+        correction_used = False
+        if target_error:
+            correction_used = True
+            correction_ci_status = ci_status
+            correction_ci_evidence = format_ci_execution_evidence(ci_status)
+            correction_prompt = (
+                render_prompt(
+                    "pr.adversarial_validation_target_correction",
+                    invalid_target=check_target,
+                    target_diagnostic=target_error,
+                    ci_evidence=correction_ci_evidence,
+                )
+                + closure_extension
+            )
+            correction_session_id = getattr(backend_manager, "_last_session_id", None)
+            if not isinstance(correction_session_id, str) or not correction_session_id:
+                result = AdversarialValidationResult(
+                    result="ERROR",
+                    summary="Reviewer target correction could not continue without an explicit session",
+                    diagnostic_category="dynamic_check_target_protocol_error",
+                    diagnostic_reason=target_error,
+                )
+            else:
+                validation_evidence.observe_prompt("target_correction", correction_prompt, None)
+                correction_response = _continue_reviewer_session(backend_manager, correction_session_id, correction_prompt)
+                if refresh_ci_status is not None:
+                    ci_status = refresh_ci_status()
+                result = _parse_reviewer_response("target_correction", correction_response, result.test_oracle_gaps, closure_input, reviewer_provenance)
+                current_gap_decision_ids = frozenset(gap.gap_id for gap in result.test_oracle_gaps)
+                _log_contextual_parse_diagnostics(result, correction_response, backend_manager, pr_number, "target_correction")
+                corrected_target = (result.dynamic_check_requested or "").strip()
+                repeated_error = validate_dynamic_check_target(corrected_target, Path(execution_cwd).resolve()) if corrected_target and execution_cwd else None
+                if repeated_error:
+                    result = AdversarialValidationResult(
+                        result="ERROR",
+                        summary="Reviewer repeated an invalid dynamic-check target after the bounded correction step",
+                        diagnostic_category="dynamic_check_target_protocol_error",
+                        diagnostic_reason=repeated_error,
+                    )
+                check_target = corrected_target
+                if result.result.strip().upper() == "PASS" and not _ci_decision_evidence_equivalent(correction_ci_status, ci_status):
+                    return AdversarialValidationResult(
+                        result="INCONCLUSIVE",
+                        summary="Current exact-head CI evidence is unavailable or changed after target correction",
+                        diagnostic_category="validator_evidence_unavailable",
+                        diagnostic_reason=format_ci_execution_evidence(ci_status),
+                    )
+        if (check_target == "all" and canonical_pr_tests_succeeded(ci_status)) or (check_target != "all" and focused_ci_target_succeeded(ci_status, check_target)):
+            logger.info("Reusing successful exact-head canonical PR Tests evidence instead of rerunning the suite")
+            result.dynamic_check_requested = None
+            result.summary = f"{result.summary} Reused successful exact-head {CANONICAL_PR_TESTS_WORKFLOW} evidence."
+        elif check_target and result.dynamic_check_requested:
+            try:
+                test_res = run_exact_head_dynamic_check(config, check_target, head_sha, execution_cwd) if execution_cwd else run_exact_head_dynamic_check(config, check_target, head_sha)
+                if test_res.target_selection_error:
+                    if correction_used:
+                        return AdversarialValidationResult(
+                            result="ERROR",
+                            summary="Reviewer repeated an unselectable dynamic-check target after the bounded correction step",
+                            diagnostic_category="dynamic_check_target_protocol_error",
+                            diagnostic_reason=test_res.target_selection_error,
+                        )
+                    correction_used = True
+                    if refresh_ci_status is not None:
+                        ci_status = refresh_ci_status()
+                    correction_ci_status = ci_status
+                    correction_ci_evidence = format_ci_execution_evidence(ci_status)
+                    correction_prompt = (
+                        render_prompt(
+                            "pr.adversarial_validation_target_correction",
+                            invalid_target=check_target,
+                            target_diagnostic=test_res.target_selection_error,
+                            ci_evidence=correction_ci_evidence,
+                        )
+                        + closure_extension
+                    )
+                    correction_session_id = getattr(backend_manager, "_last_session_id", None)
+                    if not isinstance(correction_session_id, str) or not correction_session_id:
+                        return AdversarialValidationResult(
+                            result="ERROR",
+                            summary="Reviewer target correction could not continue without an explicit session",
+                            diagnostic_category="dynamic_check_target_protocol_error",
+                            diagnostic_reason=test_res.target_selection_error,
+                        )
+                    validation_evidence.observe_prompt("target_selection_correction", correction_prompt, None)
+                    correction_response = _continue_reviewer_session(backend_manager, correction_session_id, correction_prompt)
+                    if refresh_ci_status is not None:
+                        ci_status = refresh_ci_status()
+                    result = _parse_reviewer_response("target_selection_correction", correction_response, result.test_oracle_gaps, closure_input, reviewer_provenance)
+                    current_gap_decision_ids = frozenset(gap.gap_id for gap in result.test_oracle_gaps)
+                    _log_contextual_parse_diagnostics(result, correction_response, backend_manager, pr_number, "target_selection_correction")
+                    corrected_target = (result.dynamic_check_requested or "").strip()
+                    if not corrected_target:
+                        if result.result.strip().upper() == "PASS" and not _ci_decision_evidence_equivalent(correction_ci_status, ci_status):
+                            return AdversarialValidationResult(
+                                result="INCONCLUSIVE",
+                                summary="Current exact-head CI evidence is unavailable or changed after target correction",
+                                diagnostic_category="validator_evidence_unavailable",
+                                diagnostic_reason=format_ci_execution_evidence(ci_status),
+                            )
+                        result.dynamic_check_requested = None
+                    repeated_error = validate_dynamic_check_target(corrected_target, Path(execution_cwd).resolve()) if execution_cwd else None
+                    if repeated_error:
+                        return AdversarialValidationResult(
+                            result="ERROR",
+                            summary="Reviewer repeated an invalid dynamic-check target after the bounded correction step",
+                            diagnostic_category="dynamic_check_target_protocol_error",
+                            diagnostic_reason=repeated_error,
+                        )
+                    check_target = corrected_target
+                    if (check_target == "all" and canonical_pr_tests_succeeded(ci_status)) or (check_target != "all" and focused_ci_target_succeeded(ci_status, check_target)):
+                        logger.info("Reusing refreshed exact-head CI evidence after dynamic-target correction")
+                        result.dynamic_check_requested = None
+                        result.summary = f"{result.summary} Reused successful exact-head {CANONICAL_PR_TESTS_WORKFLOW} evidence."
+                    if check_target and result.dynamic_check_requested:
+                        test_res = run_exact_head_dynamic_check(config, check_target, head_sha, execution_cwd) if execution_cwd else run_exact_head_dynamic_check(config, check_target, head_sha)
+                    if result.dynamic_check_requested and test_res.target_selection_error:
+                        return AdversarialValidationResult(
+                            result="ERROR",
+                            summary="Reviewer repeated an unselectable dynamic-check target after the bounded correction step",
+                            diagnostic_category="dynamic_check_target_protocol_error",
+                            diagnostic_reason=test_res.target_selection_error,
+                        )
+                if not result.dynamic_check_requested:
+                    pass
+                elif test_res.verification_error:
+                    known_mismatch = test_res.executed_sha is not None
+                    result.source_response_id = ""  # a controller-local verdict never borrows the earlier response
+                    result.result = "ERROR" if known_mismatch else "INCONCLUSIVE"
+                    result.summary = f"Dynamic validation evidence rejected: {test_res.verification_error}"
+                    result.diagnostic_category = "dynamic_check_head_mismatch" if known_mismatch else "dynamic_check_head_unverifiable"
+                    result.diagnostic_reason = test_res.verification_error
+                    result.thread_dispositions = []
+                    # The prior lifecycle remains authoritative: invalid execution
+                    # evidence cannot resolve, invalidate, or recreate any gap.
+                    if lifecycle_session is not None:
+                        result.test_oracle_gaps = [replace(gap) for gap in lifecycle_session.test_oracle_gaps]
+                    logger.error(result.summary) if known_mismatch else logger.warning(result.summary)
+                else:
+                    test_success = test_res.success
+                    test_output = (test_res.output + "\n" + test_res.errors).strip()
+
+                    # Preserve original counterexamples and findings in the follow-up
+                    original_findings_blocks = []
+                    for idx, f in enumerate(result.findings, start=1):
+                        original_findings_blocks.append(f"Finding {idx}:\n" f"- Violated Requirement: {f.violated_requirement}\n" f"- Suspected Counterexample: {f.counterexample}\n" f"- Test Gap: {f.test_gap}\n" f"- Suggested Regression Scenario: {f.suggested_regression_scenario}\n")
+                    original_findings_str = "\n".join(original_findings_blocks) if original_findings_blocks else "(No initial findings recorded)"
+
+                    logger.info(f"Dynamic check executed on {check_target} (success={test_success}); querying reviewer with raw test output for final decision")
+                    initial_thread_dispositions_str = "\n".join(f"- {d.thread_id}: {d.status} — {d.rationale}" for d in initial_thread_dispositions) if initial_thread_dispositions else "(No initial thread dispositions recorded)"
+                    followup_prompt = (
+                        render_prompt(
+                            "pr.adversarial_validation_followup",
+                            repo_name=repo_name,
+                            pr_number=pr_number,
+                            pr_title=context.pr_title,
+                            check_target=check_target,
+                            test_status="PASSED" if test_success else "FAILED",
+                            test_success="True" if test_success else "False",
+                            test_output=test_output[: config.MAX_PROMPT_SIZE * 2],
+                            original_summary=result.summary,
+                            original_findings=original_findings_str,
+                            prior_test_oracle_gaps=json.dumps([gap.__dict__ for gap in result.test_oracle_gaps], indent=2, sort_keys=True),
+                            linked_issues_context=context.issue_context,
+                            pr_diff=context.pr_diff,
+                            requirement_manifest=requirement_manifest,
+                            claimed_review_threads=claimed_review_threads_section or "(No claimed-addressed review threads for this run.)",
+                            initial_thread_dispositions=initial_thread_dispositions_str,
+                        )
+                        + closure_extension
+                    )
+                    validation_evidence.observe_prompt("dynamic_check_followup", followup_prompt, _manifest_input(context))
+                    with ProgressStage("Adversarial dynamic check follow-up"):
+                        followup_session_id = getattr(backend_manager, "_last_session_id", None)
+                        if isinstance(followup_session_id, str) and followup_session_id:
+                            followup_response = _continue_reviewer_session(backend_manager, followup_session_id, followup_prompt)
+                        else:
+                            # Never guess an implicit last session. A provider that did not
+                            # expose an ID cannot safely retain dynamic-check context.
+                            raise RuntimeError("Reviewer provider did not return an explicit session ID for dynamic follow-up")
+                    result = _parse_reviewer_response("dynamic_check_followup", followup_response, result.test_oracle_gaps, closure_input, reviewer_provenance)
+                    current_gap_decision_ids = frozenset(gap.gap_id for gap in result.test_oracle_gaps)
+                    _log_contextual_parse_diagnostics(result, followup_response, backend_manager, pr_number, "dynamic_check_followup")
+                    result = _reconcile_reusable_recovered_evidence(result, effective_stored_session, context, head_sha)
+                    result = _carry_forward_current_run_recovered_evidence(result, current_run_recovered_evidence)
+                    context.accepted_upheld_gap_ids = accepted_gap_ids & _upheld_test_oracle_gap_ids(result, claimed_review_threads, canonical_recorded_gaps, accepted_projection)
+                    result = _reconcile_test_oracle_gap_lifecycle(
+                        result,
+                        effective_lifecycle_session,
+                        head_sha,
+                        _addressed_test_oracle_gap_evidence(
+                            result,
+                            claimed_review_threads,
+                            effective_lifecycle_session.test_oracle_gaps if effective_lifecycle_session else (),
+                        ),
+                        accepted_gap_ids,
+                    )
+                result = _apply_coverage_and_verdict_precedence(result, context)
+                if initial_thread_dispositions and not result.thread_dispositions:
+                    # The follow-up prompt explicitly asks for a final disposition
+                    # per claimed thread grounded in the dynamic-check evidence.
+                    # Never resurrect the stale initial dispositions here: if the
+                    # follow-up omitted them, that thread must fail closed to
+                    # "no valid disposition" (stays unresolved) rather than reuse
+                    # evidence the dynamic check may have since contradicted.
+                    logger.warning(f"Dynamic-check follow-up for PR #{pr_number} returned no thread_dispositions; " f"{len(initial_thread_dispositions)} claimed thread(s) will not be resolved this run")
+            except Exception as e:
+                logger.warning(f"Failed to execute dynamic validation check '{check_target}': {e}")
+                # Inability to complete a requested check must be treated as non-pass (fail-closed)
+                result.source_response_id = ""  # no semantic answer produced this outcome
+                result.result = "BLOCKED"
+                result.summary = f"Dynamic validation check '{check_target}' could not be completed: {e}"
+                if initial_thread_dispositions:
+                    # Once dynamic re-adjudication starts, an initial disposition is
+                    # provisional: it was explicitly not trusted enough to skip the
+                    # dynamic check. If that check (or the follow-up call) fails
+                    # before a final disposition is obtained, the initial one must
+                    # not resolve any thread — clear it so every claimed thread
+                    # stays unresolved (REQ-006, REQ-008).
+                    logger.warning(f"Dynamic re-adjudication failed for PR #{pr_number}; discarding {len(initial_thread_dispositions)} initial thread disposition(s)")
+                    result.thread_dispositions = []
+
+    # A replacement response can omit a recorded lifecycle entry even though
+    # its Requirement coverage is otherwise complete. Give all such ordinary
+    # gaps one bounded, known-scope completion opportunity before finalizing.
+    completion_gap_ids = (
+        _ordinary_gap_completion_ids(
+            canonical_recorded_gaps,
+            result,
+            current_gap_decision_ids,
+            accepted_gap_ids,
+            head_sha,
+        )
+        if result.result not in {"ERROR", "EXHAUSTED"}
+        else ()
+    )
+    if completion_gap_ids:
+        completion_gaps = [gap for gap in canonical_recorded_gaps if gap.gap_id in completion_gap_ids]
+        completion_prompt = render_prompt(
+            "pr.adversarial_validation_gap_completion",
+            repo_name=repo_name,
+            pr_number=pr_number,
+            head_sha=head_sha,
+            base_sha=projection_target.base_sha,
+            validation_snapshot=context.validation_snapshot,
+            requirement_manifest=requirement_manifest,
+            completion_gap_ids=json.dumps(completion_gap_ids),
+            completion_gaps=json.dumps([gap.__dict__ for gap in completion_gaps], indent=2, sort_keys=True),
+            prior_adjudication=result.raw_response,
+            changed_tests=changed_tests_str,
+            changed_files=changed_files_str,
+            ci_execution_evidence=format_ci_execution_evidence(ci_status),
+        )
+        validation_evidence.observe_prompt("test_oracle_gap_completion", completion_prompt, _manifest_input(context))
+        try:
+            verify_execution_target("test-oracle gap completion")
+            completion_session_id = getattr(backend_manager, "_last_session_id", None)
+            completion_retained_local = bool(isinstance(completion_session_id, str) and completion_session_id and used_type.lower() not in CLOUD_BACKEND_TYPES and backend_manager.has_retained_local_session(completion_session_id))
+            can_continue_completion = isinstance(completion_session_id, str) and bool(completion_session_id) and (used_type.lower() in CLOUD_BACKEND_TYPES or completion_retained_local)
+            if can_continue_completion:
+                assert isinstance(completion_session_id, str)
+                completion_response = _continue_reviewer_session(
+                    backend_manager,
+                    completion_session_id,
+                    completion_prompt,
+                    retained_local=completion_retained_local,
+                )
+            else:
+                completion_response = run_llm_prompt(completion_prompt, backend_manager=backend_manager, is_noedit=True)
+            verify_execution_target("test-oracle gap completion response")
+            if not validation_snapshot_is_current(repo_name, pr_data, config, github_client, context.validation_snapshot):
+                raise RuntimeError("repository/PR/head/base/Requirements snapshot changed or could not be reconfirmed")
+            completion = _parse_reviewer_response(
+                "test_oracle_gap_completion",
+                completion_response,
+                canonical_recorded_gaps,
+                closure_input,
+                reviewer_provenance,
+            )
+            _log_contextual_parse_diagnostics(completion, completion_response, backend_manager, pr_number, "test_oracle_gap_completion")
+            returned_ids = frozenset(gap.gap_id for gap in completion.test_oracle_gaps)
+            omitted = sorted(set(completion_gap_ids) - returned_ids)
+            invalid_evidence = sorted(gap.gap_id for gap in completion.test_oracle_gaps if gap.gap_id in completion_gap_ids and not _valid_focused_terminal_gap_evidence(gap))
+            completion_parse_failed = completion.result == "ERROR"
+            completion_returned_ids = {gap.gap_id for gap in completion.test_oracle_gaps}
+            completion.test_oracle_gaps.extend(gap for gap in result.test_oracle_gaps if gap.gap_id not in completion_returned_ids and (gap.gap_id in current_gap_decision_ids or (gap.status in {"RESOLVED", "INVALID"} and gap.resolution_head_sha == head_sha)))
+            completion = _reconcile_test_oracle_gap_lifecycle(
+                completion,
+                effective_lifecycle_session,
+                head_sha,
+                _addressed_test_oracle_gap_evidence(
+                    completion,
+                    claimed_review_threads,
+                    canonical_recorded_gaps,
+                ),
+                accepted_gap_ids,
+            )
+            result = _merge_gap_completion(result, completion)
+            if completion_parse_failed or omitted or invalid_evidence:
+                result.result = "BLOCKED"
+                result.diagnostic_category = "test_oracle_gap_completion_failed"
+                if invalid_evidence:
+                    for gap in result.test_oracle_gaps:
+                        if gap.gap_id in invalid_evidence:
+                            gap.status = "OPEN"
+                            gap.resolution_evidence = ""
+                            gap.resolution_head_sha = ""
+                failures = omitted or invalid_evidence or list(completion_gap_ids)
+                result.diagnostic_reason = f"Current-head completion for {repo_name}#{pr_number} at {head_sha} did not provide qualifying evidence for: " f"{', '.join(failures)}"
+        except Exception as exc:
+            result.result = "BLOCKED"
+            result.diagnostic_category = "test_oracle_gap_completion_failed"
+            result.diagnostic_reason = f"Current-head completion for {repo_name}#{pr_number} at {head_sha} failed for " f"{', '.join(completion_gap_ids)}: {exc}"
+
+    # Recovery installation, reuse consumption, invalidation, and the final
+    # adjudication share one target snapshot. This check is intentionally after
+    # every external reviewer/dynamic-check boundary and immediately before the
+    # checkpoint is assembled.
+    recovery_ledger_active = any(entry.status in {"RECOVERED", "IRRELEVANT"} and entry.path in context.unverified_files for entry in result.evidence_recovery) or bool(effective_stored_session and effective_stored_session.recovered_file_evidence)
+    if recovery_ledger_active:
+        if github_client is None:
+            try:
+                refreshed = build_adversarial_validation_context(repo_name, pr_data, config, github_client, bypass_cache=True)
+                snapshot_current = bool(context.validation_snapshot) and refreshed.validation_snapshot == context.validation_snapshot
+            except Exception:
+                snapshot_current = False
+        else:
+            snapshot_current = validation_snapshot_is_current(repo_name, pr_data, config, github_client, context.validation_snapshot)
+        if not snapshot_current:
+            return AdversarialValidationResult(
+                result="ERROR",
+                summary="Changed-file evidence adjudication became stale and requires revalidation",
+                diagnostic_category="validation_snapshot_stale",
+                diagnostic_reason="PR head, base/change representation, or Issue Requirement manifest changed or could not be reconfirmed",
+            )
+
+    result = _apply_coverage_and_verdict_precedence(result, context)
+    result.accepted_finding_projection = project_accepted_findings(bridge, projection_target, claimed_review_threads, accepted_finding_dispositions(result, claimed_review_threads, accepted_projection, head_sha)) if accepted_projection.records else accepted_projection
+
+    if was_resumed:
+        persisted_session_id = provider_session_id if isinstance(provider_session_id, str) and provider_session_id else stored_session.session_id if stored_session else ""
+    else:
+        persisted_session_id = provider_session_id if isinstance(provider_session_id, str) and provider_session_id else ""
+    if used_backend and persisted_session_id:
+        incomplete_lifecycle_diagnostics = {"incomplete_evidence_coverage", "incomplete_requirement_coverage"}
+        lifecycle_completed = result.result in {"PASS", "NEEDS_FIX", "NEEDS_TESTS"} and result.diagnostic_category not in incomplete_lifecycle_diagnostics
+        # A proven exact-thread closure is authoritative for that gap even
+        # when an unrelated gate (for example change provenance) keeps the
+        # overall verdict inconclusive. Persist the semantic transition before
+        # the caller projects the disposition to GitHub.
+        prior_gaps_by_id = {gap.gap_id: gap for gap in effective_lifecycle_session.test_oracle_gaps} if effective_lifecycle_session else {}
+        has_proven_gap_closure = any(
+            prior_gaps_by_id.get(gap.gap_id) is not None
+            and _same_test_oracle_gap_scope(prior_gaps_by_id[gap.gap_id], gap)
+            and gap.status in {"RESOLVED", "INVALID"}
+            and bool(gap.resolution_evidence)
+            and gap.resolution_head_sha == head_sha
+            and (prior_gaps_by_id[gap.gap_id].status == "OPEN" or (prior_gaps_by_id[gap.gap_id].resolution_head_sha or (effective_lifecycle_session.last_head_sha if effective_lifecycle_session else "")) != head_sha)
+            for gap in result.test_oracle_gaps
+        )
+        persist_proven_closure = has_proven_gap_closure and result.result in {"PASS", "NEEDS_FIX", "NEEDS_TESTS", "INCONCLUSIVE", "BLOCKED"}
+        persisted_head_sha = head_sha if lifecycle_completed or persist_proven_closure else effective_lifecycle_session.last_head_sha if effective_lifecycle_session else ""
+        persisted_gaps = result.test_oracle_gaps if lifecycle_completed or persist_proven_closure else effective_lifecycle_session.test_oracle_gaps if effective_lifecycle_session else []
+        # Accepted-finding representations are re-derived from the owning stores on
+        # every read; persisting them in a reviewer session would fork their lifecycle.
+        persisted_gaps = [gap for gap in persisted_gaps if gap.gap_id not in accepted_gap_ids]
+        checkpoint = ReviewerSession(
+            repository=repo_name,
+            pr_number=pr_number,
+            backend_name=used_backend,
+            backend_type=used_type,
+            model_name=used_model,
+            session_id=persisted_session_id,
+            last_head_sha=persisted_head_sha,
+            test_oracle_gaps=persisted_gaps,
+            evidence_head_sha=head_sha,
+            evidence_validation_snapshot=context.validation_snapshot,
+            recovered_file_evidence=_build_recovery_ledger(result, effective_stored_session, context, head_sha),
+        )
+        result.reviewer_session_checkpoint = checkpoint
+        result.reviewer_session_registry = registry
+        if not defer_session_persistence:
+            registry.save(checkpoint)
+
+    discussion_digests = {thread.thread_id: thread.discussion_evidence_digest for thread in claimed_review_threads}
+    result.thread_dispositions = [
+        replace(
+            disposition,
+            discussion_evidence_digest=discussion_digests.get(disposition.thread_id, ""),
+        )
+        for disposition in result.thread_dispositions
+    ]
+
+    get_trace_logger().log(
+        "Adversarial Validation Result",
+        f"Validation for PR #{pr_number}: {result.result}",
+        item_type="pr",
+        item_number=pr_number,
+        details={"result": result.result, "findings_count": len(result.findings), "summary": result.summary},
+    )
+
+    return result

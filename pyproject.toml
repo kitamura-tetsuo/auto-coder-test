@@ -1,0 +1,263 @@
+[build-system]
+requires = ["setuptools>=84.2.1", "wheel"]
+build-backend = "auto_coder_build_backend"
+backend-path = ["build_backend"]
+
+[project]
+name = "auto-coder"
+dynamic = ["version"]
+description = "Automated application development using Gemini CLI and GitHub integration"
+readme = "README.md"
+license = {file = "LICENSE"}
+authors = [
+    {name = "Auto-Coder Team"}
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+requires-python = ">=3.12"
+dependencies = [
+    "requests>=2.31.0",
+    "pydantic>=2.0.0,<3.0.0",
+    "pydantic-settings>=2.15.0",
+    "click>=8.1.0",
+    "python-dotenv>=1.0.0",
+    "GitPython>=3.1.0",
+    "pyyaml>=6.0",
+    "loguru>=0.7.3",
+    "watchdog>=7.1.0",
+    "pathspec>=0.12.0",
+    "playwright>=1.64.1",
+    "mcp-server>=0.1.4",
+    "build>=1.6.1",
+    "pytest>=9.2.0",
+    "tomli-w>=1.0.0",
+    "google-auth>=2.62.1",
+    "httpx>=0.27.0",
+    "hishel[sqlite]>=1.4.0",
+    "ghapi>=1.0.0,<2.0.0",
+    # fastcore is a transitive dep of ghapi with no upper bound in ghapi's own
+    # metadata. fastcore>=2.0 removed L.starmap(), which ghapi<2.0's
+    # GhApi.__init__ still calls -- see gh_cache.py's get_ghapi_client() comment.
+    "fastcore>=1.14.5,<2.0.0",
+    "aider-chat>=0.1.0",
+    "rapidfuzz>=3.14.6",
+    "PyGithub>=2.0.0",
+    "PyJWT[crypto]>=2.8.0",
+    "PyNaCl>=1.5.0",
+    "fastapi>=0.128.0",
+    "uvicorn>=0.54.0",
+    "nicegui>=1.4.0",
+    "firebase-admin>=7.0.0",
+    "mcp==1.30.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=9.2.0",
+    "pytest-asyncio>=1.4.1.post1",
+    "pytest-cov>=7.1.0",
+    "pytest-mock>=3.17.0",
+    "pytest-timeout>=2.1.0",
+    "pytest-xdist>=3.0.0",
+    "pytest-split>=0.10.0",
+]
+dev = [
+    "black>=26.10.1",
+    "isort>=9.0.2",
+    "flake8>=6.0.0",
+    "mypy>=2.4.1",
+    "pre-commit>=4.7.0",
+    "pytest>=9.2.0",
+    "pytest-timeout>=2.1.0",
+    "types-toml>=0.10.8.20260518",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+# Entry points for CLI commands
+[project.scripts]
+auto-coder = "auto_coder.cli:main"
+
+# Include package data files
+[tool.setuptools.package-data]
+auto_coder = ["prompts.yaml", "*.yml", "*.yaml", "*.json", "management/static/*.html", "management/static/*.js"]
+
+[tool.setuptools.dynamic]
+version = {attr = "auto_coder_build_backend.get_build_version"}
+
+[tool.uv]
+cache-keys = [{ git = { commit = true } }, { file = "**/*.py" }, { file = "pyproject.toml" }]
+
+[tool.pyright]
+# Python version
+pythonVersion = "3.12"
+include = ["src"]
+
+# Basic checking
+strictParameterNoneValue = true
+reportGeneralTypeIssues = true
+reportOptionalSubscript = true
+reportOptionalMemberAccess = true
+reportOptionalCall = true
+reportOptionalIterable = true
+reportOptionalContextManager = true
+reportOptionalOperand = true
+
+# Report issues (設定して警告レベルに変更)
+reportUnknownParameterType = "warning"
+reportUnknownArgumentType = "warning"
+reportUnknownLambdaType = "warning"
+reportUnknownVariableType = "warning"
+reportUnknownMemberType = "warning"
+reportMissingTypeStubs = "warning"
+reportPossiblyUnboundVariable = "warning"
+
+# Import analysis
+reportImportCycles = "warning"
+reportUnusedImport = "warning"
+reportDuplicateImport = "warning"
+
+# Code quality
+reportUnusedVariable = "warning"
+reportPrivateUsage = "warning"
+reportConstantRedefinition = "warning"
+
+# Type annotations
+reportTypedDictNotRequiredAccess = "warning"
+reportPrivateImportUsage = "warning"
+
+# Advanced checking
+strictListInference = true
+strictDictionaryInference = true
+strictSetInference = true
+
+# Exclude specific files from checking if needed
+exclude = [
+    "**/.*",
+    "**/node_modules",
+    "**/__pycache__",
+    ".venv",
+    ".agent-tmp",
+    "tests/",
+    "build/",
+    "dist/",
+]
+
+[tool.black]
+line-length = 300
+target-version = ['py312']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+)/
+'''
+
+[tool.isort]
+profile = "black"
+line_length = 300
+multi_line_output = 3
+include_trailing_comma = true
+force_grid_wrap = 0
+use_parentheses = true
+ensure_newline_before_comments = true
+src_paths = ["src", "tests"]
+skip_glob = [
+    "*/mcp_servers/*",
+    "*/build/*",
+    "*/dist/*",
+]
+
+[tool.mypy]
+python_version = "3.12"
+namespace_packages = true
+# Enable explicit_package_bases to avoid module path conflicts
+explicit_package_bases = true
+# Specify the package root directory
+mypy_path = "src"
+# Disable strict mode temporarily to allow commit
+strict = false
+warn_return_any = false
+warn_unused_configs = false
+ignore_missing_imports = true
+disallow_untyped_defs = false
+disallow_any_generics = false
+disallow_incomplete_defs = false
+check_untyped_defs = false
+disallow_untyped_decorators = false
+no_implicit_optional = false
+# Use packages instead of files to avoid module path conflicts
+packages = ["auto_coder"]
+
+[[tool.mypy.overrides]]
+module = [
+    "gitpython.*",
+
+    "loguru.*",
+    "yaml.*",
+    "rich.*",
+    "dotenv.*",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+norecursedirs = [
+    ".*",
+    "build",
+    "dist",
+    "CVS",
+    "_darcs",
+    "{arch}",
+    "*.egg",
+    "venv",
+    "env",
+    "utils",
+]
+markers = [
+    "browser: test whose correctness oracle requires launching and driving a real browser (excluded from ordinary PR Tests shards; run by the dedicated Browser Tests GitHub Actions workflow)",
+    "opencode_live: test that drives the real (auto-installed) OpenCode CLI against a controlled local provider, each invocation costing several real seconds of CLI startup (excluded from ordinary PR Tests shards; run by the dedicated OpenCode Live Tests GitHub Actions workflow)",
+    "muse_live: test that drives the pinned released Muse host against a controlled local provider (excluded from ordinary shards; run by the dedicated Muse Live Tests workflow)",
+    "supervisor_integration: real Supervisor process and isolated Docker container integration tests (run by the dedicated Supervisor Integration Tests workflow)",
+    "pr_lifecycle_contract: maintained production-origin PR lifecycle contract group",
+    "pr_repair_contract: maintained production-origin PR repair execution contract group",
+    "issue_lifecycle_contract: maintained production-origin Issue lifecycle contract group",
+]
+
+[dependency-groups]
+dev = [
+    "black>=26.10.1",
+    "isort>=9.0.2",
+    "flake8>=6.0.0",
+    "types-pyyaml>=6.0.12.20261103",
+    "pre-commit>=4.7.0",
+    "pylint>=4.1.3",
+    "types-setuptools>=84.2.0.20261104",
+    "pyright>=1.1.414",
+    "types-python-dateutil>=2.9.0.20261104",
+    "mypy>=2.4.1",
+    "pytest>=9.2.0",
+    "pytest-timeout>=2.1.0",
+    "types-toml>=0.10.8.20260518",
+    "httpx>=0.28.1",
+]

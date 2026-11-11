@@ -1,0 +1,490 @@
+"""Durable, request-scoped ownership of explicit retry dispatch effects.
+
+The retry authorization store decides *whether* an operator request may own an
+implementation attempt.  This module starts at the next boundary: it makes the
+one external creation allowed by that owned attempt recoverable and
+idempotent.  In particular, an absent provider receipt is never treated as
+proof that a claimed creation did not happen.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import json
+import sqlite3
+import threading
+import time
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Mapping, Optional
+
+from .issue_stage_routing import ImplementationRetryRequest
+
+HANDOFF_COLUMNS = (
+    "repository,issue_number,request_id,attempt_id,generation,route,backend_name,"
+    "creation_id,outcome,route_config,numeric_attempt,external_id,external_url,"
+    "diagnostic,tracking_complete,predecessor_provider,predecessor_task_id,"
+    "predecessor_backend_name,projection_disposition,environment_id,handoff_complete"
+)
+
+
+class RetryDispatchConflict(RuntimeError):
+    """Raised when durable dispatch identity contradicts the requested use."""
+
+
+@dataclass(frozen=True)
+class RetryHandoff:
+    repository: str
+    issue_number: int
+    request_id: str
+    attempt_id: str
+    generation: str
+    route: str
+    backend_name: str
+    creation_id: str
+    outcome: str
+    route_config: str
+    numeric_attempt: Optional[int] = None
+    external_id: Optional[str] = None
+    external_url: Optional[str] = None
+    diagnostic: Optional[str] = None
+    tracking_complete: bool = False
+    predecessor_provider: Optional[str] = None
+    predecessor_task_id: Optional[str] = None
+    predecessor_backend_name: Optional[str] = None
+    projection_disposition: str = "pending"
+    environment_id: Optional[str] = None
+    # ``tracking_complete`` is the provider/pointer acknowledgement retained
+    # for compatibility with old receipts.  The controller sets this separate
+    # checkpoint only after logical-slot membership is durable as well.
+    handoff_complete: bool = False
+
+    @property
+    def suppresses_creation(self) -> bool:
+        return self.outcome in {"claimed", "accepted", "indeterminate", "completed"}
+
+
+class RetryDispatchRepository:
+    """SQLite journal for one creation effect per owned retry attempt."""
+
+    def __init__(self, repository: str, path: Optional[Path] = None) -> None:
+        if not repository:
+            raise ValueError("repository must be non-empty")
+        self.repository = repository
+        self.path = path or Path.home() / ".auto-coder" / repository / "retry_dispatch.db"
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        # WAL setup and schema migration need serialization of their own:
+        # SQLite's busy handler does not reliably wait when two fresh
+        # connections race to change journal mode.  The advisory lock is only
+        # for construction; normal claims continue to serialize in SQLite.
+        initialization_lock = self.path.with_suffix(f"{self.path.suffix}.init.lock")
+        with open(initialization_lock, "a+", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            self._connection = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
+            self._connection.execute("PRAGMA busy_timeout=30000")
+            self._connection.execute("PRAGMA journal_mode=WAL")
+            with self._connection:
+                self._connection.executescript("""
+                CREATE TABLE IF NOT EXISTS retry_handoffs (
+                    request_id TEXT PRIMARY KEY,
+                    repository TEXT NOT NULL,
+                    issue_number INTEGER NOT NULL,
+                    attempt_id TEXT NOT NULL UNIQUE,
+                    generation TEXT NOT NULL,
+                    route TEXT NOT NULL,
+                    backend_name TEXT NOT NULL,
+                    creation_id TEXT NOT NULL,
+                    outcome TEXT NOT NULL CHECK(outcome IN
+                        ('claimed','definitely-not-started','accepted','indeterminate','completed')),
+                    route_config TEXT NOT NULL,
+                    numeric_attempt INTEGER,
+                    external_id TEXT,
+                    external_url TEXT,
+                    diagnostic TEXT,
+                    tracking_complete INTEGER NOT NULL DEFAULT 0,
+                    updated_at REAL NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS retry_handoff_issue_attempt
+                    ON retry_handoffs(repository, issue_number, numeric_attempt)
+                    WHERE numeric_attempt IS NOT NULL;
+                """)
+                columns = {row[1] for row in self._connection.execute("PRAGMA table_info(retry_handoffs)")}
+                for name, declaration in (
+                    ("predecessor_provider", "TEXT"),
+                    ("predecessor_task_id", "TEXT"),
+                    ("predecessor_backend_name", "TEXT"),
+                    ("projection_disposition", "TEXT NOT NULL DEFAULT 'pending'"),
+                    ("environment_id", "TEXT"),
+                    ("handoff_complete", "INTEGER NOT NULL DEFAULT 0"),
+                ):
+                    if name not in columns:
+                        self._connection.execute(f"ALTER TABLE retry_handoffs ADD COLUMN {name} {declaration}")
+
+    def _coordination_lock(self):
+        lock_path = self.path.parent / "cloud.csv.lock"
+        lock_file = open(lock_path, "a+", encoding="utf-8")
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        except Exception:
+            lock_file.close()
+            raise
+        return lock_file
+
+    @staticmethod
+    def _validate_authority(authority: ImplementationRetryRequest, repository: str, issue_number: int) -> None:
+        if authority.status != "owned" or not authority.ownership_reference:
+            raise RetryDispatchConflict("retry authority has not acquired real implementation ownership")
+        if authority.repository != repository or authority.target_number != issue_number:
+            raise RetryDispatchConflict("retry authority does not match the dispatch target")
+        if not authority.request_id or not authority.attempt_id or not authority.generation:
+            raise RetryDispatchConflict("retry authority identity is incomplete")
+
+    @staticmethod
+    def _safe_config(config: Mapping[str, str]) -> str:
+        forbidden = ("token", "secret", "password", "credential", "authorization", "api_key")
+        clean: dict[str, str] = {}
+        for key, value in config.items():
+            if any(part in key.lower() for part in forbidden):
+                raise ValueError(f"route configuration must not persist credentials ({key})")
+            if not isinstance(key, str) or not isinstance(value, str):
+                raise TypeError("route configuration keys and values must be strings")
+            clean[key] = value
+        return json.dumps(clean, sort_keys=True, separators=(",", ":"))
+
+    def claim(
+        self,
+        authority: ImplementationRetryRequest,
+        route: str,
+        backend_name: str,
+        route_config: Mapping[str, str],
+        predecessor: Optional[tuple[str, str, str]] = None,
+    ) -> tuple[RetryHandoff, bool]:
+        """Claim the external creation before calling a process/provider.
+
+        ``claimed`` deliberately means indeterminate after a crash.  Only an
+        explicit ``definitely-not-started`` result permits the same R/A to
+        reacquire; it retains the original creation identity.
+        """
+        self._validate_authority(authority, self.repository, authority.target_number)
+        if not route or not backend_name:
+            raise ValueError("route and backend_name must be non-empty")
+        encoded = self._safe_config(route_config)
+        with self._lock, self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
+            existing = self._get_locked(authority.request_id)
+            if existing is not None:
+                expected_authority = (self.repository, authority.target_number, authority.attempt_id, authority.generation)
+                actual_authority = (existing.repository, existing.issue_number, existing.attempt_id, existing.generation)
+                if actual_authority != expected_authority:
+                    raise RetryDispatchConflict("retry handoff is already bound to different dispatch inputs")
+                if existing.outcome == "definitely-not-started":
+                    self._connection.execute(
+                        "UPDATE retry_handoffs SET route=?,backend_name=?,route_config=?,outcome='claimed',diagnostic=NULL,updated_at=? WHERE request_id=? AND outcome='definitely-not-started'",
+                        (route, backend_name, encoded, time.time(), authority.request_id),
+                    )
+                    refreshed = self._get_locked(authority.request_id)
+                    assert refreshed is not None
+                    return refreshed, True
+                if existing.outcome in {"accepted", "completed"}:
+                    # Replay follows the immutable accepted receipt and its
+                    # recorded route, not subsequently changed configuration.
+                    return existing, False
+                existing_config = json.loads(existing.route_config)
+                requested_config = json.loads(encoded)
+                config_matches = all(existing_config.get(key) == value for key, value in requested_config.items())
+                if (existing.route, existing.backend_name) != (route, backend_name) or not config_matches:
+                    raise RetryDispatchConflict("retry handoff is already bound to different dispatch inputs")
+                return existing, False
+            self._connection.execute(
+                "INSERT INTO retry_handoffs(repository,issue_number,request_id,attempt_id,generation,route,backend_name,creation_id,outcome,route_config,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (self.repository, authority.target_number, authority.request_id, authority.attempt_id, authority.generation, route, backend_name, uuid.uuid4().hex, "claimed", encoded, time.time()),
+            )
+            if predecessor is not None:
+                self._connection.execute(
+                    "UPDATE retry_handoffs SET predecessor_provider=?,predecessor_task_id=?,predecessor_backend_name=? WHERE request_id=?",
+                    (*predecessor, authority.request_id),
+                )
+            created = self._get_locked(authority.request_id)
+            assert created is not None
+            return created, True
+
+    def allocate_numeric_attempt(self, request_id: str, observed_attempts: list[int]) -> RetryHandoff:
+        """Bind a number once, strictly above all available authoritative evidence."""
+        if not observed_attempts or any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in observed_attempts):
+            raise ValueError("authoritative numeric attempt evidence is required")
+        with self._lock, self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
+            handoff = self._require_locked(request_id)
+            if handoff.numeric_attempt is not None:
+                return handoff
+            rows = self._connection.execute(
+                "SELECT numeric_attempt FROM retry_handoffs WHERE repository=? AND issue_number=? AND numeric_attempt IS NOT NULL",
+                (self.repository, handoff.issue_number),
+            ).fetchall()
+            retained = [int(row[0]) for row in rows]
+            allocated = max(observed_attempts + retained) + 1
+            self._connection.execute("UPDATE retry_handoffs SET numeric_attempt=?,updated_at=? WHERE request_id=?", (allocated, time.time(), request_id))
+            return self._require_locked(request_id)
+
+    def bind_route_config(self, request_id: str, route_config: Mapping[str, str]) -> RetryHandoff:
+        """Bind final pre-submission launch intent while a claim is unaccepted."""
+        encoded = self._safe_config(route_config)
+        with self._lock, self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
+            handoff = self._require_locked(request_id)
+            if handoff.outcome != "claimed":
+                if handoff.route_config != encoded:
+                    raise RetryDispatchConflict("accepted retry launch configuration is immutable")
+                return handoff
+            self._connection.execute("UPDATE retry_handoffs SET route_config=?,updated_at=? WHERE request_id=?", (encoded, time.time(), request_id))
+            return self._require_locked(request_id)
+
+    def record_outcome(
+        self,
+        request_id: str,
+        outcome: str,
+        *,
+        external_id: Optional[str] = None,
+        external_url: Optional[str] = None,
+        diagnostic: Optional[str] = None,
+        tracking_complete: bool = False,
+        environment_id: Optional[str] = None,
+    ) -> RetryHandoff:
+        if outcome not in {"definitely-not-started", "accepted", "indeterminate", "completed"}:
+            raise ValueError("invalid retry dispatch outcome")
+        if outcome in {"accepted", "completed"} and not external_id:
+            raise ValueError("accepted work requires an external identity")
+        coordination = self._coordination_lock() if outcome in {"accepted", "completed"} else None
+        try:
+            with self._lock, self._connection:
+                current = self._require_locked(request_id)
+                if current.outcome in {"accepted", "completed"}:
+                    if (current.external_id, current.external_url) != (external_id or current.external_id, external_url or current.external_url):
+                        raise RetryDispatchConflict("accepted retry receipt is immutable")
+                    if outcome == "definitely-not-started":
+                        raise RetryDispatchConflict("accepted work cannot become unsent")
+                self._connection.execute(
+                    "UPDATE retry_handoffs SET outcome=?,external_id=COALESCE(?,external_id),external_url=COALESCE(?,external_url),environment_id=COALESCE(?,environment_id),diagnostic=?,tracking_complete=?,updated_at=? WHERE request_id=?",
+                    (outcome, external_id, external_url, environment_id, diagnostic, int(tracking_complete), time.time(), request_id),
+                )
+                return self._require_locked(request_id)
+        finally:
+            if coordination is not None:
+                coordination.close()
+
+    def recover_accepted_receipt(
+        self,
+        authority: ImplementationRetryRequest,
+        *,
+        numeric_attempt: int,
+        backend_name: str,
+        task_id: str,
+        task_url: str,
+        environment_id: str,
+        base_branch: str,
+    ) -> RetryHandoff:
+        """Rebuild a lost receipt from an owned request and its accepted run.
+
+        This is deliberately an insert-only recovery boundary. The existing
+        ownership reference is reused as the creation identity; no request,
+        attempt, or provider creation authority is allocated here.
+        """
+        self._validate_authority(authority, self.repository, authority.target_number)
+        if numeric_attempt < 0 or not backend_name or not task_id:
+            raise ValueError("accepted CloudRun identity is incomplete")
+        encoded = self._safe_config({"base_branch": base_branch})
+        with self._lock, self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
+            existing = self._get_locked(authority.request_id)
+            if existing is not None:
+                return existing
+            self._connection.execute(
+                "INSERT INTO retry_handoffs("
+                "repository,issue_number,request_id,attempt_id,generation,route,backend_name,"
+                "creation_id,outcome,route_config,numeric_attempt,external_id,external_url,diagnostic,"
+                "tracking_complete,updated_at,predecessor_provider,predecessor_task_id,"
+                "predecessor_backend_name,projection_disposition,environment_id,handoff_complete) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?,0)",
+                (
+                    self.repository,
+                    authority.target_number,
+                    authority.request_id,
+                    authority.attempt_id,
+                    authority.generation,
+                    "codex-cloud",
+                    backend_name,
+                    authority.ownership_reference,
+                    "accepted",
+                    encoded,
+                    numeric_attempt,
+                    task_id,
+                    task_url or None,
+                    "accepted receipt recovered from matching durable CloudRun and owned request",
+                    time.time(),
+                    authority.predecessor_provider,
+                    authority.predecessor_task_id,
+                    authority.predecessor_backend_name,
+                    "accepted-tracking-incomplete",
+                    environment_id or None,
+                ),
+            )
+            return self._require_locked(authority.request_id)
+
+    def mark_tracking_complete(self, request_id: str) -> RetryHandoff:
+        with self._lock, self._connection:
+            current = self._require_locked(request_id)
+            if current.outcome not in {"accepted", "completed"} or not current.external_id:
+                raise RetryDispatchConflict("only accepted work can complete tracking")
+            self._connection.execute("UPDATE retry_handoffs SET tracking_complete=1,projection_disposition='accepted-current',updated_at=? WHERE request_id=?", (time.time(), request_id))
+            return self._require_locked(request_id)
+
+    def mark_handoff_complete(self, request_id: str) -> RetryHandoff:
+        """Acknowledge the joined run, pointer, and logical-slot projection."""
+        with self._lock, self._connection:
+            current = self._require_locked(request_id)
+            if current.outcome not in {"accepted", "completed"} or not current.external_id or not current.tracking_complete or current.projection_disposition != "accepted-current":
+                raise RetryDispatchConflict("provider tracking is not confirmed current")
+            self._connection.execute(
+                "UPDATE retry_handoffs SET handoff_complete=1,diagnostic=NULL,updated_at=? WHERE request_id=?",
+                (time.time(), request_id),
+            )
+            return self._require_locked(request_id)
+
+    def mark_historical(self, request_id: str, diagnostic: str) -> RetryHandoff:
+        """Retain an accepted receipt that no longer owns the current pointer."""
+        with self._lock, self._connection:
+            self._connection.execute(
+                "UPDATE retry_handoffs SET projection_disposition='accepted-historical',handoff_complete=1,diagnostic=?,updated_at=? WHERE request_id=?",
+                (diagnostic, time.time(), request_id),
+            )
+            return self._require_locked(request_id)
+
+    def mark_tracking_incomplete(self, request_id: str, diagnostic: str) -> RetryHandoff:
+        with self._lock, self._connection:
+            self._connection.execute(
+                "UPDATE retry_handoffs SET projection_disposition='accepted-tracking-incomplete',handoff_complete=0,diagnostic=?,updated_at=? WHERE request_id=?",
+                (diagnostic, time.time(), request_id),
+            )
+            return self._require_locked(request_id)
+
+    def mark_prior_accepted_historical(self, request_id: str) -> None:
+        """Classify every older accepted receipt superseded by this request."""
+        with self._lock, self._connection:
+            current = self._connection.execute(
+                "SELECT rowid,repository,issue_number FROM retry_handoffs WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+            if current is None:
+                raise ValueError(f"unknown retry handoff {request_id!r}")
+            row_id, repository, issue_number = current
+            self._connection.execute(
+                "UPDATE retry_handoffs SET projection_disposition='accepted-historical',diagnostic='a later accepted retry owns the current pointer',updated_at=? " "WHERE repository=? AND issue_number=? AND rowid<? AND outcome IN ('accepted','completed')",
+                (time.time(), repository, issue_number, row_id),
+            )
+
+    def get(self, request_id: str) -> Optional[RetryHandoff]:
+        with self._lock:
+            return self._get_locked(request_id)
+
+    def list_for_issue(self, issue_number: int) -> tuple[RetryHandoff, ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                f"SELECT {HANDOFF_COLUMNS} FROM retry_handoffs " "WHERE repository=? AND issue_number=? ORDER BY rowid",
+                (self.repository, issue_number),
+            ).fetchall()
+        return tuple(self._decode(row) for row in rows)
+
+    def list_unfinished_accepted(self) -> tuple[RetryHandoff, ...]:
+        """Return accepted Codex receipts whose joined bookkeeping is pending."""
+        with self._lock:
+            rows = self._connection.execute(
+                f"SELECT {HANDOFF_COLUMNS} FROM retry_handoffs " "WHERE repository=? AND route='codex-cloud' " "AND outcome IN ('accepted','completed') AND external_id IS NOT NULL " "AND handoff_complete=0 ORDER BY rowid",
+                (self.repository,),
+            ).fetchall()
+        return tuple(self._decode(row) for row in rows)
+
+    def is_latest_accepted(self, request_id: str) -> bool:
+        """Return whether this request may project the Issue's current pointer.
+
+        SQLite row identity records claim order independently of completion
+        time.  Once a later claimed request has an accepted receipt, an older
+        request remains history and cannot restore its task as current.
+        """
+        with self._lock:
+            current = self._connection.execute(
+                "SELECT rowid,repository,issue_number,outcome,external_id FROM retry_handoffs WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+            if current is None:
+                raise ValueError(f"unknown retry handoff {request_id!r}")
+            row_id, repository, issue_number, outcome, external_id = current
+            if outcome not in {"accepted", "completed"} or not external_id:
+                raise RetryDispatchConflict("only accepted work can update current tracking")
+            newer = self._connection.execute(
+                "SELECT 1 FROM retry_handoffs WHERE repository=? AND issue_number=? AND rowid>? AND outcome IN ('accepted','completed') AND external_id IS NOT NULL LIMIT 1",
+                (repository, issue_number, row_id),
+            ).fetchone()
+            return newer is None
+
+    def accepted_predecessors(self, request_id: str) -> tuple[tuple[str, str, str], ...]:
+        """Return older accepted tasks that may have won before this request."""
+        with self._lock:
+            current = self._connection.execute(
+                "SELECT rowid,repository,issue_number FROM retry_handoffs WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+            if current is None:
+                raise ValueError(f"unknown retry handoff {request_id!r}")
+            row_id, repository, issue_number = current
+            rows = self._connection.execute(
+                "SELECT route,external_id,backend_name FROM retry_handoffs WHERE repository=? AND issue_number=? AND rowid<? AND outcome IN ('accepted','completed') AND external_id IS NOT NULL ORDER BY rowid DESC",
+                (repository, issue_number, row_id),
+            ).fetchall()
+            return tuple((str(route), str(task_id), str(backend)) for route, task_id, backend in rows)
+
+    def _require_locked(self, request_id: str) -> RetryHandoff:
+        result = self._get_locked(request_id)
+        if result is None:
+            raise ValueError(f"unknown retry handoff {request_id!r}")
+        return result
+
+    def _get_locked(self, request_id: str) -> Optional[RetryHandoff]:
+        row = self._connection.execute(
+            f"SELECT {HANDOFF_COLUMNS} FROM retry_handoffs WHERE request_id=?",
+            (request_id,),
+        ).fetchone()
+        return self._decode(row) if row is not None else None
+
+    @staticmethod
+    def _decode(row: tuple[object, ...]) -> RetryHandoff:
+        issue_number = row[1]
+        numeric_attempt = row[10]
+        if isinstance(issue_number, bool) or not isinstance(issue_number, int):
+            raise ValueError("stored retry handoff Issue number is invalid")
+        if numeric_attempt is not None and (isinstance(numeric_attempt, bool) or not isinstance(numeric_attempt, int)):
+            raise ValueError("stored retry handoff numeric attempt is invalid")
+        return RetryHandoff(
+            repository=str(row[0]),
+            issue_number=issue_number,
+            request_id=str(row[2]),
+            attempt_id=str(row[3]),
+            generation=str(row[4]),
+            route=str(row[5]),
+            backend_name=str(row[6]),
+            creation_id=str(row[7]),
+            outcome=str(row[8]),
+            route_config=str(row[9]),
+            numeric_attempt=numeric_attempt,
+            external_id=str(row[11]) if row[11] is not None else None,
+            external_url=str(row[12]) if row[12] is not None else None,
+            diagnostic=str(row[13]) if row[13] is not None else None,
+            tracking_complete=bool(row[14]),
+            predecessor_provider=str(row[15]) if row[15] is not None else None,
+            predecessor_task_id=str(row[16]) if row[16] is not None else None,
+            predecessor_backend_name=str(row[17]) if row[17] is not None else None,
+            projection_disposition=str(row[18]),
+            environment_id=str(row[19]) if row[19] is not None else None,
+            handoff_complete=bool(row[20]),
+        )

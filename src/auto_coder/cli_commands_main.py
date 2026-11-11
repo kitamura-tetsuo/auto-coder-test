@@ -1,0 +1,1117 @@
+"""Main CLI commands (process_issues, create_feature_issues, fix_to_pass_tests)."""
+
+import json
+import os
+import re
+import signal
+import uuid
+from contextlib import nullcontext
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+import click
+
+from .automation_config import AutomationConfig
+from .automation_engine import AutomationEngine
+from .cli_commands_utils import get_github_token_or_fail, get_repo_or_detect
+from .cli_helpers import build_backend_manager_from_config, build_message_backend_manager, build_models_map, check_backend_prerequisites, check_github_sub_issue_or_setup, ensure_test_script_or_fail
+from .cli_ui import Spinner, create_terminal_link, print_completion_message, print_configuration_summary, sleep_with_countdown
+from .git_utils import extract_number_from_branch, get_current_branch
+from .health_monitor import get_health_monitor, start_health_monitoring
+from .llm_backend_config import TASK_ONLY_BACKEND_TYPES, get_llm_config, is_jules_mode_enabled, set_active_repo_name
+from .logger_config import get_logger, setup_logger
+from .pr_processing_evidence import SCHEMA_VERSION, begin_invocation_observation, observed_invocations, redacted_dict
+from .progress_footer import setup_progress_footer_logging
+from .security_utils import redact_data, redact_string
+from .util.gh_cache import GitHubClient
+from .utils import VERBOSE_ENV_FLAG
+
+logger = get_logger(__name__)
+
+
+def _synchronize_codex_auth_secret_unless_skipped(skip: bool) -> None:
+    """Keep isolated operator runs outside the optional secret publisher."""
+    if skip:
+        return
+    from .github_secrets import synchronize_codex_auth_secret
+
+    synchronize_codex_auth_secret()
+
+
+def _force_exit_after_second_sigint() -> None:
+    """Exit without asyncio's executor drain; this is the explicit unsafe path."""
+    os._exit(130)
+
+
+def _disable_uvicorn_signal_capture(server: Any) -> None:
+    """Leave SIGINT/SIGTERM exclusively owned by process-issues."""
+    # Uvicorn 0.29+ captures and replays signals in ``serve`` itself. Disabling
+    # only its removed legacy install_signal_handlers hook is insufficient.
+    setattr(server, "capture_signals", lambda: nullcontext())
+
+
+async def _run_process_issues_daemon(
+    automation_engine: AutomationEngine,
+    repo_name: str,
+    enable_webhook: bool,
+    host: str,
+    port: int,
+    log_level: str,
+    github_webhook_secret: Optional[str],
+    sentry_webhook_secret: Optional[str],
+) -> None:
+    """Run the production signal, webhook, and engine orchestration."""
+    import asyncio
+
+    from .worker_management_bridge import WorkerManagementBridge, configured_identity
+
+    loop = asyncio.get_running_loop()
+    bridge_identity = configured_identity(repo_name)
+    bridge = WorkerManagementBridge(bridge_identity, automation_engine) if bridge_identity is not None else None
+    bridge_watch_task: Optional[asyncio.Task[None]] = None
+    if bridge is not None:
+        await bridge.start()
+        automation_engine.graceful_terminal_observer = bridge.persist_graceful_terminal
+
+        async def watch_bridge() -> None:
+            assert bridge.task is not None
+            result = await asyncio.gather(bridge.task, return_exceptions=True)
+            if automation_engine.lifecycle.value == "running":
+                failure = result[0] if result else None
+                detail = type(failure).__name__ if isinstance(failure, BaseException) else "unexpected exit"
+                logger.error(f"Private worker management bridge stopped while the daemon was running: {detail}")
+                automation_engine.request_graceful_shutdown("private management bridge exit")
+
+        bridge_watch_task = asyncio.create_task(watch_bridge(), name="private-worker-management-bridge-watch")
+    signal_counts = {signal.SIGINT: 0, signal.SIGTERM: 0}
+
+    def handle_shutdown_signal(received: signal.Signals) -> None:
+        signal_counts[received] += 1
+        if received is signal.SIGINT and signal_counts[received] > 1:
+            automation_engine.request_force_stop("second SIGINT")
+            _force_exit_after_second_sigint()
+            return
+        automation_engine.request_graceful_shutdown(received.name)
+
+    installed_signals = []
+    for shutdown_signal in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(shutdown_signal, handle_shutdown_signal, shutdown_signal)
+            installed_signals.append(shutdown_signal)
+        except (NotImplementedError, RuntimeError):
+            logger.warning(f"Could not install asyncio handler for {shutdown_signal.name}")
+
+    try:
+        if enable_webhook:
+            import uvicorn
+
+            from .webhook_server import create_app
+
+            app = create_app(automation_engine, repo_name, github_webhook_secret, sentry_webhook_secret)
+            uvicorn_config = uvicorn.Config(app, host=host, port=port, log_level=log_level.lower())
+            server = uvicorn.Server(uvicorn_config)
+            _disable_uvicorn_signal_capture(server)
+            logger.info(f"Starting FastAPI server on {host}:{port}")
+            engine_task = asyncio.create_task(automation_engine.start_automation(repo_name), name="automation-engine")
+            server_task = asyncio.create_task(server.serve(), name="webhook-server")
+            done, _ = await asyncio.wait({engine_task, server_task}, return_when=asyncio.FIRST_COMPLETED)
+            if server_task in done and not engine_task.done():
+                automation_engine.request_graceful_shutdown("webhook server exit")
+            await engine_task
+            server.should_exit = True
+            await server_task
+        else:
+            await automation_engine.start_automation(repo_name)
+    finally:
+        if bridge is not None:
+            automation_engine.graceful_terminal_observer = None
+            await bridge.close()
+        if bridge_watch_task is not None:
+            await bridge_watch_task
+        for shutdown_signal in installed_signals:
+            loop.remove_signal_handler(shutdown_signal)
+
+
+@click.command()
+@click.option(
+    "--repo",
+    help="GitHub repository (owner/repo). If not specified, auto-detects from current Git repository.",
+)
+@click.option("--github-token", envvar="GITHUB_TOKEN", help="GitHub API token")
+@click.option(
+    "--disable-labels/--no-disable-labels",
+    default=False,
+    help="Disable GitHub label operations (@auto-coder label) - affects LabelManager context manager behavior",
+)
+@click.option(
+    "--skip-main-update/--no-skip-main-update",
+    default=True,
+    help="When PR checks fail, skip merging the PR base branch into the PR before attempting fixes (default: skip)",
+)
+@click.option(
+    "--ignore-dependabot-prs/--no-ignore-dependabot-prs",
+    default=False,
+    help="Skip non-ready dependency-bot PRs (Dependabot/Renovate/[bot]); still auto-merge when checks pass and PR is mergeable.",
+)
+@click.option(
+    "--auto-merge/--no-auto-merge",
+    default=True,
+    help="Enable auto-merge of PRs when checks pass and PR is mergeable (default: enabled)",
+)
+@click.option(
+    "--auto-merge-dependabot-prs/--no-auto-merge-dependabot-prs",
+    default=True,
+    help="Enable auto-merge of Dependabot PRs when checks pass and PR is mergeable (default: enabled)",
+)
+@click.option(
+    "--force-clean-before-checkout/--no-force-clean-before-checkout",
+    default=False,
+    help="Force clean workspace (git reset --hard + git clean -fd) before PR checkout (default: do not force clean)",
+)
+@click.option(
+    "--only",
+    "only_target",
+    help="Process only a specific issue/PR by URL or number (e.g., https://github.com/owner/repo/issues/123 or 123)",
+)
+@click.option(
+    "--retry",
+    is_flag=True,
+    help="Authorize one durable, request-scoped Issue implementation attempt; requires --only and --force and preserves existing safety gates.",
+)
+@click.option("--resume", is_flag=True, help="Continue the retained local Issue job and provider session; requires --only and cannot be combined with --retry.")
+@click.option(
+    "--log-level",
+    default="INFO",
+    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]),
+    help="Set logging level",
+)
+@click.option("--log-file", help="Log file path (optional)")
+@click.option("--verbose", is_flag=True, help="Enable verbose logging and detailed command traces")
+@click.option("--enable-webhook/--disable-webhook", default=True, help="Enable webhook server in normal mode (default: True)")
+@click.option("--host", default="0.0.0.0", help="Host to bind the server to")
+@click.option("--port", default=8000, type=int, help="Port to bind the server to")
+@click.option(
+    "--jules-mode/--no-jules-mode",
+    default=None,
+    help="Enable or disable Jules/Cloud mode for issue processing (default: on)",
+)
+@click.option("--github-webhook-secret", envvar="GITHUB_WEBHOOK_SECRET", help="GitHub Webhook Secret")
+@click.option("--sentry-webhook-secret", envvar="SENTRY_WEBHOOK_SECRET", help="Sentry Webhook Secret")
+@click.option("--result-file", type=click.Path(dir_okay=False, path_type=Path), help="Write the authoritative explicit-target outcome as JSON (operator automation only).")
+@click.option("--skip-codex-auth-secret-sync", is_flag=True, help="Skip optional Codex auth publication for isolated operator runs.")
+def process_issues(
+    repo: Optional[str],
+    github_token: Optional[str],
+    disable_labels: Optional[bool],
+    skip_main_update: bool,
+    ignore_dependabot_prs: bool,
+    auto_merge: bool,
+    auto_merge_dependabot_prs: bool,
+    force_clean_before_checkout: bool,
+    only_target: Optional[str],
+    log_level: str,
+    log_file: Optional[str],
+    verbose: bool,
+    enable_webhook: bool,
+    host: str,
+    port: int,
+    github_webhook_secret: Optional[str],
+    sentry_webhook_secret: Optional[str],
+    result_file: Optional[Path],
+    skip_codex_auth_secret_sync: bool,
+    retry: bool = False,
+    jules_mode: Optional[bool] = None,
+    resume: bool = False,
+) -> None:
+    """Process GitHub issues and PRs using AI CLI (codex or gemini)."""
+
+    parent_context = click.get_current_context().parent
+    operator_force = bool(parent_context and parent_context.params.get("force"))
+
+    if retry and not (only_target and operator_force):
+        raise click.UsageError("--retry requires --only and --force")
+    if resume and (not only_target or retry):
+        raise click.UsageError("--resume requires --only and cannot be combined with --retry")
+
+    # Get repository name (from parameter, auto-detect, or --only URL)
+    repo_name = get_repo_or_detect(repo, fallback_url=only_target)
+    from .deployment_channel import validate_repository_ownership
+
+    validate_repository_ownership(repo_name)
+    set_active_repo_name(repo_name)
+
+    config = get_llm_config(repo_name=repo_name)
+    if jules_mode is not None:
+        configured_cloud_mode = jules_mode
+    else:
+        configured_cloud_mode = is_jules_mode_enabled(repo_name=repo_name)
+
+    selected_backends = [name for group in config.get_ordinary_priority_groups() for name in group]
+    if not selected_backends and not resume:
+        raise click.ClickException("The ordinary backend candidate pool is empty")
+    primary_backend = selected_backends[0] if selected_backends else ""
+    models = build_models_map()
+    primary_model = models.get(primary_backend)
+
+    # Configure verbose flag and setup logger with specified options
+    if verbose:
+        os.environ[VERBOSE_ENV_FLAG] = "1"
+        effective_log_level = "DEBUG"
+    else:
+        os.environ.pop(VERBOSE_ENV_FLAG, None)
+        effective_log_level = log_level
+
+    setup_logger(log_level=effective_log_level, log_file=log_file)
+
+    # Setup progress footer logging (re-configures logger with footer sink)
+    setup_progress_footer_logging()
+
+    # Optional and deliberately failure-isolated: ordinary GitHub processing never
+    # receives or reuses the dedicated Actions Secrets credential.
+    _synchronize_codex_auth_secret_unless_skipped(skip_codex_auth_secret_sync)
+
+    # Record resource usage and crash diagnostics for this (long running) session
+    start_health_monitoring()
+
+    # Check prerequisites
+    github_token_final = get_github_token_or_fail(github_token)
+    # Startup validates only the candidate that can be attempted first. Later
+    # fallbacks validate their own prerequisites when selected, so an unused
+    # local executable or workspace does not block an earlier remote handoff.
+    if not resume:
+        check_backend_prerequisites([primary_backend])
+    if resume or config.resolve_backend_type(primary_backend) not in TASK_ONLY_BACKEND_TYPES:
+        ensure_test_script_or_fail()
+
+    backend_list_str = ", ".join(selected_backends)
+    logger.info(f"Processing repository: {repo_name}")
+    logger.info(f"Using backends: {backend_list_str} (default: {primary_backend})")
+    if primary_backend in ("antigravity", "qwen", "auggie", "claude"):
+        logger.info(f"Using model: {primary_model}")
+    logger.info(f"Disable labels: {disable_labels}")
+    logger.info(f"Log level: {effective_log_level}")
+    logger.info(f"Verbose logging: {verbose}")
+    logger.info(f"Ignore Dependabot PRs: {ignore_dependabot_prs}")
+    logger.info(f"Auto-merge: {auto_merge}")
+    logger.info(f"Auto-merge Dependabot PRs: {auto_merge_dependabot_prs}")
+    logger.info(f"Force clean before checkout: {force_clean_before_checkout}")
+    logger.info(f"Jules mode: {configured_cloud_mode}")
+
+    # Configure engine behavior flags
+    engine_config = AutomationConfig()
+    engine_config.repo_name = repo_name
+    engine_config.jules_mode = configured_cloud_mode
+
+    # Explicitly show base branch update policy for PR checks failure
+    policy_str = "SKIP (default)" if skip_main_update else "ENABLED (--no-skip-main-update)"
+    logger.info(f"Base branch update before fixes when PR checks fail: {policy_str}")
+
+    summary: Dict[str, Any] = {
+        "Repository": repo_name,
+        "Backends": f"{backend_list_str} (default: {primary_backend})",
+    }
+    if primary_backend in ("antigravity", "qwen", "auggie", "claude"):
+        summary["Model"] = primary_model
+    summary.update(
+        {
+            "Jules mode": configured_cloud_mode,
+            "Disable labels": disable_labels,
+            "Main update before fixes": policy_str,
+            "Ignore Dependabot PRs": ignore_dependabot_prs,
+            "Auto-merge": auto_merge,
+            "Auto-merge Dependabot PRs": auto_merge_dependabot_prs,
+            "Force clean before checkout": force_clean_before_checkout,
+            "Verbose logging": verbose,
+        }
+    )
+    print_configuration_summary("Processing Configuration", summary)
+
+    # Initialize clients
+    github_client = GitHubClient.get_instance(github_token_final, disable_labels=bool(disable_labels))
+
+    # The general and no-edit/message managers are synchronous prompt clients:
+    # they are never the ordinary per-issue dispatcher (that reads the full
+    # ordinary pool fresh from config and routes task-only remote candidates,
+    # such as Jules, straight to their own provider adapter). Building them
+    # from the full ordinary pool would try to construct a synchronous client
+    # for a task-only remote backend, and an all-remote ordinary policy would
+    # fail bootstrap entirely even though no synchronous manager is needed to
+    # reach ordinary dispatch. Scope each manager to its own synchronous
+    # candidates instead, and leave it uninitialized (rather than resurrecting
+    # an unlisted default) when that candidate list is empty.
+    #
+    # Building either manager also eagerly constructs its selected candidate's
+    # client, which can probe that candidate's own prerequisites (e.g. an
+    # OpenCode/local CLI executable). Neither manager is required to reach
+    # ordinary dispatch, so a construction failure here is isolated rather
+    # than aborting startup: an earlier remote candidate (e.g. Jules) that the
+    # ordinary policy would actually select must not be blocked merely
+    # because a later, unused local fallback's prerequisites are missing.
+    synchronous_backends = [] if resume else [name for name in selected_backends if config.resolve_backend_type(name) not in TASK_ONLY_BACKEND_TYPES]
+    manager = None
+
+    # Initialize LLM backend manager singleton
+    from .backend_manager import LLMBackendManager
+
+    if synchronous_backends:
+        try:
+            manager = build_backend_manager_from_config(
+                cli_models=models,
+                cli_backends=synchronous_backends,
+            )
+        except Exception as exc:
+            logger.warning(f"Could not initialize the general LLM manager from the ordinary pool's synchronous candidates {synchronous_backends}; leaving it uninitialized so this does not block ordinary dispatch: {exc}")
+            manager = None
+            LLMBackendManager.reset_singleton()
+        else:
+            # force_reinitialize=True so a singleton left over from an earlier
+            # repository/configuration in the same long-lived process is
+            # always rebound to the current effective configuration, rather
+            # than silently reused with stale repository/alias settings.
+            LLMBackendManager.get_llm_instance(
+                default_backend=manager._default_backend,
+                default_client=manager._clients[manager._default_backend],
+                factories=manager._factories,
+                order=manager._all_backends,
+                force_reinitialize=True,
+            )
+    else:
+        # No synchronous candidate in the current ordinary pool: clear any
+        # singleton bound to a previous repository/configuration instead of
+        # leaving it in place, so a later synchronous call cannot silently
+        # run against the wrong repository's manager.
+        LLMBackendManager.reset_singleton()
+        logger.info("Ordinary backend pool has no synchronous candidate; the general LLM manager stays uninitialized until a synchronous operation needs one.")
+
+    message_manager = None
+    if not resume and config.get_active_noedit_backends():
+        try:
+            message_manager = build_message_backend_manager(models=models)
+        except Exception as exc:
+            logger.warning(f"Could not initialize the message/no-edit LLM manager; leaving it uninitialized so this does not block ordinary dispatch: {exc}")
+            message_manager = None
+            LLMBackendManager.reset_noedit_singleton()
+        else:
+            message_backend_list = message_manager._all_backends[:]
+            message_primary_backend = message_manager._default_backend
+            message_backend_str = ", ".join(message_backend_list)
+            logger.info(f"Message backends: {message_backend_str} (default: {message_primary_backend})")
+    else:
+        LLMBackendManager.reset_noedit_singleton()
+        logger.info("No synchronous no-edit backend configured; message/no-edit manager stays uninitialized.")
+
+    engine_config.SKIP_MAIN_UPDATE_WHEN_CHECKS_FAIL = bool(skip_main_update)
+    engine_config.IGNORE_DEPENDABOT_PRS = bool(ignore_dependabot_prs)
+    engine_config.AUTO_MERGE = bool(auto_merge)
+    engine_config.AUTO_MERGE_DEPENDABOT_PRS = bool(auto_merge_dependabot_prs)
+    engine_config.DISABLE_LABELS = bool(disable_labels)
+    engine_config.FORCE_CLEAN_BEFORE_CHECKOUT = bool(force_clean_before_checkout)
+
+    automation_engine = AutomationEngine(
+        github_client,  # type: ignore[arg-type]
+        config=engine_config,
+    )
+
+    # Check if we should resume work on current branch
+    # (only if not on main branch and no --only target specified)
+    if not only_target:
+        current_branch = get_current_branch()
+        if current_branch and current_branch != engine_config.MAIN_BRANCH:
+            logger.info(f"Detected work in progress on branch '{current_branch}'")
+
+            # Search for an open PR with this head branch
+            target_type = None
+            target_data = None
+            number = None
+
+            # Try to find PR by head branch
+            try:
+                pr_data = github_client.find_pr_by_head_branch(repo_name, current_branch)
+                if pr_data:
+                    target_type = "pr"
+                    target_data = pr_data
+                    number = pr_data.get("number")
+                    logger.info(f"Found open PR #{number} for current branch")
+            except Exception as e:
+                logger.debug(f"No open PR found for branch '{current_branch}': {e}")
+
+            # If no PR found, try to extract number from branch name and look for issue
+            if not target_type:
+                number = extract_number_from_branch(current_branch)
+                if number:
+                    try:
+                        # gh_repo = github_client.get_repository(repo_name)
+                        # issue = gh_repo.get_issue(number)
+                        issue = github_client.get_issue(repo_name, number)
+                        issue_data = github_client.get_issue_details(issue)
+                        if issue_data and issue_data.get("state") == "open":
+                            target_type = "issue"
+                            target_data = issue_data
+                            logger.info(f"Found open issue #{number} for current branch")
+                    except Exception as e:
+                        logger.debug(f"No open issue found for #{number}: {e}")
+
+            # If we found an open PR or issue, process it
+            if target_type and target_data and number:
+                click.echo(f"Resuming work on {target_type} #{number} (branch: {current_branch})")
+                logger.info(f"Resuming work on {target_type} #{number}")
+
+                # Run single-item processing
+                _ = automation_engine.process_single(repo_name, target_type, number, jules_mode=configured_cloud_mode)
+                # Print brief summary to stdout
+                click.echo(f"Processed {target_type} #{number}")
+                # Close MCP session if present
+                try:
+                    if manager is not None:
+                        manager.close()
+                    if message_manager is not None:
+                        message_manager.close()
+                except Exception:
+                    pass
+                # After resuming and processing the current branch item,
+                # continue to the main loop to process other items.
+                pass
+            else:
+                logger.info(f"No open PR or issue found for branch '{current_branch}', proceeding with normal processing")
+
+    # If only_target is provided, parse and process a single item
+    if only_target:
+        begin_invocation_observation()
+        number = None
+        target_type = None
+        # If URL, extract number and type
+        m = re.search(r"/issues/(\d+)$", only_target)
+        if m:
+            target_type = "issue"
+            number = int(m.group(1))
+        else:
+            m = re.search(r"/pull/(\d+)$", only_target)
+            if m:
+                target_type = "pr"
+                number = int(m.group(1))
+        if number is None:
+            # Try plain number - auto-detect type (try PR first, then issue)
+            try:
+                number = int(only_target.strip())
+            except ValueError:
+                raise click.ClickException("--only must be a PR/Issue URL or a number")
+        # Run single-item processing with auto-detection if needed
+        result = {}
+        with Spinner(f"Processing {target_type if target_type else 'item'} #{number}...", show_timer=True) as spinner:
+            if target_type is None:
+                # Auto-detect the type; process_single reports failures in its result
+                # instead of raising, so the detection happens while building the candidate.
+                result = automation_engine.process_single(repo_name, "auto", number, jules_mode=configured_cloud_mode, explicit_only=True, force=operator_force, **({"retry": True} if retry else {}), **({"resume": True} if resume else {}))
+            else:
+                result = automation_engine.process_single(repo_name, target_type, number, jules_mode=configured_cloud_mode, explicit_only=True, force=operator_force, **({"retry": True} if retry else {}), **({"resume": True} if resume else {}))
+
+            diagnostics = list(result.get("errors") or [])
+            resolved_type = result.get("target_type")
+            outcome = result.get("target_outcome")
+            valid_outcomes = {"success", "deferred", "skipped", "blocked", "failed"}
+            unresolved_non_success = resolved_type is None and outcome in {"failed", "deferred"} and bool(diagnostics)
+            if resolved_type not in {"issue", "pr"} and not unresolved_non_success:
+                diagnostics.append(f"Explicit result did not provide an authoritative target type for #{number}")
+                outcome = "failed"
+            elif result.get("target_number") != number:
+                diagnostics.append(f"Explicit result target mismatch: requested #{number}, received #{result.get('target_number')}")
+                outcome = "failed"
+            elif outcome not in valid_outcomes:
+                diagnostics.append(f"Explicit result provided unsupported target outcome: {outcome!r}")
+                outcome = "failed"
+            elif outcome == "success" and diagnostics:
+                diagnostics.append("Explicit result claimed success while reporting processing errors")
+                outcome = "failed"
+            target_type = resolved_type if resolved_type in {"issue", "pr"} else (target_type or "item")
+            result["errors"] = diagnostics
+            result["target_outcome"] = outcome
+
+            # Create completion message with clickable link
+            target_display = f"{target_type} #{number}"
+            if number:
+                target_url = f"https://github.com/{repo_name}/{'issues' if target_type == 'issue' else 'pull'}/{number}"
+                target_display = create_terminal_link(target_display, target_url)
+
+            outcome_label = str(outcome).capitalize()
+            if outcome == "success":
+                spinner.step(f"Processed single {target_display}")
+            else:
+                spinner.step(f"{outcome_label} single {target_display}")
+
+        # Prepare summary for completion message
+        target_display = f"{target_type} #{number}"
+        if number:
+            target_url = f"https://github.com/{repo_name}/{'issues' if target_type == 'issue' else 'pull'}/{number}"
+            target_display = create_terminal_link(target_display, target_url)
+
+        status_by_outcome = {
+            "success": "Success",
+            "deferred": "Deferred",
+            "skipped": "Skipped",
+            "blocked": "Blocked",
+            "failed": "Failed",
+        }
+        final_outcome = result.get("target_outcome")
+        if result_file is not None:
+            result_file.parent.mkdir(parents=True, exist_ok=True)
+            result_file.write_text(
+                json.dumps(
+                    {
+                        "schema_version": SCHEMA_VERSION,
+                        "invocation_id": uuid.uuid4().hex,
+                        "repository": repo_name,
+                        "target_number": result.get("target_number"),
+                        "target_type": result.get("target_type"),
+                        "target_outcome": final_outcome,
+                        "target_reason": redact_string(str(result.get("target_reason") or "")),
+                        "target_actions": redact_data(list(result.get("target_actions") or [])),
+                        "configured_primary_backend": primary_backend,
+                        "execution_origin": "ordinary-explicit-process-issues",
+                        "repair": redacted_dict(result.get("repair_result")),
+                        "final_gate": redacted_dict(result.get("final_gate")),
+                        "editing_invocations": [redacted_dict(item) for item in observed_invocations()],
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+        completion_summary: Dict[str, Any] = {
+            "Repository": repo_name,
+            "Target": target_display,
+            "Status": status_by_outcome.get(final_outcome, "Failed") if isinstance(final_outcome, str) else "Failed",
+        }
+
+        if result.get("errors"):
+            completion_summary["Errors"] = result["errors"]
+
+        # Extract actions taken
+        actions = list(result.get("target_actions") or [])
+        # Check issues_processed
+        for issue_res in result.get("issues_processed", []):
+            if issue_res.get("actions_taken"):
+                actions.extend(issue_res["actions_taken"])
+        # Check prs_processed
+        for pr_res in result.get("prs_processed", []):
+            if pr_res.get("actions_taken"):
+                actions.extend(pr_res["actions_taken"])
+
+        if actions:
+            completion_summary["Actions Taken"] = list(dict.fromkeys(actions))
+        if result.get("target_reason"):
+            completion_summary["Reason"] = result["target_reason"]
+
+        print_completion_message("Processing Complete", completion_summary)
+
+        # Close MCP session if present
+        try:
+            if manager is not None:
+                manager.close()
+        except Exception:
+            pass
+        return
+
+    # Run automation
+    import asyncio
+
+    try:
+        asyncio.run(
+            _run_process_issues_daemon(
+                automation_engine,
+                repo_name,
+                enable_webhook,
+                host,
+                port,
+                log_level,
+                github_webhook_secret,
+                sentry_webhook_secret,
+            )
+        )
+        if automation_engine.lifecycle.value == "stopped":
+            logger.info("process-issues shutdown completed after graceful drain")
+            get_health_monitor().record_event("cli_exit", "gracefully drained", repo_name)
+        elif automation_engine.lifecycle.value == "forced":
+            logger.error("process-issues force-stopped before graceful drain completed")
+            get_health_monitor().record_event("cli_exit", "forced", repo_name)
+        else:
+            logger.warning("Automation returned without being interrupted; process-issues is exiting")
+            get_health_monitor().record_event("cli_exit", "asyncio.run returned", repo_name)
+    except KeyboardInterrupt:
+        logger.info("Stopped by user")
+        get_health_monitor().record_event("cli_exit", "KeyboardInterrupt", repo_name)
+    except BaseException as e:
+        logger.opt(exception=True).error(f"process-issues terminated by an unhandled error: {e}")
+        get_health_monitor().record_event("cli_exit", f"unhandled error: {type(e).__name__}: {e}", repo_name)
+        raise
+    finally:
+        get_health_monitor().stop(reason="cli_exit")
+
+    # Close MCP session if present
+    try:
+        if manager is not None:
+            manager.close()
+    except Exception:
+        pass
+
+
+@click.command()
+@click.option(
+    "--repo",
+    help="GitHub repository (owner/repo). If not specified, auto-detects from current Git repository.",
+)
+@click.option("--github-token", envvar="GITHUB_TOKEN", help="GitHub API token")
+@click.option(
+    "--disable-labels/--no-disable-labels",
+    default=False,
+    help="Disable GitHub label operations (@auto-coder label) - affects LabelManager context manager behavior",
+)
+@click.option(
+    "--log-level",
+    default="INFO",
+    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]),
+    help="Set logging level",
+)
+@click.option("--log-file", help="Log file path (optional)")
+@click.option("--verbose", is_flag=True, help="Enable verbose logging and detailed command traces")
+def create_feature_issues(
+    repo: Optional[str],
+    github_token: Optional[str],
+    disable_labels: Optional[bool],
+    log_level: str,
+    log_file: Optional[str],
+    verbose: bool,
+) -> None:
+    """Analyze repository and create feature enhancement issues."""
+
+    # Get repository name (from parameter or auto-detect)
+    repo_name = get_repo_or_detect(repo)
+    set_active_repo_name(repo_name)
+
+    config = get_llm_config(repo_name=repo_name)
+
+    active_backends = config.get_active_backends()
+    ordered_backends = [backend for backend in (config.backend_order or []) if backend in active_backends]
+    selected_backends = ordered_backends or [config.default_backend or "codex"]
+    primary_backend = selected_backends[0]
+    models = build_models_map()
+    primary_model = models.get(primary_backend)
+
+    # Configure verbose flag and setup logger with specified options
+    if verbose:
+        os.environ[VERBOSE_ENV_FLAG] = "1"
+        effective_log_level = "DEBUG"
+    else:
+        os.environ.pop(VERBOSE_ENV_FLAG, None)
+        effective_log_level = log_level
+
+    setup_logger(log_level=effective_log_level, log_file=log_file)
+
+    # Check prerequisites
+    github_token_final = get_github_token_or_fail(github_token)
+    check_backend_prerequisites(selected_backends)
+    check_github_sub_issue_or_setup()
+
+    backend_list_str = ", ".join(selected_backends)
+    logger.info(f"Analyzing repository for feature opportunities: {repo_name}")
+    logger.info(f"Using backends: {backend_list_str} (default: {primary_backend})")
+    if primary_backend in ("antigravity", "qwen", "auggie", "claude"):
+        logger.info(f"Using model: {primary_model}")
+    logger.info(f"Log level: {effective_log_level}")
+    logger.info(f"Verbose logging: {verbose}")
+    logger.info(f"Disable labels: {disable_labels}")
+
+    summary: Dict[str, Any] = {
+        "Repository": repo_name,
+        "Backends": f"{backend_list_str} (default: {primary_backend})",
+    }
+    if primary_backend in ("antigravity", "qwen", "auggie", "claude"):
+        summary["Model"] = primary_model
+    summary.update(
+        {
+            "Disable labels": disable_labels,
+            "Verbose logging": verbose,
+        }
+    )
+    print_configuration_summary("Feature Analysis Configuration", summary)
+
+    # Initialize clients
+    github_client = GitHubClient.get_instance(github_token_final, disable_labels=bool(disable_labels))
+    manager = build_backend_manager_from_config(
+        cli_models=models,
+        cli_backends=selected_backends,
+    )
+
+    # Initialize LLM backend manager singleton
+    from .backend_manager import LLMBackendManager
+
+    LLMBackendManager.get_llm_instance(
+        default_backend=manager._default_backend,
+        default_client=manager._clients[manager._default_backend],
+        factories=manager._factories,
+        order=manager._all_backends,
+    )
+
+    selected_backends = manager._all_backends[:]
+    primary_backend = manager._default_backend
+    if primary_backend in ("antigravity", "qwen", "auggie", "claude"):
+        client = manager._clients.get(primary_backend)
+        if client is not None:
+            primary_model = getattr(client, "model_name", None)
+
+    # Configure engine behavior flags
+    engine_config = AutomationConfig()
+    engine_config.repo_name = repo_name
+    engine_config.DISABLE_LABELS = bool(disable_labels)
+
+    automation_engine = AutomationEngine(github_client, config=engine_config)  # type: ignore[arg-type]
+
+    # Analyze and create feature issues
+    created_issues = []
+    with Spinner("Analyzing repository for features...", show_timer=True) as spinner:
+        created_issues = automation_engine.create_feature_issues(repo_name)
+        spinner.step(f"Created {len(created_issues)} feature issue(s)")
+
+    # Prepare summary
+    completion_summary: Dict[str, Any] = {"Repository": repo_name, "Issues Created": len(created_issues)}
+
+    if created_issues:
+        details = []
+        for issue in created_issues:
+            num = issue.get("number")
+            title = issue.get("title")
+            display_text = f"#{num}"
+            if num:
+                url = f"https://github.com/{repo_name}/issues/{num}"
+                display_text = create_terminal_link(display_text, url)
+            details.append(f"{display_text} - {title}")
+        completion_summary["Details"] = details
+
+    print_completion_message("Feature Analysis Complete", completion_summary)
+
+    # Close MCP session if present
+    try:
+        manager.close()
+    except Exception:
+        pass
+
+
+@click.command(name="fix-to-pass-tests")
+@click.option(
+    "--disable-labels/--no-disable-labels",
+    default=False,
+    help="Disable GitHub label operations (@auto-coder label) - affects LabelManager context manager behavior",
+)
+@click.option(
+    "--max-attempts",
+    type=int,
+    default=None,
+    help="Maximum fix attempts before giving up (defaults to engine config)",
+)
+@click.option(
+    "--log-level",
+    default="INFO",
+    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]),
+    help="Set logging level",
+)
+@click.option("--log-file", help="Log file path (optional)")
+@click.option("--verbose", is_flag=True, help="Enable verbose logging and detailed command traces")
+def fix_to_pass_tests_command(
+    disable_labels: Optional[bool],
+    max_attempts: Optional[int],
+    log_level: str,
+    log_file: Optional[str],
+    verbose: bool,
+) -> None:
+    """Run local tests and repeatedly request LLM fixes until tests pass.
+
+    If the LLM makes no edits in an iteration, error and stop.
+    """
+    repo_name = get_repo_or_detect(None)
+    set_active_repo_name(repo_name)
+
+    config = get_llm_config(repo_name=repo_name)
+
+    active_backends = config.get_active_backends()
+    ordered_backends = [backend for backend in (config.backend_order or []) if backend in active_backends]
+    selected_backends = ordered_backends or [config.default_backend or "codex"]
+    primary_backend = selected_backends[0]
+    models = build_models_map()
+    primary_model = models.get(primary_backend)
+
+    if verbose:
+        os.environ[VERBOSE_ENV_FLAG] = "1"
+        effective_log_level = "DEBUG"
+    else:
+        os.environ.pop(VERBOSE_ENV_FLAG, None)
+        effective_log_level = log_level
+
+    setup_logger(log_level=effective_log_level, log_file=log_file)
+
+    # Record resource usage and crash diagnostics: fix-to-pass-tests also runs
+    # for a long time and can be stopped by the same causes as process-issues
+    start_health_monitoring()
+
+    # Ensure required test script is present (fail early)
+    ensure_test_script_or_fail()
+
+    # Check backend CLI availability
+    check_backend_prerequisites(selected_backends)
+    check_github_sub_issue_or_setup()
+
+    backend_list_str = ", ".join(selected_backends)
+
+    summary: Dict[str, Any] = {
+        "Backends": f"{backend_list_str} (default: {primary_backend})",
+    }
+    if primary_backend in ("antigravity", "qwen", "auggie", "claude"):
+        summary["Model"] = primary_model
+    summary.update(
+        {
+            "Disable labels": disable_labels,
+            "Verbose logging": verbose,
+        }
+    )
+    print_configuration_summary("Fix Tests Configuration", summary)
+
+    # Initialize minimal clients (GitHub not used here, but engine expects a client)
+    try:
+        from .util.gh_cache import GitHubClient as _GH
+
+        github_client = _GH("", disable_labels=bool(disable_labels))
+    except Exception:
+        # Fallback to a minimal stand-in (never used)
+        class _Dummy:
+            token = ""
+
+        github_client = _Dummy()  # type: ignore
+
+    manager = build_backend_manager_from_config(
+        cli_models=models,
+        cli_backends=selected_backends,
+    )
+
+    # Initialize LLM backend manager singleton
+    from .backend_manager import LLMBackendManager
+
+    LLMBackendManager.get_llm_instance(
+        default_backend=manager._default_backend,
+        default_client=manager._clients[manager._default_backend],
+        factories=manager._factories,
+        order=manager._all_backends,
+    )
+
+    selected_backends = manager._all_backends[:]
+    primary_backend = manager._default_backend
+    if primary_backend in ("antigravity", "qwen", "auggie", "claude"):
+        client = manager._clients.get(primary_backend)
+        if client is not None:
+            primary_model = getattr(client, "model_name", None)
+
+    message_manager = build_message_backend_manager(models=models)
+    message_backend_list = message_manager._all_backends[:]
+    message_primary_backend = message_manager._default_backend
+    logger.info(f"Message backends: {', '.join(message_backend_list)} (default: {message_primary_backend})")
+    engine_config = AutomationConfig()
+    engine_config.repo_name = get_repo_or_detect(None)
+    engine = AutomationEngine(github_client, config=engine_config)  # type: ignore[arg-type]
+
+    try:
+        result = engine.fix_to_pass_tests(
+            llm_backend_manager=manager,
+            max_attempts=max_attempts,
+            message_backend_manager=message_manager,
+        )
+        if result.get("success"):
+            click.echo(f"✅ Tests passed in {result.get('attempts')} attempt(s)")
+        else:
+            click.echo("❌ Tests still failing after attempts")
+            raise click.ClickException("Tests did not pass within the attempt limit")
+    except RuntimeError as e:
+        # Specific error when LLM made no edits
+        raise click.ClickException(str(e))
+    finally:
+        # Close underlying sessions if present
+        try:
+            manager.close()
+            message_manager.close()
+        except Exception:
+            pass
+
+
+@click.command()
+@click.option(
+    "--repo",
+    help="GitHub repository (owner/repo). If not specified, auto-detects from current Git repository.",
+)
+@click.option("--github-token", envvar="GITHUB_TOKEN", help="GitHub API token")
+@click.option(
+    "--disable-labels/--no-disable-labels",
+    default=False,
+    help="Disable GitHub label operations (@auto-coder label) - affects LabelManager context manager behavior",
+)
+@click.option(
+    "--skip-main-update/--no-skip-main-update",
+    default=True,
+    help="When PR checks fail, skip merging the PR base branch into the PR before attempting fixes (default: skip)",
+)
+@click.option(
+    "--ignore-dependabot-prs/--no-ignore-dependabot-prs",
+    default=False,
+    help="Skip non-ready dependency-bot PRs (Dependabot/Renovate/[bot]); still auto-merge when checks pass and PR is mergeable.",
+)
+@click.option(
+    "--auto-merge/--no-auto-merge",
+    default=True,
+    help="Enable auto-merge of PRs when checks pass and PR is mergeable (default: enabled)",
+)
+@click.option(
+    "--auto-merge-dependabot-prs/--no-auto-merge-dependabot-prs",
+    default=True,
+    help="Enable auto-merge of Dependabot PRs when checks pass and PR is mergeable (default: enabled)",
+)
+@click.option(
+    "--force-clean-before-checkout/--no-force-clean-before-checkout",
+    default=False,
+    help="Force clean workspace (git reset --hard + git clean -fd) before PR checkout (default: do not force clean)",
+)
+@click.option(
+    "--log-level",
+    default="INFO",
+    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]),
+    help="Set logging level",
+)
+@click.option("--log-file", help="Log file path (optional)")
+@click.option("--verbose", is_flag=True, help="Enable verbose logging and detailed command traces")
+@click.option("--host", default="0.0.0.0", help="Host to bind the server to")
+@click.option("--port", default=8000, type=int, help="Port to bind the server to")
+@click.option(
+    "--jules-mode/--no-jules-mode",
+    default=None,
+    help="Enable or disable Jules/Cloud mode for issue processing (default: on)",
+)
+@click.option("--github-webhook-secret", envvar="GITHUB_WEBHOOK_SECRET", help="GitHub Webhook Secret")
+@click.option("--sentry-webhook-secret", envvar="SENTRY_WEBHOOK_SECRET", help="Sentry Webhook Secret")
+def serve(
+    repo: Optional[str],
+    github_token: Optional[str],
+    disable_labels: Optional[bool],
+    skip_main_update: bool,
+    ignore_dependabot_prs: bool,
+    auto_merge: bool,
+    auto_merge_dependabot_prs: bool,
+    force_clean_before_checkout: bool,
+    log_level: str,
+    log_file: Optional[str],
+    verbose: bool,
+    host: str,
+    port: int,
+    github_webhook_secret: Optional[str],
+    sentry_webhook_secret: Optional[str],
+    jules_mode: Optional[bool] = None,
+) -> None:
+    """Run Auto-Coder in daemon mode with FastAPI server."""
+
+    # Get repository name (from parameter or auto-detect)
+    repo_name = get_repo_or_detect(repo)
+    set_active_repo_name(repo_name)
+
+    config = get_llm_config(repo_name=repo_name)
+
+    active_backends = config.get_active_backends()
+    ordered_backends = [backend for backend in (config.backend_order or []) if backend in active_backends]
+    selected_backends = ordered_backends or [config.default_backend or "codex"]
+    primary_backend = selected_backends[0]
+    models = build_models_map()
+    primary_model = models.get(primary_backend)
+
+    # Configure verbose flag and setup logger with specified options
+    if verbose:
+        os.environ[VERBOSE_ENV_FLAG] = "1"
+        effective_log_level = "DEBUG"
+    else:
+        os.environ.pop(VERBOSE_ENV_FLAG, None)
+        effective_log_level = log_level
+
+    setup_logger(log_level=effective_log_level, log_file=log_file)
+    setup_progress_footer_logging()
+
+    # Record resource usage and crash diagnostics for this (long running) daemon
+    start_health_monitoring()
+
+    # Check prerequisites
+    github_token_final = get_github_token_or_fail(github_token)
+    check_backend_prerequisites(selected_backends)
+
+    # Ensure required test script is present (fail early)
+    ensure_test_script_or_fail()
+
+    backend_list_str = ", ".join(selected_backends)
+    logger.info(f"Starting Auto-Coder Daemon for repository: {repo_name}")
+    logger.info(f"Using backends: {backend_list_str} (default: {primary_backend})")
+
+    # Initialize clients
+    github_client = GitHubClient.get_instance(github_token_final, disable_labels=bool(disable_labels))
+    manager = build_backend_manager_from_config(
+        cli_models=models,
+        cli_backends=selected_backends,
+    )
+
+    # Initialize LLM backend manager singleton
+    from .backend_manager import LLMBackendManager
+
+    LLMBackendManager.get_llm_instance(
+        default_backend=manager._default_backend,
+        default_client=manager._clients[manager._default_backend],
+        factories=manager._factories,
+        order=manager._all_backends,
+    )
+
+    selected_backends = manager._all_backends[:]
+    message_manager = build_message_backend_manager(models=models)
+
+    if jules_mode is not None:
+        configured_cloud_mode = jules_mode
+    else:
+        configured_cloud_mode = is_jules_mode_enabled(repo_name=repo_name)
+
+    # Configure engine behavior flags
+    engine_config = AutomationConfig()
+    engine_config.SKIP_MAIN_UPDATE_WHEN_CHECKS_FAIL = bool(skip_main_update)
+    engine_config.IGNORE_DEPENDABOT_PRS = bool(ignore_dependabot_prs)
+    engine_config.AUTO_MERGE = bool(auto_merge)
+    engine_config.AUTO_MERGE_DEPENDABOT_PRS = bool(auto_merge_dependabot_prs)
+    engine_config.DISABLE_LABELS = bool(disable_labels)
+    engine_config.FORCE_CLEAN_BEFORE_CHECKOUT = bool(force_clean_before_checkout)
+    engine_config.jules_mode = configured_cloud_mode
+
+    automation_engine = AutomationEngine(
+        github_client,  # type: ignore[arg-type]
+        config=engine_config,
+    )
+
+    # Import here to avoid circular dependencies
+    import asyncio
+
+    import uvicorn
+
+    from .webhook_server import create_app
+
+    app = create_app(automation_engine, repo_name, github_webhook_secret, sentry_webhook_secret)
+    uvicorn_config = uvicorn.Config(app, host=host, port=port, log_level=log_level.lower())
+    server = uvicorn.Server(uvicorn_config)
+
+    async def run_all():
+        logger.info(f"Starting FastAPI server on {host}:{port}")
+        await asyncio.gather(automation_engine.start_automation(repo_name), server.serve())
+
+    try:
+        asyncio.run(run_all())
+    except KeyboardInterrupt:
+        logger.info("Stopped by user")
+    finally:
+        # Close MCP session if present
+        try:
+            manager.close()
+            message_manager.close()
+        except Exception:
+            pass

@@ -1,0 +1,10075 @@
+"""
+Main automation engine for Auto-Coder.
+"""
+
+import asyncio
+import dataclasses
+import hashlib
+import inspect
+import json
+import os
+import sqlite3
+import threading
+import time
+import uuid
+from contextlib import nullcontext
+from datetime import datetime, timedelta, timezone
+from enum import Enum
+from functools import partial
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Sequence, Union, cast
+
+import httpx
+
+from . import fix_to_pass_tests_runner as fix_to_pass_tests_runner_module
+from .adversarial_validation_scheduler import AdversarialValidationScheduler
+from .automation_config import AutomationConfig, Candidate, CandidateProcessingResult, ExplicitTargetOutcome, ProcessResult, PRProcessingOutcome
+from .backend_manager import LLMBackendManager, get_llm_backend_manager, run_llm_prompt
+from .candidate_queue import CandidateQueue
+from .claude_followup_waits import get_claude_followup_wait_store
+from .codex_retry_reconciliation import CodexRetryReconciler
+from .decomposition_analyzer import DecompositionIssue
+from .decomposition_validation_lifecycle import (
+    DECOMPOSITION_PUBLICATION_STAGE,
+    DecompositionDecision,
+    DecompositionValidationLifecycle,
+)
+from .dependency_observation_cache import DEPENDENCY_OBSERVATION_TTL, DependencyObservationCache
+from .deployment_channel import repository_dispatch_authority
+from .entity_invalidation import (
+    ClaimedInvalidation,
+    CompletionOutcome,
+    CompletionTransition,
+    DurableInvalidationQueue,
+    EntityIdentity,
+    InvalidationDisposition,
+    InvalidationTransition,
+    ReevaluationOperationConflict,
+    ReevaluationReceipt,
+    issue_stabilization_deadline,
+)
+from .exceptions import AutoCoderRetryableBackendError, CloudSubmissionNotStartedError
+from .execution_trace import EventKind, Outcome, current_scope, get_trace_collector
+from .fix_to_pass_tests_runner import fix_to_pass_tests
+from .git_branch import extract_number_from_branch, git_commit_with_retry, git_pull
+from .git_commit import git_push
+from .git_info import get_current_branch
+from .github_ci_observer import ci_read_phase_method, end_ci_read_phase
+from .github_pending_work import (
+    PendingObligation,
+    PendingReason,
+    PendingWorkOwnershipError,
+    PendingWorkPersistenceError,
+    PendingWorkScheduler,
+    StageOutcome,
+    WorkIdentity,
+    get_pending_work_store,
+    repository_ownership_key,
+)
+from .github_request_governor import GitHubRequestDeferred, GitHubRequestGovernor, GovernorStateError
+from .health_monitor import get_health_monitor, heartbeat, install_asyncio_diagnostics
+from .implementation_ownership import (
+    OwnershipStartDecision,
+    begin_implementation_ownership,
+    confirm_implementation_ownership,
+    evaluate_implementation_start,
+)
+from .implementation_reclamation_scheduler import (
+    ReclamationObligationStore,
+    recover_obligations_at_startup,
+    run_due_reclamation_checks,
+    schedule_reevaluation_for_pr_owner,
+)
+from .implementation_skip_diagnostic import duplicate_suppression_guidance, explain_already_owned
+from .implementation_slots import (
+    ImplementationHierarchyConflict,
+    ImplementationHierarchyUnavailable,
+    ImplementationOwner,
+    ImplementationOwnerResolutionError,
+    ImplementationSlotObservation,
+    ImplementationSlotRepository,
+    ImplementationSlotUnavailable,
+)
+from .invocation_admission import GateSnapshot, GateState, InvocationAdmissionGate, install_invocation_gate, reset_invocation_gate
+from .issue_admission_cache import IssueAdmissionCache
+from .issue_context import extract_associated_issue_numbers, get_linked_issues_context
+from .issue_implementation_service import IssueImplementationPorts, IssueImplementationRequest, IssueImplementationService
+from .issue_implementation_worker import ImplementationLaneOutcome, IssueImplementationWorker
+from .issue_job_finalizer import IssuePublicationResult
+from .issue_job_runtime import IssueJobRuntime
+from .issue_local_job import IssueJobAuthorizationPorts, IssueJobGitHubPort
+from .issue_processor import create_feature_issues
+from .issue_retry_admission import IssueRetryAdmissionService, IssueRetryDisposition, IssueRetryOrigin
+from .issue_review_rerun import IssueReviewRerunOperation, ReviewSubject, SubjectRerunStatus
+from .issue_review_service import (
+    IssueReviewService,
+    LaneItemOutcome,
+    ReconciledReviewTarget,
+    build_decomposition_descriptor,
+    build_individual_descriptor,
+)
+from .issue_runtime_composition import IssueRuntimeComposition
+from .issue_stage_routing import (
+    IMPLEMENTATION_STAGE,
+    REVIEW_STAGE,
+    ContractIdentity,
+    ImplementationRetryRequest,
+    IssueStageRoutingStore,
+    PendingLaneItem,
+    ReviewRequirement,
+    family_review_generation,
+    implementation_classification,
+    implementation_generation,
+    review_classification,
+    standalone_review_generation,
+)
+from .jules_client import invalidate_jules_sessions_cache
+from .jules_engine import check_and_resume_or_archive_sessions, check_and_start_recurrent_jules_tasks
+from .label_manager import LabelManager
+from .llm_backend_config import active_repo_context, get_pr_review_allowlist_from_config, get_review_adjudicator_allowlist_from_config
+from .local_job_handoff import LocalJobClaim, LocalJobKind, LocalJobRecord, LocalJobStore, LocalJobStoreUnavailable
+from .local_job_runner import LocalJobRunner
+from .logger_config import get_logger
+from .merge_operation_scheduler import get_merge_operation_scheduler
+from .merge_operation_state import MergeOperation
+from .open_target_observations import OpenTarget, OpenTargetObservations
+from .parent_issue_reconciliation import ParentDeclarationStatus, ParentOperationalError, ParentSpecificationError, parse_parent_declaration
+from .pr_processor import PR_PROCESSING_STAGE, LocalPRRepairContext
+from .pr_processor import _create_pr_analysis_prompt as _engine_pr_prompt
+from .pr_processor import _get_pr_diff as _pr_get_diff
+from .pr_processor import _should_skip_waiting_for_jules, process_pull_request
+from .progress_footer import ProgressStage
+from .prompt_loader import render_prompt
+from .reissue_required_store import ReissueRequiredStore
+from .repo_job_trace import (
+    RepoJobExecutionHandle,
+    RepoJobExecutionScope,
+    RepoJobFacts,
+    RepoJobKind,
+    RepoJobTarget,
+    RepoJobTraceCollector,
+    current_repo_job_scope,
+    get_repo_job_trace_collector,
+    observations_for_execution,
+    resolve_repo_job_target,
+    unassociated_observations_for_target,
+)
+from .requirement_contract import REQUIREMENT_CONTRACT_PARSER_VERSION, build_normative_issue_manifest
+from .review_adjudication_github import ADJUDICATION_DB_ENV, DEFAULT_ADJUDICATION_DB_PATH, AdjudicationContextStore, AdjudicationSnapshot, ReviewAdjudicationService
+from .review_capture import issue_review_audit
+from .shutdown_context import install_admission_check, reset_admission_check
+from .sibling_dependencies import (
+    BlockedByDeclarationStatus,
+    DependencySatisfaction,
+    GraphValidity,
+    IssueEvidence,
+    IssueState,
+    IssueType,
+    evaluate_family_graph,
+    parse_blocked_by_declaration,
+)
+from .specification_analyzer import IndividualRelationshipContext
+from .specification_validation_lifecycle import (
+    DIAGNOSTIC_EFFECT,
+    READINESS_WITHDRAWAL_EFFECT,
+    VALIDATION_PUBLICATION_STAGE,
+    SpecificationValidationLifecycle,
+    ValidationDecision,
+    configured_provider_identity,
+    validation_publication_identity,
+)
+from .stale_jules_recovery import find_pending_stale_jules_recovery
+from .test_log_utils import extract_important_errors
+from .test_result import TestResult
+from .trace_logger import get_trace_logger
+from .update_manager import check_for_updates_and_restart
+from .util.gh_cache import IMPLEMENTATION_READY_LABEL, GitHubClient, InvalidSubIssueRelationshipError, get_ghapi_client, is_implementation_ready, parse_parent_issue_number, parse_parent_issue_url_number, resolve_authoritative_item_type
+from .util.github_action import check_and_handle_closed_state, get_github_actions_logs_from_url, is_item_closed_on_github
+from .util.github_cache import get_github_cache
+from .util.github_request_outcome import DeliveryCertainty, GitHubApiOutcome, GitHubReadCancelled, GitHubRequestError, cancel_github_reads_when, configure_github_request_boundary, is_issue_resource_read
+from .utils import CommandExecutor, get_target_container, log_action
+from .validation_scheduler import ValidationAdmissionDeferred, ValidationJob, ValidationScheduler
+from .worker_startup_failure import StartupReconciliationFailure
+
+logger = get_logger(__name__)
+
+_RECONCILIATION_ADMISSION_DEFERRALS = frozenset(
+    {
+        "request_in_flight",
+        "admission_queue",
+        "mutation_spacing",
+        "request_rolling_window",
+        "mutation_minute_window",
+        "mutation_hour_window",
+        "governor_initialization_contention",
+        "governor_transaction_contention",
+        "rate_limit_cooldown",
+    }
+)
+
+
+def _reconciliation_admission_deferral(error: BaseException) -> GitHubRequestDeferred | None:
+    """Recover a typed, definitely-unsent deferral from operational wrappers."""
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, GitHubRequestDeferred) and current.reason in _RECONCILIATION_ADMISSION_DEFERRALS and current.outcome.classification is GitHubApiOutcome.REFUSED and current.outcome.delivery is DeliveryCertainty.DEFINITELY_NOT_SENT:
+            return current
+        # Reconciliation deliberately wraps failures with ``raise ... from``.
+        # Only that explicit causal chain is authoritative: implicit or
+        # suppressed ``__context__`` may belong to an unrelated programming
+        # error raised while a prior deferral was being handled.
+        if not isinstance(current, ParentOperationalError):
+            return None
+        current = current.__cause__
+    return None
+
+
+def _reconciliation_request_error(error: BaseException) -> GitHubRequestError | None:
+    """Preserve supported admission refusals and typed transport failures."""
+    deferred = _reconciliation_admission_deferral(error)
+    if deferred is not None:
+        return deferred
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, GitHubRequestError) and current.outcome.classification is GitHubApiOutcome.TRANSPORT_FAILURE:
+            return current
+        if not isinstance(current, ParentOperationalError):
+            return None
+        current = current.__cause__
+    return None
+
+
+JULES_SESSION_LIST_REFRESH_INTERVAL_SECONDS = 60 * 60
+MAINTENANCE_INTERVAL_SECONDS = 60
+CAPACITY_STATE_CHECK_INTERVAL_SECONDS = 1
+REFILL_RETRY_INTERVAL_SECONDS = 60
+INVALID_REQUIREMENT_CONTRACT_MARKER_PREFIX = "auto-coder-invalid-requirement-contract"
+INVALID_DEPENDENCY_MARKER_PREFIX = "auto-coder-invalid-sibling-dependency"
+STARTUP_RECONCILIATION_STAGE = "startup-reconciliation"
+STARTUP_RECONCILIATION_EFFECT = "startup-scan"
+# Pending-work stage for an Issue hierarchy/readiness evaluation interrupted by
+# a GitHub operational failure. See PR_PROCESSING_STAGE in pr_processor.py for
+# the equivalent PR-side stage.
+ISSUE_PROCESSING_STAGE = "issue-processing"
+ISSUE_PROCESSING_REFRESH_EFFECT = "authoritative-refresh"
+CODEX_RETRY_HANDOFF_STAGE = "codex-retry-handoff"
+CODEX_RETRY_HANDOFF_EFFECT = "joined-bookkeeping"
+
+
+def _issue_content_revision(issue_data: Dict[str, Any]) -> str:
+    """Stable fingerprint of the Issue inputs an evaluation decision relied on.
+
+    Used to detect a changed title/body between deferral and resumption
+    (REQ-003): a resumed evaluation must not authorize an action using
+    observations that were current for a different revision of the Issue.
+    """
+    title = str(issue_data.get("title") or "")
+    body = str(issue_data.get("body") or "")
+    return hashlib.sha256(f"{title}\x1f{body}".encode("utf-8", "surrogatepass")).hexdigest()
+
+
+_TARGET_OUTCOME_TO_TRACE_OUTCOME = {
+    ExplicitTargetOutcome.SUCCESS: Outcome.COMPLETED,
+    ExplicitTargetOutcome.DEFERRED: Outcome.DEFERRED,
+    ExplicitTargetOutcome.SKIPPED: Outcome.SKIPPED,
+    ExplicitTargetOutcome.BLOCKED: Outcome.BLOCKED,
+    ExplicitTargetOutcome.FAILED: Outcome.FAILED,
+}
+
+
+def _record_issue_stage_result(
+    item_number: int,
+    stage_id: str,
+    label: str,
+    outcome: Outcome,
+    facts: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Record an Issue stage-result event using whatever execution scope is active.
+
+    Uses the ambient ``ExecutionScope`` bound by the enclosing candidate
+    evaluation (REQ-002); when none is bound the event is retained as
+    legacy/unscoped by ``TraceCollector`` rather than inventing one. A
+    diagnostic-recorder failure is caught here and never propagates into the
+    admission/dispatch decision it is describing (REQ-008).
+    """
+    try:
+        get_trace_collector().record_event(
+            EventKind.STAGE_RESULT,
+            stage_id=stage_id,
+            origin=stage_id,
+            label=label,
+            outcome=outcome,
+            facts=facts,
+        )
+    except Exception:
+        logger.opt(exception=True).debug("Diagnostic trace recording failed for issue#{} stage {}; continuing", item_number, stage_id)
+
+
+def _record_pr_stage_result(
+    pr_number: int,
+    stage_id: str,
+    label: str,
+    outcome: Outcome,
+    facts: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Record a PR stage-result event for a boundary reached before any execution scope opens.
+
+    ``_PrProcessingStageHandler`` and ``_MergeOperationResumeHandler`` can
+    discover a superseded/stale head and discard the obligation before ever
+    calling ``AutomationEngine._process_single_candidate`` (REQ-001 of Issue
+    #1946: strict-refresh failures or superseded-head exits before common
+    processing must still emit their own execution-scoped evidence). A
+    diagnostic-recorder failure here is caught and never affects the
+    resumption decision it describes (REQ-008).
+    """
+    try:
+        get_trace_collector().record_event(
+            EventKind.STAGE_RESULT,
+            stage_id=stage_id,
+            origin=stage_id,
+            label=label,
+            outcome=outcome,
+            facts=facts,
+        )
+    except Exception:
+        logger.opt(exception=True).debug("Diagnostic trace recording failed for pr#{} stage {}; continuing", pr_number, stage_id)
+
+
+def _map_candidate_result_outcome(result: "CandidateProcessingResult") -> Outcome:
+    """Derive an honest execution outcome from what the boundary actually reported.
+
+    Only fields the producing code already set are consulted (REQ-007): an
+    explicit ``target_outcome`` is authoritative when present, otherwise the
+    ordinary success/error/deferral flags decide. Anything this mapping
+    cannot classify from real evidence stays UNKNOWN rather than defaulting
+    to a successful outcome (REQ-001).
+    """
+    target_outcome = result.target_outcome
+    if isinstance(target_outcome, str):
+        try:
+            target_outcome = ExplicitTargetOutcome(target_outcome)
+        except ValueError:
+            target_outcome = None
+    if target_outcome is not None and target_outcome in _TARGET_OUTCOME_TO_TRACE_OUTCOME:
+        return _TARGET_OUTCOME_TO_TRACE_OUTCOME[target_outcome]
+    if result.capacity_deferred or result.refill_retry_required:
+        return Outcome.DEFERRED
+    if result.error:
+        return Outcome.FAILED
+    if result.success:
+        return Outcome.COMPLETED
+    return Outcome.UNKNOWN
+
+
+def _require_handler_repository(repo_name: str, obligation: PendingObligation) -> None:
+    """Fence every production handler before it can derive an external action."""
+    if repository_ownership_key(obligation.identity.repository) != repository_ownership_key(repo_name):
+        logger.error(
+            "Pending-work handler ownership refused: configured repository={!r}, obligation repository={!r}",
+            repo_name,
+            obligation.identity.repository,
+        )
+        raise PendingWorkOwnershipError("Pending-work handler received a foreign obligation")
+
+
+class _StartupReconciliationHandler:
+    """Retries the durable startup-recovery obligation via the pending-work scheduler.
+
+    Startup recovery has no partial, non-idempotent mutation of its own: it
+    only reads authoritative GitHub state and durably (re)invalidates the
+    entities it discovers, through the same path used for webhooks. An
+    obligation left 'running' by a controller that stopped mid-dispatch is
+    therefore simply retried the same way as a fresh dispatch.
+    """
+
+    def __init__(self, engine: "AutomationEngine", repo_name: str) -> None:
+        self._engine = engine
+        self._repo_name = repo_name
+
+    def dispatch(self, obligation: PendingObligation) -> StageOutcome:
+        _require_handler_repository(self._repo_name, obligation)
+        return self._run()
+
+    def recover(self, obligation: PendingObligation) -> StageOutcome:
+        _require_handler_repository(self._repo_name, obligation)
+        return self._run()
+
+    def _run(self) -> StageOutcome:
+        engine = self._engine
+        loop = engine._loop
+        assert loop is not None, "startup reconciliation obligation dispatched before the engine loop started"
+        try:
+            asyncio.run_coroutine_threadsafe(engine._attempt_startup_reconciliation(self._repo_name), loop).result()
+        except GitHubRequestError as exc:
+            return StageOutcome(error=exc)
+        assert engine._startup_reconciliation_event is not None
+        loop.call_soon_threadsafe(engine._startup_reconciliation_event.set)
+        return StageOutcome(completed_effects=(STARTUP_RECONCILIATION_EFFECT,))
+
+
+class _PrProcessingStageHandler:
+    """Resumes a PR evaluation deferred by a GitHub operational failure.
+
+    Dispatch always re-establishes the PR's current head before authorizing
+    anything: it never resends whatever decision was in flight when the
+    original ``GitHubRequestError`` was raised. Resumption goes through
+    ``AutomationEngine._process_single_candidate`` -- the same production
+    entrypoint the ordinary worker pool uses -- so LabelManager ownership,
+    author allow-listing, and every other admission gate apply identically to
+    a resumed evaluation and a freshly discovered one (REQ-004).
+    """
+
+    def __init__(self, engine: "AutomationEngine", repo_name: str) -> None:
+        self._engine = engine
+        self._repo_name = repo_name
+
+    def dispatch(self, obligation: PendingObligation) -> StageOutcome:
+        _require_handler_repository(self._repo_name, obligation)
+        return self._run(obligation)
+
+    def recover(self, obligation: PendingObligation) -> StageOutcome:
+        _require_handler_repository(self._repo_name, obligation)
+        return self._run(obligation)
+
+    def _run(self, obligation: PendingObligation) -> StageOutcome:
+        entity = obligation.identity.entity
+        pr_number: Optional[int] = None
+        if entity.startswith("pr:"):
+            try:
+                pr_number = int(entity.split(":", 1)[1])
+            except ValueError:
+                pr_number = None
+        if pr_number is None:
+            logger.warning("Malformed PR pending-work identity {!r}; discarding obligation", entity)
+            return StageOutcome(superseded=True)
+        # Opening this resumption's own execution scope here -- before the
+        # strict-refresh read and the superseded-head check -- gives it a
+        # fresh execution identity even when it never reaches
+        # ``_process_single_candidate`` (REQ-001 of Issue #1946). When that
+        # call is reached, ``_process_single_candidate_unified`` detects it
+        # is already nested in this same (repository, "pr", pr_number) scope
+        # and continues it rather than opening a second one.
+        try:
+            handle_cm = get_trace_collector().start_execution(
+                repository=self._repo_name,
+                item_type="pr",
+                item_number=pr_number,
+                origin="pr-pending-work-resumption",
+                stage_id="pr.pending-work-resume",
+                label=f"pr#{pr_number} pending-work resumption",
+            )
+        except Exception:
+            logger.opt(exception=True).debug("Diagnostic trace recording failed opening execution scope for pr#{}; continuing untraced", pr_number)
+            outcome, _result = self._run_impl(obligation, pr_number)
+            return outcome
+        with handle_cm as handle:
+            outcome, result = self._run_impl(obligation, pr_number)
+            try:
+                if result is not None:
+                    handle.set_outcome(_map_candidate_result_outcome(result))
+                elif outcome.superseded:
+                    handle.set_outcome(Outcome.SUPERSEDED)
+                elif outcome.error is not None:
+                    handle.set_outcome(Outcome.DEFERRED)
+                else:
+                    handle.set_outcome(Outcome.UNKNOWN)
+            except Exception:
+                logger.opt(exception=True).debug("Diagnostic trace recording failed finishing execution scope for pr#{}; continuing", pr_number)
+            return outcome
+
+    def _run_impl(self, obligation: PendingObligation, pr_number: int) -> tuple[StageOutcome, Optional["CandidateProcessingResult"]]:
+        engine = self._engine
+        try:
+            raw_pr = engine.github.get_pull_request_metadata_strict(self._repo_name, pr_number)
+        except GitHubRequestError as exc:
+            _record_pr_stage_result(pr_number, "pr.strict-refresh", f"pr#{pr_number} strict refresh", Outcome.DEFERRED, {"reason": str(exc), "phase": "pending-work-resumption"})
+            return StageOutcome(error=exc), None
+        pr_data = engine.github.get_pr_details(raw_pr)
+        if pr_data.get("state") == "closed" or pr_data.get("merged") is True:
+            engine._reconcile_terminal_pr_resumption(self._repo_name, pr_data)
+            _record_pr_stage_result(pr_number, "pr.pending-work-resume-refresh", f"pr#{pr_number} pending-work resume refresh", Outcome.SUPERSEDED, {"reason": "PR is terminal", "state": pr_data.get("state"), "merged": pr_data.get("merged") is True})
+            return StageOutcome(superseded=True), None
+        current_head = str((pr_data.get("head") or {}).get("sha") or "")
+        # A changed head since deferral means the retained observations no
+        # longer describe the PR being resumed. Discard this obligation and
+        # let normal invalidation/webhook handling evaluate the new head on
+        # its own terms rather than fabricating a re-evaluation here
+        # (REQ-003, REQ-006).
+        if obligation.identity.revision and current_head != obligation.identity.revision:
+            _record_pr_stage_result(
+                pr_number,
+                "pr.pending-work-resume-refresh",
+                f"pr#{pr_number} pending-work resume refresh",
+                Outcome.SUPERSEDED,
+                {"expected_head": obligation.identity.revision, "current_head": current_head},
+            )
+            return StageOutcome(superseded=True), None
+        result = engine._process_single_candidate(self._repo_name, Candidate(type="pr", data=pr_data, priority=0), origin="pr-pending-work-resumption")
+        if result.target_outcome is ExplicitTargetOutcome.DEFERRED:
+            # The resumed evaluation hit another operational failure and has
+            # already re-persisted its own obligation through the same defer
+            # path; nothing further to apply here.
+            return StageOutcome(), result
+        return StageOutcome(completed_effects=obligation.unfinished_effects), result
+
+
+class _MergeOperationResumeHandler:
+    """Resumes a durable merge operation once its own retry deadline has passed.
+
+    ``merge_operation_scheduler.MergeOperationScheduler`` owns only timing:
+    it hands this handler the due ``MergeOperation`` and nothing more. This
+    handler re-establishes the PR's current head before doing anything else
+    and, when it still matches the operation's expected head, resumes
+    through the very same ``AutomationEngine._process_single_candidate``
+    entrypoint every other PR evaluation goes through (REQ-005, REQ-006).
+    Normal processing re-validates CI/review/thread/mergeability conditions
+    on its own before reaching ``pr_processor._merge_pr``, which is what
+    actually advances the operation's still-unfinished effect through
+    ``merge_operation_adapter`` -- this handler never calls GitHub itself and
+    never re-implements that validation.
+    """
+
+    def __init__(self, engine: "AutomationEngine", repo_name: str) -> None:
+        self._engine = engine
+        self._repo_name = repo_name
+
+    def __call__(self, operation: MergeOperation) -> None:
+        from .merge_operation_state import owns_merge_operation
+
+        if not owns_merge_operation(self._repo_name, operation.identity):
+            raise ValueError("Merge-operation repository does not match the resume handler")
+        pr_number = operation.identity.pr_number
+        # As with ``_PrProcessingStageHandler``, this resumption's own scope
+        # is opened here so a strict-refresh failure or a superseded-head
+        # exit -- both before ``_process_single_candidate`` is ever called --
+        # still carries a fresh execution identity (REQ-001 of Issue #1946).
+        try:
+            handle_cm = get_trace_collector().start_execution(
+                repository=operation.identity.repository,
+                item_type="pr",
+                item_number=pr_number,
+                origin="merge-operation-resumption",
+                stage_id="pr.merge-operation-resume",
+                label=f"pr#{pr_number} merge-operation resumption",
+            )
+        except Exception:
+            logger.opt(exception=True).debug("Diagnostic trace recording failed opening execution scope for pr#{}; continuing untraced", pr_number)
+            self._run_impl(operation, pr_number)
+            return
+        with handle_cm as handle:
+            outcome = self._run_impl(operation, pr_number)
+            try:
+                handle.set_outcome(outcome)
+            except Exception:
+                logger.opt(exception=True).debug("Diagnostic trace recording failed finishing execution scope for pr#{}; continuing", pr_number)
+
+    def _run_impl(self, operation: MergeOperation, pr_number: int) -> Outcome:
+        engine = self._engine
+        try:
+            raw_pr = engine.github.get_pull_request_metadata_strict(operation.identity.repository, pr_number)
+        except GitHubRequestError as exc:
+            logger.info("Could not refresh PR #{} for merge-operation resumption: {}", pr_number, exc)
+            _record_pr_stage_result(pr_number, "pr.strict-refresh", f"pr#{pr_number} strict refresh", Outcome.DEFERRED, {"reason": str(exc), "phase": "merge-operation-resumption"})
+            return Outcome.DEFERRED
+        pr_data = engine.github.get_pr_details(raw_pr)
+        if pr_data.get("state") == "closed" or pr_data.get("merged") is True:
+            from .merge_operation_state import get_merge_operation_store
+
+            engine._reconcile_terminal_pr_resumption(operation.identity.repository, pr_data)
+            get_merge_operation_store().supersede(operation.identity)
+            _record_pr_stage_result(pr_number, "pr.merge-operation-resume-refresh", f"pr#{pr_number} merge-operation resume refresh", Outcome.SUPERSEDED, {"reason": "PR is terminal", "state": pr_data.get("state"), "merged": pr_data.get("merged") is True})
+            return Outcome.SUPERSEDED
+        current_head = str((pr_data.get("head") or {}).get("sha") or "")
+        if current_head and current_head != operation.expected_head_sha:
+            # A newer head invalidates this operation's own execution
+            # permission; normal invalidation/webhook handling evaluates the
+            # new head on its own terms rather than this handler fabricating
+            # a re-evaluation for it (REQ-006).
+            from .merge_operation_state import get_merge_operation_store
+
+            get_merge_operation_store().supersede(operation.identity)
+            _record_pr_stage_result(
+                pr_number,
+                "pr.merge-operation-resume-refresh",
+                f"pr#{pr_number} merge-operation resume refresh",
+                Outcome.SUPERSEDED,
+                {"expected_head": operation.expected_head_sha, "current_head": current_head},
+            )
+            return Outcome.SUPERSEDED
+        result = engine._process_single_candidate(operation.identity.repository, Candidate(type="pr", data=pr_data, priority=0), origin="merge-operation-resumption")
+        return _map_candidate_result_outcome(result)
+
+
+class _IssueProcessingStageHandler:
+    """Resumes an Issue hierarchy/readiness evaluation deferred by a GitHub failure.
+
+    See ``_PrProcessingStageHandler`` for the equivalent PR-side contract;
+    this handler applies the same freshness and admission requirements to
+    Issue evaluation.
+    """
+
+    def __init__(self, engine: "AutomationEngine", repo_name: str) -> None:
+        self._engine = engine
+        self._repo_name = repo_name
+
+    def dispatch(self, obligation: PendingObligation) -> StageOutcome:
+        _require_handler_repository(self._repo_name, obligation)
+        return self._run(obligation)
+
+    def recover(self, obligation: PendingObligation) -> StageOutcome:
+        _require_handler_repository(self._repo_name, obligation)
+        return self._run(obligation)
+
+    def _run(self, obligation: PendingObligation) -> StageOutcome:
+        engine = self._engine
+        entity = obligation.identity.entity
+        issue_number: Optional[int] = None
+        if entity.startswith("issue:"):
+            try:
+                issue_number = int(entity.split(":", 1)[1])
+            except ValueError:
+                issue_number = None
+        if issue_number is None:
+            logger.warning("Malformed Issue pending-work identity {!r}; discarding obligation", entity)
+            return StageOutcome(superseded=True)
+        if engine._refill_admission_paused(self._repo_name, issue_number, "issue"):
+            logger.info(
+                "Issue pending-work evaluation remains unfinished behind refill fault repository={} issue={} stage={}",
+                self._repo_name,
+                issue_number,
+                ISSUE_PROCESSING_STAGE,
+            )
+            return StageOutcome()
+        try:
+            fresh_issue = engine.github.get_issue_dispatch_snapshot_strict(self._repo_name, issue_number)
+        except GitHubRequestError as exc:
+            return StageOutcome(error=exc)
+        except Exception as exc:
+            logger.opt(exception=True).warning("Issue pending-work initial refresh failed repository={} issue={}", self._repo_name, issue_number)
+            return StageOutcome(blocked_reason=PendingReason.EVALUATION_FAILED, blocked_error=str(exc))
+        if not isinstance(fresh_issue, dict) or fresh_issue.get("number") != issue_number or "pull_request" in fresh_issue:
+            # No longer an authoritative open Issue snapshot; nothing left for
+            # this obligation to authorize.
+            return StageOutcome(superseded=True)
+        current_revision = _issue_content_revision(fresh_issue)
+        if obligation.identity.revision and current_revision != obligation.identity.revision:
+            return StageOutcome(superseded=True)
+        candidate = Candidate(type="issue", data=fresh_issue, priority=0, issue_number=issue_number)
+        try:
+            result = engine._process_single_candidate(self._repo_name, candidate, origin="issue-pending-work-resumption")
+        except GitHubRequestError as exc:
+            return StageOutcome(error=exc)
+        except Exception as exc:
+            logger.opt(exception=True).warning("Issue pending-work evaluation failed repository={} issue={}", self._repo_name, issue_number)
+            return StageOutcome(blocked_reason=PendingReason.EVALUATION_FAILED, blocked_error=str(exc))
+        if result.target_outcome is ExplicitTargetOutcome.DEFERRED or result.error:
+            if result.error:
+                logger.warning(
+                    "Issue pending-work evaluation remains unfinished repository={} issue={} stage={} reason={}",
+                    self._repo_name,
+                    issue_number,
+                    ISSUE_PROCESSING_STAGE,
+                    result.error,
+                )
+            if isinstance(result.failure, GitHubRequestError):
+                return StageOutcome(error=result.failure)
+            if result.error:
+                return StageOutcome(blocked_reason=PendingReason.EVALUATION_FAILED, blocked_error=result.error)
+            return StageOutcome()
+        return StageOutcome(completed_effects=obligation.unfinished_effects)
+
+
+class _CodexRetryHandoffStageHandler:
+    """Finish accepted Codex bookkeeping without re-entering Issue dispatch."""
+
+    def __init__(self, reconciler: CodexRetryReconciler, repo_name: str) -> None:
+        self._reconciler = reconciler
+        self._repo_name = repo_name
+
+    def dispatch(self, obligation: PendingObligation) -> StageOutcome:
+        _require_handler_repository(self._repo_name, obligation)
+        return self._run(obligation)
+
+    def recover(self, obligation: PendingObligation) -> StageOutcome:
+        _require_handler_repository(self._repo_name, obligation)
+        return self._run(obligation)
+
+    def _run(self, obligation: PendingObligation) -> StageOutcome:
+        request_id = obligation.identity.revision
+        outcome, reason = self._reconciler.reconcile(request_id)
+        if outcome in {ExplicitTargetOutcome.SUCCESS, ExplicitTargetOutcome.SKIPPED}:
+            return StageOutcome(completed_effects=obligation.unfinished_effects)
+        logger.info("Codex retry handoff {} remains pending: {}", request_id, reason)
+        # Keep the durable obligation waiting. PendingWorkScheduler interprets
+        # an empty outcome as unfinished and schedules another normal turn.
+        return StageOutcome()
+
+
+class _ValidationPublicationStageHandler:
+    """Resumes an Issue specification/decomposition BLOCKED publication.
+
+    This is the effect-level counterpart to ``_IssueProcessingStageHandler``:
+    it owns exactly the two independently-trackable effects a BLOCKED
+    decision requires (the diagnostic comment and, when applicable, the
+    parent readiness withdrawal), durably completed one at a time via
+    ``PendingWorkStore.complete_effect`` from inside
+    ``SpecificationValidationLifecycle.apply_blocked``/``apply_inherited_blocked``
+    (Issue #1923, REQ-001, REQ-002, REQ-007).
+
+    Recovery re-derives the current decision from scratch -- issue snapshot,
+    hierarchy, and the durably-saved decision keyed by a freshly recomputed
+    identity -- exactly as a fresh evaluation would (REQ-005). A revision
+    mismatch (edited title/body, changed hierarchy, or a new readiness
+    submission) supersedes the retained obligation rather than authorizing
+    stale effects (REQ-003).
+    """
+
+    def __init__(self, engine: "AutomationEngine", repo_name: str) -> None:
+        self._engine = engine
+        self._repo_name = repo_name
+
+    def dispatch(self, obligation: PendingObligation) -> StageOutcome:
+        _require_handler_repository(self._repo_name, obligation)
+        return self._run(obligation)
+
+    def recover(self, obligation: PendingObligation) -> StageOutcome:
+        _require_handler_repository(self._repo_name, obligation)
+        return self._run(obligation)
+
+    def _run(self, obligation: PendingObligation) -> StageOutcome:
+        repo_name = self._repo_name
+        entity = obligation.identity.entity
+        issue_number: Optional[int] = None
+        if entity.startswith("issue:"):
+            try:
+                issue_number = int(entity.split(":", 1)[1])
+            except ValueError:
+                issue_number = None
+        if issue_number is None:
+            logger.warning("Malformed validation-publication pending-work identity {!r}; discarding obligation", entity)
+            return StageOutcome(superseded=True)
+        try:
+            handle_cm = get_trace_collector().start_execution(
+                repository=repo_name,
+                item_type="issue",
+                item_number=issue_number,
+                origin="validation-publication-resumption",
+                stage_id="issue.validation-publication-resume",
+                label=f"issue#{issue_number} validation-publication resumption",
+            )
+        except Exception:
+            logger.opt(exception=True).debug("Diagnostic trace recording failed opening execution scope for issue#{}; continuing untraced", issue_number)
+            return self._run_impl(obligation, issue_number)
+        with handle_cm as handle:
+            outcome = self._run_impl(obligation, issue_number)
+            try:
+                if outcome.error is not None:
+                    handle.set_outcome(Outcome.DEFERRED)
+                elif outcome.superseded:
+                    handle.set_outcome(Outcome.SUPERSEDED)
+                elif outcome.completed_effects:
+                    handle.set_outcome(Outcome.COMPLETED)
+                else:
+                    handle.set_outcome(Outcome.DEFERRED)
+            except Exception:
+                logger.opt(exception=True).debug("Diagnostic trace recording failed finishing execution scope for issue#{}; continuing", issue_number)
+            return outcome
+
+    def _run_impl(self, obligation: PendingObligation, issue_number: int) -> StageOutcome:
+        engine = self._engine
+        repo_name = self._repo_name
+        try:
+            fresh_issue = engine.github.get_issue_dispatch_snapshot_strict(repo_name, issue_number)
+        except GitHubRequestError as exc:
+            return StageOutcome(error=exc)
+        if not isinstance(fresh_issue, dict) or fresh_issue.get("number") != issue_number or "pull_request" in fresh_issue:
+            return StageOutcome(superseded=True)
+        if not engine._is_authoritatively_open_issue(fresh_issue):
+            # Closure withdraws undelivered individual effects. Confirmed
+            # receipts already completed in PendingWorkStore remain intact.
+            return StageOutcome(superseded=True)
+        title = str(fresh_issue.get("title") or "")
+        body = str(fresh_issue.get("body") or "")
+        validator = engine._get_specification_validator(repo_name)
+        parent_number = engine._get_authoritative_parent_number(repo_name, issue_number, fresh_issue)
+        relationship_context = None
+        authoritative_set: Optional[tuple[Dict[str, Any], List[Dict[str, Any]]]] = None
+        if parent_number is not None:
+            try:
+                authoritative_set = engine._fetch_authoritative_decomposition_set(repo_name, parent_number)
+            except GitHubRequestError as exc:
+                return StageOutcome(error=exc)
+            if authoritative_set is not None:
+                relationship_context = engine._child_review_context(*authoritative_set, issue_number)
+        fresh_identity = validator.identity(issue_number, title, body, relationship_context)
+        if fresh_identity.key != obligation.identity.revision:
+            # An edited Issue, a changed hierarchy, or a new readiness
+            # submission produces a different identity; the retained
+            # obligation described a now-obsolete result (REQ-003, REQ-005).
+            return StageOutcome(superseded=True)
+        decision = validator.store.get(fresh_identity)
+        if decision is None or decision.verdict != "BLOCKED":
+            return StageOutcome(superseded=True)
+        try:
+            if parent_number is not None:
+
+                def _set_is_current() -> bool:
+                    latest = engine._fetch_authoritative_decomposition_set(repo_name, parent_number)
+                    if latest is None or not engine._is_open_issue(latest[0]) or not is_implementation_ready(latest[0]) or issue_number not in {child.get("number") for child in latest[1]}:
+                        return False
+                    relationship = engine._child_review_context(*latest, issue_number)
+                    return validator.identity(issue_number, title, body, relationship) == decision.identity
+
+                side_effect_error = validator.apply_inherited_blocked(engine.github, decision, _set_is_current)
+            else:
+                side_effect_error = validator.apply_blocked(engine.github, decision, lambda: engine._standalone_validation_is_current(repo_name, decision))
+        except GitHubRequestError as exc:
+            issue_review_audit.record_effect(
+                repository=repo_name,
+                target_number=issue_number,
+                review_kind=issue_review_audit.REVIEW_KIND_ISSUE_SPECIFICATION,
+                generation_key=decision.identity.key,
+                policy_identity=decision.identity.policy_identity,
+                disposition="failed",
+                details={"recovery": True, "error": str(exc)},
+            )
+            return StageOutcome(error=exc)
+        issue_review_audit.record_effect(
+            repository=repo_name,
+            target_number=issue_number,
+            review_kind=issue_review_audit.REVIEW_KIND_ISSUE_SPECIFICATION,
+            generation_key=decision.identity.key,
+            policy_identity=decision.identity.policy_identity,
+            disposition="failed" if side_effect_error else "unknown",
+            details={"recovery": True, "error": side_effect_error},
+        )
+        if side_effect_error:
+            logger.warning("Validation publication effects remain incomplete for Issue #{}: {}", issue_number, side_effect_error)
+            return StageOutcome()
+        current = get_pending_work_store(repo_name).get(obligation.identity)
+        if current is None:
+            # Every effect this obligation named has been durably completed
+            # via complete_effect() from inside apply_blocked/apply_inherited_blocked.
+            return StageOutcome(completed_effects=obligation.unfinished_effects)
+        return StageOutcome()
+
+
+class _DecompositionPublicationStageHandler:
+    """Resumes a decomposition (parent-set) BLOCKED publication.
+
+    Mirrors ``_ValidationPublicationStageHandler`` but reconstructs a fresh
+    ``DecompositionIdentity`` from the authoritative parent/direct-child set
+    rather than an individual ``ValidationIdentity`` (Issue #2026, REQ-007):
+    the inspected specification-only resumption handler never reached
+    decomposition decisions, so their publication effects had no recovery
+    path at all before this handler existed.
+    """
+
+    def __init__(self, engine: "AutomationEngine", repo_name: str) -> None:
+        self._engine = engine
+        self._repo_name = repo_name
+
+    def dispatch(self, obligation: PendingObligation) -> StageOutcome:
+        _require_handler_repository(self._repo_name, obligation)
+        return self._run(obligation)
+
+    def recover(self, obligation: PendingObligation) -> StageOutcome:
+        _require_handler_repository(self._repo_name, obligation)
+        return self._run(obligation)
+
+    def _run(self, obligation: PendingObligation) -> StageOutcome:
+        repo_name = self._repo_name
+        entity = obligation.identity.entity
+        parent_number: Optional[int] = None
+        if entity.startswith("issue:"):
+            try:
+                parent_number = int(entity.split(":", 1)[1])
+            except ValueError:
+                parent_number = None
+        if parent_number is None:
+            logger.warning("Malformed decomposition-publication pending-work identity {!r}; discarding obligation", entity)
+            return StageOutcome(superseded=True)
+        try:
+            handle_cm = get_trace_collector().start_execution(
+                repository=repo_name,
+                item_type="issue",
+                item_number=parent_number,
+                origin="decomposition-publication-resumption",
+                stage_id="issue.decomposition-publication-resume",
+                label=f"issue#{parent_number} decomposition-publication resumption",
+            )
+        except Exception:
+            logger.opt(exception=True).debug("Diagnostic trace recording failed opening execution scope for issue#{}; continuing untraced", parent_number)
+            return self._run_impl(obligation, parent_number)
+        with handle_cm as handle:
+            outcome = self._run_impl(obligation, parent_number)
+            try:
+                if outcome.error is not None:
+                    handle.set_outcome(Outcome.DEFERRED)
+                elif outcome.superseded:
+                    handle.set_outcome(Outcome.SUPERSEDED)
+                elif outcome.completed_effects:
+                    handle.set_outcome(Outcome.COMPLETED)
+                else:
+                    handle.set_outcome(Outcome.DEFERRED)
+            except Exception:
+                logger.opt(exception=True).debug("Diagnostic trace recording failed finishing execution scope for issue#{}; continuing", parent_number)
+            return outcome
+
+    def _run_impl(self, obligation: PendingObligation, parent_number: int) -> StageOutcome:
+        repo_name = self._repo_name
+        engine = self._engine
+        try:
+            authoritative_set = engine._fetch_authoritative_decomposition_set(repo_name, parent_number)
+        except GitHubRequestError as exc:
+            return StageOutcome(error=exc)
+        if authoritative_set is None or not engine._is_open_issue(authoritative_set[0]):
+            return StageOutcome(superseded=True)
+        validator = engine._get_decomposition_validator(repo_name)
+        fresh_identity = validator.identity(*authoritative_set)
+        if fresh_identity.key != obligation.identity.revision:
+            # An edited parent/child, a changed membership, or a new
+            # readiness submission produces a different identity; the
+            # retained obligation described a now-obsolete result.
+            return StageOutcome(superseded=True)
+        decision = validator.store.get(fresh_identity)
+        if decision is None or decision.verdict != "BLOCKED":
+            return StageOutcome(superseded=True)
+        side_effect_error = validator.apply_blocked(engine.github, decision, lambda number: engine._fetch_authoritative_decomposition_set(repo_name, number))
+        issue_review_audit.record_effect(
+            repository=repo_name,
+            target_number=parent_number,
+            review_kind=issue_review_audit.REVIEW_KIND_ISSUE_DECOMPOSITION,
+            generation_key=decision.identity.key,
+            policy_identity=decision.identity.policy_identity,
+            disposition="failed" if side_effect_error else "unknown",
+            details={"recovery": True, "error": side_effect_error},
+        )
+        if side_effect_error:
+            logger.warning("Decomposition publication effects remain incomplete for parent Issue #{}: {}", parent_number, side_effect_error)
+            return StageOutcome()
+        current = get_pending_work_store(repo_name).get(obligation.identity)
+        if current is None:
+            # Every effect this obligation named has been durably completed
+            # via complete_effect() from inside apply_blocked.
+            return StageOutcome(completed_effects=obligation.unfinished_effects)
+        return StageOutcome()
+
+
+class EngineLifecycle(str, Enum):
+    """Observable lifecycle of the long-running automation daemon."""
+
+    RUNNING = "running"
+    DRAINING = "draining"
+    FAILED_AWAITING_DRAIN = "failed_awaiting_drain"
+    STOPPED = "stopped"
+    FORCED = "forced"
+
+
+@dataclasses.dataclass(frozen=True)
+class RefillFault:
+    """An engine-lifetime admission barrier created by an unexpected refill fault."""
+
+    repository: str
+    target: Optional[int]
+    phase: str
+    exception_class: str
+    disposition: str
+    retry_not_before: Optional[float]
+
+
+class AutomationEngine:
+    """Main automation engine that orchestrates GitHub and LLM integration."""
+
+    def __init__(
+        self,
+        github_client: GitHubClient,
+        config: Optional[AutomationConfig] = None,
+    ) -> None:
+        """Initialize automation engine."""
+        self.github = github_client
+        self.github_request_governor = GitHubRequestGovernor()
+        # The boundary installs the waiting admission form: this controller runs
+        # several workers against one origin, so its own pacing deferrals must
+        # delay a request rather than fail it.
+        configure_github_request_boundary(self.github_request_governor.admit_blocking, self.github_request_governor.observe)
+        # Construction is deliberately non-serving. ``start_automation`` replaces
+        # this with an immutable repository-bound scheduler before recovery.
+        self.pending_work_scheduler: PendingWorkScheduler | None = None
+        self._pending_work_repository_key: str | None = None
+        self.merge_operation_scheduler = get_merge_operation_scheduler()
+        self.config = config or AutomationConfig()
+        self.cmd = CommandExecutor()
+        self.queue = CandidateQueue()
+        invalidation_path = Path(os.environ.get("AUTO_CODER_INVALIDATION_DB", "~/.auto-coder/entity-invalidations.sqlite3")).expanduser()
+        self.invalidations = DurableInvalidationQueue(invalidation_path)
+        adjudication_path = Path(os.environ.get(ADJUDICATION_DB_ENV, DEFAULT_ADJUDICATION_DB_PATH)).expanduser()
+        self.review_adjudications = ReviewAdjudicationService(self.github, AdjudicationContextStore(adjudication_path))
+        routing_path = Path(os.environ.get("AUTO_CODER_ISSUE_STAGE_ROUTING_DB", "~/.auto-coder/issue-stage-routing.sqlite3")).expanduser()
+        self.issue_stage_routing = IssueStageRoutingStore(routing_path)
+        self._issue_routing_locks_guard = threading.Lock()
+        self._issue_routing_locks: dict[tuple[str, int], threading.RLock] = {}
+        self._lane_context = threading.local()
+        self.issue_admission_cache = IssueAdmissionCache()
+        self.dependency_observations = DependencyObservationCache()
+        self._invalidation_drain_lock = asyncio.Lock()
+        self._invalidation_wake_event: Optional[asyncio.Event] = None
+        self._refill_lock = asyncio.Lock()
+        # Issue #2148: set by a reclamation due-check's on_capacity_freed
+        # callback to request the capacity-refill loop treat the next tick
+        # as a refill opportunity even if it hasn't independently observed
+        # a store identity change yet.
+        self._refill_wake_requested = False
+        self._refill_faults: dict[tuple[str, Optional[int], str], RefillFault] = {}
+        self._refill_faults_lock = threading.Lock()
+        self.startup_reconciled = False
+        self.startup_reconciliation_error: Optional[str] = None
+        self.startup_failure_recovery_enabled = False
+        self.startup_failure: StartupReconciliationFailure | None = None
+        self._startup_reconciliation_event: Optional[asyncio.Event] = None
+        self.active_workers: Dict[int, Optional[Candidate]] = {}
+        self.open_target_observations = OpenTargetObservations()
+        self.open_prs_snapshot: List[Dict[str, Any]] = []
+        self.open_issues_snapshot: List[Dict[str, Any]] = []
+        self._wake_up_event: Optional[asyncio.Event] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._pr_merged_or_closed: bool = False
+        self.implementation_slots: Optional[ImplementationSlotRepository] = None
+        # Guards check-then-act access to `self.implementation_slots` from
+        # `_get_implementation_slots`/`get_implementation_slot_snapshot`, so
+        # a read-only diagnostic observation racing a concurrent lifecycle
+        # binding call can never rebind (or be rebound past) the winner
+        # (REQ-006 of Issue #1993).
+        self._implementation_slots_lock = threading.Lock()
+        self._specification_validators: Dict[str, SpecificationValidationLifecycle] = {}
+        self._decomposition_validators: Dict[str, DecompositionValidationLifecycle] = {}
+        # One Lifecycle per repository for the process lifetime. Semantic
+        # policy identity no longer depends on execution routing (Issue
+        # #2081, REQ-001), so a backend/model/fallback configuration change
+        # is not a reason to rebuild this cache; each `decide()` call reads
+        # the currently configured route fresh for execution provenance only
+        # (REQ-004, REQ-005). Tests and embedding callers may still inject a
+        # lifecycle directly by assigning into these dicts.
+        self._validator_cache_lock = threading.RLock()
+        self.validation_scheduler = ValidationScheduler(self.config.validation_concurrency)
+        # The Review lane runs on its own capacity boundary so occupied
+        # implementation slots cannot consume Review worker capacity and
+        # long-running reviews cannot occupy Implementation workers (REQ-009).
+        self.review_scheduler = ValidationScheduler(self.config.validation_concurrency)
+        self.adversarial_validation_scheduler = AdversarialValidationScheduler(self.config.adversarial_validation_concurrency)
+        self._lifecycle = EngineLifecycle.RUNNING
+        self._lifecycle_lock = threading.Lock()
+        self.daemon_serving = False
+        self.graceful_terminal_observer: Optional[Callable[[str], None]] = None
+        self._dependency_family_locks: Dict[tuple[str, int], threading.RLock] = {}
+        self._dependency_family_locks_guard = threading.Lock()
+        self._shutdown_event: Optional[asyncio.Event] = None
+        self._force_stop_event: Optional[asyncio.Event] = None
+        self._critical_operations: Dict[asyncio.Task[Any], str] = {}
+        self._critical_thread_finished: Dict[asyncio.Task[Any], threading.Event] = {}
+        # One invocation-admission gate per daemon lifetime (Issue #2009):
+        # finer-grained, per-LLM-call shutdown protection that runs alongside
+        # the coarser worker/maintenance-level `_run_local_critical` wait
+        # this class already owns. Retiring that broader wait in favor of
+        # this gate is a separate follow-up (#2010); today this gate only
+        # tracks invocations and never gates the daemon's own exit.
+        self.invocation_gate = InvocationAdmissionGate()
+        self.local_job_store: Optional[LocalJobStore] = None
+        self._pr_local_job_runner: Optional[LocalJobRunner] = None
+        self._issue_job_runtimes: Dict[str, IssueJobRuntime] = {}
+        self._issue_runtime_composition: Optional[IssueRuntimeComposition] = None
+        # Full Jules discovery is deliberately delayed after startup.  Claiming
+        # a cycle advances this deadline before any HTTP work begins, so a
+        # failed listing cannot cause a hot retry on the next loop iteration.
+        self._next_jules_session_list_refresh = time.monotonic() + JULES_SESSION_LIST_REFRESH_INTERVAL_SECONDS
+
+        # Note: Report directories are created per repository,
+        # so we do not create one here (created in _save_report)
+
+    @property
+    def lifecycle(self) -> EngineLifecycle:
+        """Return the current daemon lifecycle state safely across worker threads."""
+        with self._lifecycle_lock:
+            return self._lifecycle
+
+    @property
+    def is_draining(self) -> bool:
+        return self.lifecycle is not EngineLifecycle.RUNNING
+
+    def invocation_admission_snapshot(self) -> GateSnapshot:
+        """Expose this daemon lifetime's per-invocation admission state for diagnostics."""
+        return self.invocation_gate.snapshot()
+
+    def request_graceful_shutdown(self, reason: str) -> bool:
+        """Stop admission and request a drain. Return true for the first request."""
+        with self._lifecycle_lock:
+            if self._lifecycle not in {EngineLifecycle.RUNNING, EngineLifecycle.FAILED_AWAITING_DRAIN}:
+                return False
+            self._lifecycle = EngineLifecycle.DRAINING
+            self.daemon_serving = False
+        self.invocation_gate.close_admission(reason)
+        logger.warning(f"Graceful shutdown requested by {reason}; entering draining state")
+        # Issue #2010 REQ-007: report exactly what graceful draining actually
+        # waits for -- each still-unsettled admitted LLM invocation's own
+        # repository/target/stage/state -- rather than the coarser whole
+        # worker/maintenance thread-ownership descriptions in
+        # `_critical_operations`, which are interrupted (not awaited) and
+        # must never be presented as paid critical work.
+        unsettled = self.invocation_gate.unsettled_snapshot()
+        if unsettled:
+            descriptions = [f"{u.repository}#{u.target} stage={u.stage} state={u.state.value}" for u in unsettled]
+            logger.warning(f"Waiting for {len(unsettled)} protected LLM invocation(s) to reach a durable checkpoint: {descriptions}")
+        else:
+            logger.warning("No protected LLM invocation is in flight; shutdown proceeds without waiting for one")
+        local_operations = list(self._critical_operations.values())
+        if local_operations:
+            logger.info(f"Interrupting {len(local_operations)} unrelated local operation(s) without waiting for their natural completion: {local_operations}")
+        if self._loop is not None and self._shutdown_event is not None:
+            self._loop.call_soon_threadsafe(self._shutdown_event.set)
+        if self._wake_up_event is not None and self._loop is not None:
+            self._loop.call_soon_threadsafe(self._wake_up_event.set)
+        return True
+
+    def request_force_stop(self, reason: str) -> None:
+        """Abandon the graceful wait after an explicit second interrupt."""
+        with self._lifecycle_lock:
+            self._lifecycle = EngineLifecycle.FORCED
+        self.invocation_gate.force_stop(reason)
+        logger.error(f"Forced shutdown requested by {reason}; local work may require restart recovery")
+        if self._loop is not None and self._force_stop_event is not None:
+            self._loop.call_soon_threadsafe(self._force_stop_event.set)
+
+    async def _run_local_critical(self, description: str, function: Any, *args: Any) -> Any:
+        """Own synchronous work until its thread really returns, despite cancellation."""
+        thread_finished = threading.Event()
+        thread_submitted = False
+
+        def run_owned() -> tuple[bool, Any]:
+            try:
+                try:
+                    return True, function(*args)
+                except BaseException as exc:
+                    return False, exc
+            finally:
+                thread_finished.set()
+
+        async def submit_owned() -> tuple[bool, Any]:
+            try:
+                return await asyncio.to_thread(run_owned)
+            except asyncio.CancelledError:
+                raise
+            except BaseException:
+                # Function exceptions are returned by run_owned, so an error
+                # here means the executor could not enter the owned call.
+                thread_finished.set()
+                raise
+
+        async def run_in_thread() -> tuple[bool, Any]:
+            nonlocal thread_submitted
+            # Keep BaseException on the awaiting coroutine.  Letting a shielded
+            # child task finish with KeyboardInterrupt/SystemExit makes asyncio
+            # treat it as a loop-level termination before the caller can observe
+            # and handle the exception.
+            token = install_admission_check(lambda: not self.is_draining)
+            gate_token = install_invocation_gate(self.invocation_gate)
+            try:
+                try:
+                    # Shield the submitted work so cancellation cannot remove a
+                    # queued executor call without its completion observation.
+                    thread_submitted = True
+                    return await asyncio.shield(submit_owned())
+                except BaseException as exc:
+                    return False, exc
+            finally:
+                reset_invocation_gate(gate_token)
+                reset_admission_check(token)
+
+        task = asyncio.create_task(run_in_thread(), name=f"local-critical:{description}")
+
+        def observe_unsubmitted(done: asyncio.Task[Any]) -> None:
+            if not thread_submitted:
+                thread_finished.set()
+
+        task.add_done_callback(observe_unsubmitted)
+        self._critical_operations[task] = description
+        self._critical_thread_finished[task] = thread_finished
+        try:
+            try:
+                completed, value = await asyncio.shield(task)
+            except asyncio.CancelledError:
+                # asyncio cancellation cannot stop a running executor thread. Keep
+                # ownership and its durable lifecycle until the real boundary.
+                if self.lifecycle is not EngineLifecycle.FORCED:
+                    completed, value = await asyncio.shield(task)
+                    if not self.is_draining:
+                        # Supervisor cancellation after a companion loop fails
+                        # must stop this caller once its owned work finishes.
+                        # Only an explicit graceful drain consumes cancellation
+                        # so its callers can finalize the completed result.
+                        raise
+                else:
+                    raise
+            if completed:
+                return value
+            raise value
+        finally:
+            if task.done() and thread_finished.is_set():
+                self._critical_operations.pop(task, None)
+                self._critical_thread_finished.pop(task, None)
+
+    async def _wait_for_protected_invocations(self) -> None:
+        """Wait only for admitted LLM invocations to reach a durable checkpoint.
+
+        Issue #2010 REQ-001/REQ-002/REQ-003: graceful draining's exit gate is
+        narrowed to exactly the set this daemon's `invocation_gate` tracks --
+        an individual token/quota-consuming inference/agent invocation
+        admitted before closure, continuously protected through its
+        checkpoint. It never re-widens to the coarser `_critical_operations`
+        thread-ownership map (a whole worker/maintenance function), which is
+        interrupted independently (see `shutdown_interrupt.py` and the
+        cooperative `new_work_allowed()` checks already threaded through
+        `issue_processor.py`/`pr_processor.py`/`validation_scheduler.py`) and
+        must never delay process exit. A second interrupt (`force_stop`)
+        abandons this wait immediately, reporting a forced -- not
+        successfully graceful -- drain.
+        """
+        while True:
+            snapshot = self.invocation_gate.snapshot()
+            if snapshot.state is GateState.FORCED or not snapshot.unsettled:
+                return
+            logger.info("Draining protected LLM invocation(s): " + ", ".join(f"{u.repository}#{u.target} stage={u.stage} state={u.state.value}" for u in snapshot.unsettled))
+            force_wait = asyncio.create_task(self._force_stop_event.wait()) if self._force_stop_event is not None else None
+            poll_wait = asyncio.create_task(asyncio.sleep(0.05))
+            waiters = {poll_wait} | ({force_wait} if force_wait is not None else set())
+            done, pending = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            if force_wait is not None and force_wait in done:
+                return
+
+    async def _wait_for_interrupted_local_work(self) -> None:
+        """Reap the coarser thread-ownership wrapper's own bookkeeping.
+
+        `_run_local_critical` shields its thread from asyncio cancellation so
+        a caller never observes a claim/decision as released while the real
+        executor thread is still running (REQ-004/REQ-005). Since Issue #2010
+        REQ-003, that thread is no longer expected to run to its unrelated
+        work's natural completion: `shutdown_interrupt.py`'s cooperative
+        subprocess interruption and the `new_work_allowed()` checks already
+        threaded through the business-logic call graph make it return
+        promptly once admission has closed, so this wait -- unlike before
+        Issue #2010 -- settles quickly instead of blocking on maintenance's
+        own external response or timeout. It is not itself the daemon's
+        exit gate for a *protected* invocation; `_wait_for_protected_invocations`
+        already covers that.
+        """
+        while self._critical_operations:
+            # A forced cancellation can leave the shielded thread task in the
+            # map after its caller exits. Task completion alone is insufficient:
+            # cancellation of the asyncio wrapper does not stop its thread.
+            for task in tuple(self._critical_operations):
+                finished = self._critical_thread_finished.get(task)
+                if task.done() and finished is not None and finished.is_set():
+                    self._critical_operations.pop(task, None)
+                    self._critical_thread_finished.pop(task, None)
+            if not self._critical_operations:
+                return
+            pending = {task for task in self._critical_operations if not task.done()}
+            logger.info(f"Waiting for {len(self._critical_operations)} interrupted local operation(s) to finish returning: {list(self._critical_operations.values())}")
+            force_wait = asyncio.create_task(self._force_stop_event.wait()) if self._force_stop_event is not None else None
+            # A cancelled wrapper may already be done while its thread remains
+            # live; poll the real completion signal without spinning on it.
+            poll = asyncio.create_task(asyncio.sleep(0.05)) if len(pending) != len(self._critical_operations) else None
+            waiters = pending | ({force_wait} if force_wait is not None else set()) | ({poll} if poll is not None else set())
+            done, _ = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+            if poll is not None and poll not in done:
+                poll.cancel()
+                await asyncio.gather(poll, return_exceptions=True)
+            if force_wait is not None:
+                if force_wait in done:
+                    return
+                force_wait.cancel()
+                await asyncio.gather(force_wait, return_exceptions=True)
+            await asyncio.sleep(0)
+
+    def _claim_jules_session_list_refresh(self) -> bool:
+        """Claim the hourly full-list maintenance cycle when it is due."""
+        now = time.monotonic()
+        if now < self._next_jules_session_list_refresh:
+            return False
+
+        self._next_jules_session_list_refresh = now + JULES_SESSION_LIST_REFRESH_INTERVAL_SECONDS
+        return True
+
+    def notify_pr_merged_or_closed(self) -> None:
+        """Signal that a PR was merged or closed, interrupting any active wait in the producer loop."""
+        logger.info("PR merged or closed event received; requesting early wake-up of producer loop")
+        self._pr_merged_or_closed = True
+        if self._wake_up_event is not None:
+            if self._loop is not None and not self._loop.is_closed():
+                try:
+                    self._loop.call_soon_threadsafe(self._wake_up_event.set)
+                except RuntimeError:
+                    self._wake_up_event.set()
+            else:
+                self._wake_up_event.set()
+
+    async def _sleep_or_wake(self, sleep_time: float) -> bool:
+        """Sleep for sleep_time seconds, or cut short if a PR is merged/closed.
+
+        Returns:
+            True if woken up early (by PR merge/close), False if sleep completed normally.
+        """
+        if self._pr_merged_or_closed:
+            self._pr_merged_or_closed = False
+            if self._wake_up_event is not None:
+                self._wake_up_event.clear()
+            logger.info("PR merged/closed event was already queued; cutting short wait time and resuming immediately")
+            return True
+
+        if self._wake_up_event is None:
+            self._wake_up_event = asyncio.Event()
+        self._wake_up_event.clear()
+
+        try:
+            await asyncio.wait_for(self._wake_up_event.wait(), timeout=sleep_time)
+            self._pr_merged_or_closed = False
+            self._wake_up_event.clear()
+            logger.info("Wait time cut short by PR merged/closed event; resuming main loop immediately")
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    def _check_if_pr_merged_or_closed(self, candidate: Candidate, result: CandidateProcessingResult) -> bool:
+        """Check if the processing result indicates a PR was merged or closed."""
+        for action in result.actions:
+            action_lower = action.lower()
+            if "successfully merged pr" in action_lower or "merged pr #" in action_lower or "was merged" in action_lower:
+                return True
+            if "closed pr #" in action_lower or "closed unfixable pr" in action_lower or "closed stale jules pr" in action_lower or "closed empty jules pr" in action_lower or "closing pr" in action_lower:
+                return True
+        return False
+
+    async def check_and_start_recurrent_jules_tasks_async(self, repo_name: str) -> None:
+        """Scan .auto-coder/prompts/*.md files and start recurrent Jules tasks if not already running."""
+        try:
+            await self._run_local_critical(
+                "recurrent provider scan",
+                check_and_start_recurrent_jules_tasks,
+                repo_name,
+                self._get_implementation_slots(repo_name),
+            )
+        except Exception as e:
+            logger.error(f"Error checking/starting recurrent Jules tasks: {e}")
+
+    def handle_stale_jules_issue_sessions(self, repo_name: str) -> List[str]:
+        """Hand issues over to backend_with_high_score when Jules times out without a PR."""
+        from .issue_processor import handle_stale_jules_issue_sessions
+
+        try:
+            stale_result = handle_stale_jules_issue_sessions(
+                repo_name,
+                self.config,
+                self.github,
+                implementation_slots=self._get_implementation_slots(repo_name),
+                authorize_dispatch=self._authorize_stale_jules_dispatch,
+                routing=self.issue_stage_routing,
+                dispatch_replacement=lambda number, issue_data, authorized, generation: self._dispatch_stale_jules_replacement(repo_name, number, issue_data, authorized, generation),
+            )
+            for action in stale_result.actions:
+                logger.info(f"Stale Jules issue session: {action}")
+            return stale_result.actions
+        except Exception as e:
+            logger.error(f"Error handling stale Jules issue sessions: {e}")
+            return []
+
+    def _dispatch_stale_jules_replacement(
+        self,
+        repo_name: str,
+        issue_number: int,
+        issue_data: Dict[str, Any],
+        authorized_issue: Dict[str, Any],
+        generation: Optional[str],
+    ) -> CandidateProcessingResult:
+        """Run the daemon's high-score fallback through Issue execution ownership."""
+        slots = self._get_implementation_slots(repo_name)
+        owner = ImplementationOwner("issue", issue_number)
+        current_snapshot: dict[str, Any] = dict(authorized_issue)
+        current_identity: Optional[str] = None
+
+        def snapshot_generation(snapshot: Dict[str, Any]) -> str:
+            parent_number = self._get_authoritative_parent_number(repo_name, issue_number, snapshot)
+            family_set = self._fetch_authoritative_decomposition_set(repo_name, parent_number) if parent_number is not None else None
+            return self._compute_implementation_generation(repo_name, snapshot, family_set)
+
+        # Authorization runs after the remote session is stopped, so its snapshot
+        # is the authority for the replacement generation.  The captured value is
+        # only legacy ownership evidence and may describe the pre-stop Issue body.
+        generation = snapshot_generation(current_snapshot)
+
+        def refresh_generation() -> Optional[str]:
+            nonlocal current_snapshot, current_identity
+            refreshed = self._authorize_stale_jules_dispatch(repo_name, issue_number, current_snapshot)
+            if refreshed is None:
+                return None
+            parent_number = self._get_authoritative_parent_number(repo_name, issue_number, refreshed)
+            family_set = self._fetch_authoritative_decomposition_set(repo_name, parent_number) if parent_number is not None else None
+            relationship = self._child_review_context(*family_set, issue_number) if family_set is not None else None
+            current_snapshot = refreshed
+            current_identity = (
+                self._get_specification_validator(repo_name)
+                .identity(
+                    issue_number,
+                    str(refreshed.get("title") or ""),
+                    str(refreshed.get("body") or ""),
+                    relationship,
+                )
+                .key
+            )
+            return self._compute_implementation_generation(repo_name, refreshed, family_set)
+
+        def dispatch(_retry: Optional[ImplementationRetryRequest]) -> CandidateProcessingResult:
+            from . import issue_processor
+            from .cli_helpers import create_high_score_backend_manager
+
+            result = CandidateProcessingResult(type="issue", number=issue_number, success=True)
+            try:
+                attempt = issue_processor.increment_attempt(repo_name, issue_number)
+                result.actions.append(f"Incremented attempt for issue #{issue_number} to {attempt}")
+            except Exception as exc:
+                logger.error("Failed to increment attempt for issue #{}: {}", issue_number, exc)
+                result.actions.append(f"Failed to increment attempt for issue #{issue_number}: {exc}")
+            backend_manager = create_high_score_backend_manager()
+            if backend_manager is None:
+                logger.warning("backend_with_high_score is not configured; using the default backend for the Jules fallback")
+            issue_data.update(current_snapshot)
+            result.actions.extend(
+                issue_processor._take_issue_actions(
+                    repo_name,
+                    issue_data,
+                    self.config,
+                    self.github,
+                    backend_manager=backend_manager,
+                    implementation_slots=slots,
+                )
+            )
+            return result
+
+        service = IssueImplementationService(self.issue_stage_routing, slots)
+        return service.execute(
+            IssueImplementationRequest(
+                repository=repo_name,
+                target_number=issue_number,
+                initial_generation=generation,
+                resume_owned_generation=True,
+            ),
+            IssueImplementationPorts(
+                refresh_generation=refresh_generation,
+                dispatch=dispatch,
+                is_draining=lambda: self.is_draining,
+                github_client=self.github if isinstance(self.github, GitHubClient) else None,
+                reconciliation_client=self.github,
+                bind_validation_identity=lambda _execution_id: current_identity is not None and slots.record_validation_identity(owner, current_identity),
+                owner_already_serialized=True,
+                reconcile_after_dispatch=False,
+            ),
+        )
+
+    def _get_specification_validator(self, repo_name: str) -> SpecificationValidationLifecycle:
+        with self._validator_cache_lock:
+            validator = self._specification_validators.get(repo_name)
+            if validator is None:
+                validator = SpecificationValidationLifecycle(repo_name, configured_provider_identity())
+                self._specification_validators[repo_name] = validator
+            return validator
+
+    def _is_issue_specification_validation_enabled(self, repo_name: str, config: Optional[AutomationConfig] = None) -> bool:
+        """Return whether individual Issue specification validation is enabled."""
+        cfg = config or self.config
+        if cfg is not None and getattr(cfg, "repo_name", None) == repo_name:
+            return bool(getattr(cfg, "issue_specification_validation", True))
+        if cfg is not None and not getattr(cfg, "issue_specification_validation", True):
+            return False
+        from .llm_backend_config import get_issue_specification_validation_from_config
+
+        return get_issue_specification_validation_from_config(repo_name=repo_name)
+
+    def _is_issue_decomposition_validation_enabled(self, repo_name: str, config: Optional[AutomationConfig] = None) -> bool:
+        """Return whether parent/child decomposition validation is enabled."""
+        cfg = config or self.config
+        if cfg is not None and getattr(cfg, "repo_name", None) == repo_name:
+            return bool(getattr(cfg, "issue_decomposition_validation", True))
+        if cfg is not None and not getattr(cfg, "issue_decomposition_validation", True):
+            return False
+        from .llm_backend_config import get_issue_decomposition_validation_from_config
+
+        return get_issue_decomposition_validation_from_config(repo_name=repo_name)
+
+    def _is_pr_adversarial_validation_enabled(self, repo_name: str, config: Optional[AutomationConfig] = None) -> bool:
+        """Return whether PR adversarial validation is enabled."""
+        cfg = config or self.config
+        if cfg is not None and getattr(cfg, "repo_name", None) == repo_name:
+            return bool(getattr(cfg, "pr_adversarial_validation", True)) and bool(getattr(cfg, "ENABLE_ADVERSARIAL_VALIDATION", True))
+        if cfg is not None and (not getattr(cfg, "pr_adversarial_validation", True) or not getattr(cfg, "ENABLE_ADVERSARIAL_VALIDATION", True)):
+            return False
+        from .llm_backend_config import get_pr_adversarial_validation_from_config
+
+        return get_pr_adversarial_validation_from_config(repo_name=repo_name)
+
+    def _is_pr_review_thread_gate_enabled(self, repo_name: str, config: Optional[AutomationConfig] = None) -> bool:
+        """Return whether PR review thread gate is enabled."""
+        cfg = config or self.config
+        if cfg is not None and getattr(cfg, "repo_name", None) == repo_name:
+            return bool(getattr(cfg, "pr_review_thread_gate", True))
+        if cfg is not None and not getattr(cfg, "pr_review_thread_gate", True):
+            return False
+        from .llm_backend_config import get_pr_review_thread_gate_from_config
+
+        return get_pr_review_thread_gate_from_config(repo_name=repo_name)
+
+    def _is_automatic_test_fix_enabled(self, repo_name: str, config: Optional[AutomationConfig] = None) -> bool:
+        """Return whether automatic test fix is enabled."""
+        cfg = config or self.config
+        if cfg is not None and getattr(cfg, "repo_name", None) == repo_name:
+            return bool(getattr(cfg, "automatic_test_fix", True))
+        if cfg is not None and not getattr(cfg, "automatic_test_fix", True):
+            return False
+        from .llm_backend_config import get_automatic_test_fix_from_config
+
+        return get_automatic_test_fix_from_config(repo_name=repo_name)
+
+    def _get_decomposition_validator(self, repo_name: str) -> DecompositionValidationLifecycle:
+        with self._validator_cache_lock:
+            validator = self._decomposition_validators.get(repo_name)
+            if validator is None:
+                validator = DecompositionValidationLifecycle(repo_name, configured_provider_identity())
+                self._decomposition_validators[repo_name] = validator
+            return validator
+
+    def _fetch_authoritative_decomposition_set(self, repo_name: str, parent_number: int) -> Optional[tuple[Dict[str, Any], List[Dict[str, Any]]]]:
+        """Reconcile every member, then fetch one stable native direct-child set."""
+        if isinstance(self.github, GitHubClient):
+            self._reconcile_declared_family(repo_name, parent_number)
+        parent = self.github.get_issue_dispatch_snapshot_strict(repo_name, parent_number)
+        if not isinstance(parent, dict) or parent.get("number") != parent_number or "pull_request" in parent:
+            return None
+        if not isinstance(self.github, GitHubClient):
+            members = self._native_direct_children(repo_name, parent_number)
+            if members is None:
+                members = []
+            if not isinstance(members, list):
+                return None
+            authoritative_children = []
+            for member in members:
+                number = member.get("number") if isinstance(member, dict) else None
+                if not isinstance(number, int) or isinstance(number, bool):
+                    return None
+                child = self.github.get_issue_dispatch_snapshot_strict(repo_name, number)
+                if not isinstance(child, dict) or child.get("number") != number or "pull_request" in child:
+                    return None
+                authoritative_children.append(child)
+            return parent, authoritative_children
+        parent = self._reconcile_parent_issue(repo_name, parent_number, parent)
+        members = self.github.get_direct_sub_issues_strict(repo_name, parent_number)
+        if not isinstance(members, list):
+            return None
+        confirmed_numbers: set[int] = set()
+        for member in members:
+            number = member.get("number") if isinstance(member, dict) else None
+            if not isinstance(number, int) or isinstance(number, bool) or number in confirmed_numbers:
+                return None
+            confirmed_numbers.add(number)
+        authoritative_children = []
+        for number in sorted(confirmed_numbers):
+            child = self.github.get_issue_dispatch_snapshot_strict(repo_name, number)
+            if not isinstance(child, dict) or child.get("number") != number or "pull_request" in child:
+                return None
+            child = self._reconcile_parent_issue(repo_name, number, child)
+            native_parent = self.github.get_parent_issue_details_strict(repo_name, number)
+            if not isinstance(child, dict) or child.get("number") != number or not isinstance(native_parent, dict) or native_parent.get("number") != parent_number:
+                raise ParentOperationalError(f"native parent for child #{number} is not #{parent_number}")
+            authoritative_children.append(child)
+        self._require_shallow_hierarchy(repo_name, parent_number, parent, authoritative_children)
+        return parent, authoritative_children
+
+    def _reconcile_declared_family(self, repo_name: str, parent_number: int) -> None:
+        """Discover declarations, then validate related HTTP snapshots.
+
+        The list is only a discovery hint. Unrelated Issues are never individually
+        refreshed here; native members and cached declarations for this parent
+        use strict readers with HTTP freshness before validation or dispatch.
+        Body-only additions absent from the list are discovered after its refresh.
+        """
+        enumerator = getattr(self.github, "get_open_issue_declarations", None)
+        if not callable(enumerator):
+            raise ParentOperationalError("cached open-Issue discovery is unavailable")
+
+        logger.info("Discovering family declarations for Issue #{} from cache-aware Issue bodies", parent_number)
+        previous: Optional[dict[int, str]] = None
+        for _attempt in range(5):
+            try:
+                open_entities = enumerator(repo_name)
+                if not isinstance(open_entities, list):
+                    raise ParentOperationalError("cached open-Issue discovery was malformed")
+                discovered: dict[int, tuple[Dict[str, Any], str]] = {}
+                seen: set[int] = set()
+                for entity in open_entities:
+                    if not isinstance(entity, dict):
+                        raise ParentOperationalError("cached open-Issue discovery was malformed")
+                    hint = parse_parent_declaration(entity.get("body"))
+                    if hint.status is not ParentDeclarationStatus.SUPPORTED or hint.parent_number != parent_number:
+                        continue
+                    number = entity.get("number")
+                    if not isinstance(number, int) or isinstance(number, bool) or number in seen:
+                        raise ParentOperationalError("cached family discovery contained an invalid or duplicate Issue")
+                    seen.add(number)
+                    snapshot = self.github.get_issue_dispatch_snapshot_strict(repo_name, number)
+                    if not isinstance(snapshot, dict) or snapshot.get("number") != number or "pull_request" in snapshot:
+                        raise ParentOperationalError(f"authoritative open Issue #{number} could not be confirmed")
+                    if not self._is_open_issue(snapshot):
+                        continue
+                    declaration = parse_parent_declaration(snapshot.get("body"))
+                    if declaration.status is ParentDeclarationStatus.SUPPORTED and declaration.parent_number == parent_number:
+                        discovered[number] = (snapshot, str(snapshot.get("body") or ""))
+
+                native = self.github.get_direct_sub_issues_strict(repo_name, parent_number)
+                if not isinstance(native, list):
+                    raise ParentOperationalError(f"cannot establish direct-child membership for Issue #{parent_number}")
+                for member in native:
+                    number = member.get("number") if isinstance(member, dict) else None
+                    if not isinstance(number, int) or isinstance(number, bool):
+                        raise ParentOperationalError(f"direct-child membership for Issue #{parent_number} was malformed")
+                    snapshot = self.github.get_issue_dispatch_snapshot_strict(repo_name, number)
+                    declaration = parse_parent_declaration(snapshot.get("body"))
+                    if declaration.status is ParentDeclarationStatus.INVALID:
+                        raise ParentSpecificationError(f"Issue #{number}: {declaration.reason or 'invalid Parent-Issue declaration'}")
+                    if declaration.status is ParentDeclarationStatus.SUPPORTED and declaration.parent_number != parent_number:
+                        raise ParentSpecificationError(f"Parent-Issue declaration #{declaration.parent_number} conflicts with native parent #{parent_number}")
+
+                for number, (snapshot, _body) in sorted(discovered.items()):
+                    self._reconcile_parent_issue(repo_name, number, snapshot)
+                generation = {number: body for number, (_snapshot, body) in discovered.items()}
+                if previous == generation:
+                    _record_issue_stage_result(
+                        parent_number,
+                        "issue.family-discovery",
+                        f"issue#{parent_number} family discovery",
+                        Outcome.COMPLETED,
+                        {"discovery_source": "cached-open-issue-list", "discovery_payload": "issue-bodies", "relationship_reads": "http-cache-freshness", "live_scope": "related-declarations-and-native-children", "declared_issue_numbers": sorted(discovered), "authorizes_execution": False},
+                    )
+                    return
+                previous = generation
+            except (ParentSpecificationError, ParentOperationalError):
+                raise
+            except Exception as exc:
+                raise ParentOperationalError(f"declaration-aware family discovery failed: {exc}") from exc
+        raise ParentOperationalError("declared family did not stabilize during authoritative discovery")
+
+    def _require_shallow_hierarchy(
+        self,
+        repo_name: str,
+        parent_number: int,
+        parent: Dict[str, Any],
+        children: List[Dict[str, Any]],
+    ) -> None:
+        """Reject a graph member that is both a child and a parent.
+
+        GitHub supports deeper sub-issue trees, but Auto-Coder's decomposition
+        contract deliberately has exactly one relationship level.  These reads
+        are strict so unavailable evidence cannot silently flatten a real tree.
+        """
+        parent_reader = getattr(self.github, "get_parent_issue_details_strict", None)
+        child_reader = getattr(self.github, "get_direct_sub_issues_strict", None)
+        if not callable(parent_reader) or not callable(child_reader):
+            raise ParentOperationalError("authoritative shallow-hierarchy readers are unavailable")
+        ancestor = parent_reader(repo_name, parent_number)
+        if ancestor is not None:
+            raise ParentSpecificationError(f"Issue #{parent_number} is both a child and a parent; nested hierarchies are unsupported")
+        for child in children:
+            number = child.get("number")
+            descendants = child_reader(repo_name, int(cast(int, number)))
+            if not isinstance(descendants, list):
+                raise ParentOperationalError(f"cannot establish direct-child membership for Issue #{number}")
+            if descendants:
+                raise ParentSpecificationError(f"Issue #{number} is both a child and a parent; nested hierarchies are unsupported")
+
+    def _complete_container_parent(
+        self,
+        repo_name: str,
+        parent_number: int,
+        decomposition_decision: DecompositionDecision,
+        child_decisions: dict[int, ValidationDecision],
+    ) -> tuple[bool, str]:
+        """Close an exactly validated, fully completed parent specification set."""
+
+        def record(completed: bool, reason: str) -> tuple[bool, str]:
+            _record_issue_stage_result(
+                parent_number,
+                "issue.container-parent-completion",
+                f"issue#{parent_number} container-parent completion",
+                Outcome.COMPLETED if completed else Outcome.DEFERRED,
+                {"parent_number": parent_number, "reason": reason},
+            )
+            return completed, reason
+
+        try:
+            current = self._fetch_authoritative_decomposition_set(repo_name, parent_number)
+            if current is None:
+                return record(False, "authoritative parent/direct-child state is unavailable")
+            parent, children = current
+            if not self._is_open_issue(parent) or not is_implementation_ready(parent):
+                return record(False, "parent is no longer open and submitted")
+            decomposition = self._get_decomposition_validator(repo_name)
+            if decomposition_decision.verdict != "READY" or decomposition.identity(parent, children) != decomposition_decision.identity:
+                return record(False, "decomposition validation identity is stale or is not READY")
+            individual = self._get_specification_validator(repo_name)
+            for child in children:
+                number = child.get("number")
+                if not isinstance(number, int) or child.get("state") != "closed":
+                    return record(False, "a direct child is no longer closed")
+                decision = child_decisions.get(number)
+                relationship = self._child_review_context(parent, children, number)
+                identity = individual.identity(number, str(child.get("title") or ""), str(child.get("body") or ""), relationship)
+                if decision is None or decision.verdict != "READY" or decision.identity != identity:
+                    return record(False, f"individual validation for child #{number} is stale or is not READY")
+            self.github.close_issue(repo_name, parent_number)
+            closed = self.github.get_issue_dispatch_snapshot_strict(repo_name, parent_number)
+            if not isinstance(closed, dict) or closed.get("state") != "closed":
+                return record(False, "GitHub did not confirm parent closure")
+            return record(True, "Completed - closed container parent after all direct children completed")
+        except Exception as exc:
+            return record(False, f"authoritative parent completion failed: {exc}")
+
+    def _native_direct_children(self, repo_name: str, issue_number: int) -> Optional[List[Dict[str, Any]]]:
+        """Read native direct children, tolerating legacy adapters without hierarchy surface.
+
+        Small legacy adapters represent only standalone Issues and expose no
+        native hierarchy readers; lane callers treat an absent surface as an
+        empty membership rather than failing admission refresh. Transport
+        errors still propagate so retry and deferral keep working.
+        """
+        reader = getattr(self.github, "get_direct_sub_issues_strict", None)
+        if not callable(reader):
+            return None
+        members = reader(repo_name, issue_number)
+        return list(members) if isinstance(members, list) else []
+
+    def _get_authoritative_parent_number(self, repo_name: str, issue_number: int, snapshot: Dict[str, Any]) -> Optional[int]:
+        """Resolve the current native parent without trusting collected hints."""
+        parent_number = snapshot.get("parent_issue_number")
+        if not isinstance(parent_number, int):
+            parent_number = parse_parent_issue_url_number(snapshot.get("parent_issue_url"))
+        if isinstance(parent_number, int):
+            return parent_number
+        parent_reader = getattr(self.github, "get_parent_issue_details_strict", None)
+        parent = parent_reader(repo_name, issue_number) if callable(parent_reader) else None
+        number = parent.get("number") if isinstance(parent, dict) else None
+        return number if isinstance(number, int) and not isinstance(number, bool) else None
+
+    def _get_authoritative_parent_or_defer(
+        self,
+        repo_name: str,
+        issue_number: int,
+        snapshot: Dict[str, Any],
+        result: CandidateProcessingResult,
+    ) -> tuple[Optional[int], Optional[CandidateProcessingResult]]:
+        """Resolve a live parent, durably retaining a typed admission refusal.
+
+        Native-parent discovery occurs more than once during common Issue
+        admission, including after the per-Issue generation lock is acquired.
+        Keep this narrow boundary shared so every lookup converts only the
+        explicitly supported, definitely-unsent refusal while all other
+        failures retain their normal error behavior.
+        """
+        try:
+            return self._get_authoritative_parent_number(repo_name, issue_number, snapshot), None
+        except Exception as exc:
+            deferred = self._defer_wrapped_reconciliation(repo_name, issue_number, snapshot, exc, result)
+            if deferred is not None:
+                return None, deferred
+            raise
+
+    def _defer_initial_issue_stabilization(self, repo_name: str, snapshot: Dict[str, Any]) -> bool:
+        """Persist creation-anchored reevaluation and report whether it is deferred."""
+        created_at = snapshot.get("created_at")
+        number = snapshot.get("number")
+        if not isinstance(created_at, str) or not isinstance(number, int):
+            return False
+        deadline = issue_stabilization_deadline(created_at)
+        if deadline is None or deadline <= time.time():
+            _record_issue_stage_result(number, "issue.creation-stabilization", f"issue#{number} creation stabilization", Outcome.COMPLETED, {"issue_number": number})
+            return False
+        self.invalidations.invalidate(EntityIdentity(repo_name, "issue", number), not_before=deadline)
+        _record_issue_stage_result(number, "issue.creation-stabilization", f"issue#{number} creation stabilization", Outcome.DEFERRED, {"issue_number": number, "deadline": deadline})
+        return True
+
+    def _reconcile_parent_issue(self, repo_name: str, issue_number: int, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        """Reconcile metadata and return only a snapshot bearing that declaration."""
+        current = snapshot
+        for _attempt in range(5):
+            declaration = parse_parent_declaration(current.get("body"))
+            try:
+                native = self.github.get_parent_issue_details_strict(repo_name, issue_number)
+            except Exception as exc:
+                raise ParentOperationalError(f"cannot read native parent: {exc}") from exc
+            native_number = native.get("number") if isinstance(native, dict) else None
+
+            if declaration.status is ParentDeclarationStatus.INVALID:
+                raise ParentSpecificationError(declaration.reason or "invalid Parent-Issue declaration")
+            if declaration.status is ParentDeclarationStatus.ABSENT:
+                return current
+            if declaration.status is ParentDeclarationStatus.SUPPORTED:
+                declared = declaration.parent_number
+                assert declared is not None
+                if declared == issue_number:
+                    raise ParentSpecificationError("an Issue cannot declare itself as its parent")
+                if isinstance(native_number, int) and native_number != declared:
+                    raise ParentSpecificationError(f"Parent-Issue declaration #{declared} conflicts with native parent #{native_number}")
+                if native_number == declared:
+                    return current
+                if native_number is None:
+                    try:
+                        target = self.github.get_issue_dispatch_snapshot_strict(repo_name, declared)
+                    except httpx.HTTPStatusError as exc:
+                        if exc.response.status_code == 404:
+                            raise ParentSpecificationError(f"declared parent #{declared} does not exist") from exc
+                        raise ParentOperationalError(f"cannot resolve declared parent #{declared}: {exc}") from exc
+                    except Exception as exc:
+                        raise ParentOperationalError(f"cannot resolve declared parent #{declared}: {exc}") from exc
+                    if not isinstance(target, dict) or target.get("number") != declared or "pull_request" in target:
+                        raise ParentSpecificationError(f"declared parent #{declared} is not an Issue in {repo_name}")
+                    if not self._is_open_issue(target):
+                        raise ParentSpecificationError(f"declared parent #{declared} is closed")
+                    try:
+                        target_parent = self.github.get_parent_issue_details_strict(repo_name, declared)
+                        child_members = self.github.get_direct_sub_issues_strict(repo_name, issue_number)
+                    except Exception as exc:
+                        raise ParentOperationalError(f"cannot validate shallow Parent-Issue relationship: {exc}") from exc
+                    if target_parent is not None:
+                        raise ParentSpecificationError(f"declared parent #{declared} is already a child; nested hierarchies are unsupported")
+                    if not isinstance(child_members, list):
+                        raise ParentOperationalError(f"cannot establish direct-child membership for Issue #{issue_number}")
+                    if child_members:
+                        raise ParentSpecificationError(f"Issue #{issue_number} is already a parent and cannot become a child")
+                    child_id = current.get("id")
+                    if not isinstance(child_id, int) or isinstance(child_id, bool):
+                        raise ParentOperationalError("authoritative child snapshot omitted its database ID")
+                    try:
+                        self.github.add_sub_issue_strict(repo_name, declared, issue_number, child_id)
+                    except InvalidSubIssueRelationshipError as exc:
+                        raise ParentSpecificationError(str(exc)) from exc
+                    except Exception as exc:
+                        raise ParentOperationalError(f"cannot materialize Parent-Issue relationship: {exc}") from exc
+
+            try:
+                refreshed = self.github.get_issue_dispatch_snapshot_strict(repo_name, issue_number)
+                refreshed_parent = self.github.get_parent_issue_details_strict(repo_name, issue_number)
+            except Exception as exc:
+                raise ParentOperationalError(f"cannot re-fetch reconciled relationship: {exc}") from exc
+            if not isinstance(refreshed, dict) or refreshed.get("number") != issue_number or "pull_request" in refreshed:
+                raise ParentOperationalError("GitHub returned an ambiguous reconciled Issue snapshot")
+            refreshed_number = refreshed_parent.get("number") if isinstance(refreshed_parent, dict) else None
+            if declaration.status is ParentDeclarationStatus.SUPPORTED and refreshed_number != declaration.parent_number:
+                raise ParentOperationalError("GitHub did not confirm the materialized Parent-Issue relationship")
+            if parse_parent_declaration(refreshed.get("body")) == declaration:
+                return refreshed
+            current = refreshed
+        raise ParentOperationalError("Parent-Issue declaration did not stabilize during reconciliation")
+
+    def _reconcile_validation_snapshot(self, repo_name: str, issue_number: int, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        """Reconcile declarations on an authoritative validation input."""
+        if isinstance(self.github, GitHubClient) and parse_parent_declaration(snapshot.get("body")).status is not ParentDeclarationStatus.ABSENT:
+            return self._reconcile_parent_issue(repo_name, issue_number, snapshot)
+        return snapshot
+
+    def _dependency_family_lock(self, repo_name: str, parent_number: int) -> threading.RLock:
+        with self._dependency_family_locks_guard:
+            return self._dependency_family_locks.setdefault((repo_name, parent_number), threading.RLock())
+
+    def _reject_sibling_dependency(self, repo_name: str, issue_number: int, parent_number: int, body: str, reason: str) -> None:
+        """Finish every still-current rejection effect independently."""
+        digest = hashlib.sha256(f"{body}\0{parent_number}\0{reason}".encode()).hexdigest()
+        marker = f"<!-- {INVALID_DEPENDENCY_MARKER_PREFIX}:{digest} -->"
+        failures: list[str] = []
+        try:
+            current = self.github.get_issue_dispatch_snapshot_strict(repo_name, issue_number)
+            native_parent = self.github.get_parent_issue_details_strict(repo_name, issue_number)
+            if current.get("body") != body or not isinstance(native_parent, dict) or native_parent.get("number") != parent_number:
+                return
+            comments = self.github.get_issue_comments_strict(repo_name, issue_number)
+            if not any(marker in str(comment.get("body") or "") for comment in comments if isinstance(comment, dict)):
+                self.github.add_comment_to_issue(
+                    repo_name,
+                    issue_number,
+                    f"{marker}\n## Auto-Coder sibling dependency validation\n\n"
+                    f"Implementation submission is withdrawn because `{reason}`. `Blocked-By` may name only distinct Issues "
+                    f"whose authoritative direct parent is #{parent_number}; use comma-separated local references such as `Blocked-By: #123, #456`. "
+                    f"The readiness submission on Issue #{issue_number} and its authoritative parent #{parent_number} is being withdrawn.",
+                )
+        except Exception as exc:
+            failures.append(f"diagnostic: {exc}")
+        for target in (issue_number, parent_number):
+            try:
+                current = self.github.get_issue_dispatch_snapshot_strict(repo_name, issue_number)
+                native_parent = self.github.get_parent_issue_details_strict(repo_name, issue_number)
+                if current.get("body") != body or not isinstance(native_parent, dict) or native_parent.get("number") != parent_number:
+                    return
+                target_snapshot = current if target == issue_number else self.github.get_issue_dispatch_snapshot_strict(repo_name, target)
+                if is_implementation_ready(target_snapshot):
+                    self.github.remove_labels(repo_name, target, [IMPLEMENTATION_READY_LABEL])
+            except Exception as exc:
+                failures.append(f"label #{target}: {exc}")
+        if failures:
+            raise ParentOperationalError("dependency rejection effects remain incomplete: " + "; ".join(failures))
+
+    def _reconcile_sibling_dependencies(self, repo_name: str, issue_number: int, snapshot: Dict[str, Any]) -> DependencySatisfaction:
+        """Materialize and gate a complete sibling dependency family from live REST evidence."""
+        parent_decl = parse_parent_declaration(snapshot.get("body"))
+        if parent_decl.status is ParentDeclarationStatus.SUPPORTED:
+            snapshot = self._reconcile_parent_issue(repo_name, issue_number, snapshot)
+        parent_decl = parse_parent_declaration(snapshot.get("body"))
+        native_parent = self.github.get_parent_issue_details_strict(repo_name, issue_number)
+        parent_number = native_parent.get("number") if isinstance(native_parent, dict) else None
+        standalone = native_parent is None and parent_decl.status is ParentDeclarationStatus.ABSENT
+        declaration = parse_blocked_by_declaration(snapshot.get("body"), parent_decl.status, standalone=standalone)
+        if standalone and declaration.status is BlockedByDeclarationStatus.SUPPORTED and declaration.dependencies == frozenset():
+            return DependencySatisfaction.SATISFIED
+        if declaration.status is BlockedByDeclarationStatus.INVALID and isinstance(parent_number, int):
+            self._reject_sibling_dependency(repo_name, issue_number, parent_number, str(snapshot.get("body") or ""), declaration.reason or "invalid Blocked-By declaration")
+            return DependencySatisfaction.INVALID
+        if declaration.status is BlockedByDeclarationStatus.ABSENT and not isinstance(parent_number, int):
+            return DependencySatisfaction.SATISFIED
+        if not isinstance(parent_number, int):
+            raise ParentOperationalError("dependency parent relationship is not yet materialized")
+
+        with self._dependency_family_lock(repo_name, parent_number):
+            # Materialize supported parent declarations before sibling membership is judged.
+            current = snapshot
+            declaration = parse_blocked_by_declaration(current.get("body"), parse_parent_declaration(current.get("body")).status)
+            desired_refs = set(declaration.dependencies or ()) if declaration.status is BlockedByDeclarationStatus.SUPPORTED else set()
+            for number in sorted(desired_refs):
+                target = self.github.get_issue_dispatch_snapshot_strict(repo_name, number)
+                target_parent_decl = parse_parent_declaration(target.get("body"))
+                if target_parent_decl.status is ParentDeclarationStatus.SUPPORTED:
+                    self._reconcile_parent_issue(repo_name, number, target)
+
+            parent_snapshot = self.github.get_issue_dispatch_snapshot_strict(repo_name, parent_number)
+            members = self.github.get_direct_sub_issues_strict(repo_name, parent_number)
+            member_numbers = {int(member["number"]) for member in members}
+            children = []
+            for number in sorted(member_numbers):
+                child = self.github.get_issue_dispatch_snapshot_strict(repo_name, number)
+                child_parent_decl = parse_parent_declaration(child.get("body"))
+                if child_parent_decl.status is ParentDeclarationStatus.SUPPORTED:
+                    child = self._reconcile_parent_issue(repo_name, number, child)
+                children.append(child)
+            confirmed_members = self.github.get_direct_sub_issues_strict(repo_name, parent_number)
+            if {int(member["number"]) for member in confirmed_members} != member_numbers:
+                raise ParentOperationalError("authoritative dependency family changed during observation")
+            if parent_snapshot.get("number") != parent_number:
+                raise ParentOperationalError("authoritative dependency parent is unavailable")
+            evidence: dict[int, IssueEvidence] = {}
+            referenced: set[int] = set()
+            native_by_child: dict[int, frozenset[int]] = {}
+            snapshots = {int(child["number"]): child for child in children}
+            for number, child in snapshots.items():
+                native_items = self.github.get_blocked_by_strict(repo_name, number)
+                native = frozenset(int(item["number"]) for item in native_items)
+                native_by_child[number] = native
+                child_decl = parse_blocked_by_declaration(child.get("body"), parse_parent_declaration(child.get("body")).status)
+                referenced.update(native)
+                referenced.update(child_decl.dependencies or ())
+                evidence[number] = IssueEvidence(number, repo_name, IssueType.ISSUE, IssueState.CLOSED if child.get("state") == "closed" else IssueState.OPEN, parent_number, str(child.get("body") or ""), native)
+            for number in referenced - set(evidence):
+                try:
+                    target = self.github.get_issue_dispatch_snapshot_strict(repo_name, number)
+                except httpx.HTTPStatusError as exc:
+                    if exc.response.status_code == 404:
+                        evidence[number] = IssueEvidence(number, repo_name, IssueType.ISSUE, IssueState.UNAVAILABLE, None, "", frozenset(), True)
+                        continue
+                    raise
+                target_parent = self.github.get_parent_issue_details_strict(repo_name, number)
+                evidence[number] = IssueEvidence(
+                    number,
+                    repo_name,
+                    IssueType.PULL_REQUEST if "pull_request" in target else IssueType.ISSUE,
+                    IssueState.CLOSED if target.get("state") == "closed" else IssueState.OPEN,
+                    target_parent.get("number") if isinstance(target_parent, dict) else None,
+                    str(target.get("body") or ""),
+                    frozenset(),
+                )
+
+            graph = evaluate_family_graph(evidence, parent_number, repo_name)
+            invalid = [(number, result) for number, result in graph.results.items() if result.is_valid_graph is GraphValidity.INVALID]
+            if invalid:
+                for number, result in invalid:
+                    child = snapshots[number]
+                    self._reject_sibling_dependency(repo_name, number, parent_number, str(child.get("body") or ""), result.reason or "invalid desired dependency graph")
+                return DependencySatisfaction.INVALID
+            if any(result.is_valid_graph is GraphValidity.UNRESOLVED for result in graph.results.values()):
+                raise ParentOperationalError("desired sibling dependency graph is unresolved")
+
+            # No graph mutation starts until every family declaration has passed.
+            for number, result in graph.results.items():
+                if result.declaration_status is not BlockedByDeclarationStatus.SUPPORTED:
+                    continue
+                desired = set(result.desired_dependencies or ())
+                actual = set(native_by_child[number])
+                for dependency_number in sorted(actual - desired):
+                    declaring = self.github.get_issue_dispatch_snapshot_strict(repo_name, number)
+                    declaring_parent = self.github.get_parent_issue_details_strict(repo_name, number)
+                    if declaring.get("body") != snapshots[number].get("body") or not isinstance(declaring_parent, dict) or declaring_parent.get("number") != parent_number:
+                        raise ParentOperationalError("dependency declaration or family membership changed before mutation")
+                    dependency = self.github.get_issue_dispatch_snapshot_strict(repo_name, dependency_number)
+                    self.github.mutate_blocked_by_strict(repo_name, number, int(dependency["id"]), add=False)
+                for dependency_number in sorted(desired - actual):
+                    declaring = self.github.get_issue_dispatch_snapshot_strict(repo_name, number)
+                    declaring_parent = self.github.get_parent_issue_details_strict(repo_name, number)
+                    if declaring.get("body") != snapshots[number].get("body") or not isinstance(declaring_parent, dict) or declaring_parent.get("number") != parent_number:
+                        raise ParentOperationalError("dependency declaration or family membership changed before mutation")
+                    dependency = self.github.get_issue_dispatch_snapshot_strict(repo_name, dependency_number)
+                    self.github.mutate_blocked_by_strict(repo_name, number, int(dependency["id"]), add=True)
+
+            # A complete family readback (including reverse edges) fences lost responses and stale writes.
+            for number, result in graph.results.items():
+                incoming = self.github.get_blocked_by_strict(repo_name, number)
+                self.github.get_blocking_strict(repo_name, number)
+                expected = set(result.desired_dependencies or ())
+                if {int(item["number"]) for item in incoming} != expected:
+                    raise ParentOperationalError("native dependency graph did not confirm desired equality")
+                latest = self.github.get_issue_dispatch_snapshot_strict(repo_name, number)
+                if latest.get("body") != snapshots[number].get("body"):
+                    raise ParentOperationalError("dependency declaration changed during reconciliation")
+            return graph.results.get(issue_number, next(iter(graph.results.values()))).satisfaction
+
+    def _preflight_explicit_issue_relationships(self, repo_name: str, issue_number: int, *, refresh_all: bool = False) -> Dict[str, Any]:
+        """Complete the target hierarchy using cache-aware discovery at --only startup.
+
+        This deliberately performs no validation or implementation work.  The
+        repository-wide discovery only finds declarations which can
+        change the target's native direct-child set; all policy decisions happen
+        later, from a validated HTTP snapshot. Normal callers use cached discovery;
+        explicit startup honors discovery and related-Issue HTTP cache expiry.
+        """
+        enumerator = getattr(self.github, "get_open_issue_declarations", None)
+        if not callable(enumerator):
+            raise ParentOperationalError("open-Issue discovery is unavailable")
+        try:
+            discovery = enumerator(repo_name)
+            open_entities = discovery
+            if not isinstance(open_entities, list):
+                raise ParentOperationalError("open-Issue discovery was malformed")
+            declarations = {}
+            for entity in open_entities:
+                number = entity.get("number") if isinstance(entity, dict) else None
+                if not isinstance(number, int) or isinstance(number, bool) or number in declarations:
+                    raise ParentOperationalError("open-Issue discovery contained an invalid or duplicate Issue")
+                declarations[number] = parse_parent_declaration(entity.get("body"))
+
+            target = self.github.get_issue_dispatch_snapshot_strict(repo_name, issue_number)
+            if not isinstance(target, dict) or target.get("number") != issue_number or "pull_request" in target:
+                raise ParentOperationalError(f"explicit Issue #{issue_number} could not be confirmed")
+            declarations[issue_number] = parse_parent_declaration(target.get("body"))
+            if declarations[issue_number].status is ParentDeclarationStatus.INVALID:
+                raise ParentSpecificationError(f"Issue #{issue_number}: {declarations[issue_number].reason or 'invalid Parent-Issue declaration'}")
+            target_native = self.github.get_parent_issue_details_strict(repo_name, issue_number)
+            native_parent = target_native.get("number") if isinstance(target_native, dict) else None
+            target_declaration = declarations[issue_number]
+            declared_parent = target_declaration.parent_number if target_declaration.status is ParentDeclarationStatus.SUPPORTED else None
+            if isinstance(native_parent, int) and isinstance(declared_parent, int) and native_parent != declared_parent:
+                raise ParentSpecificationError(f"Parent-Issue declaration #{declared_parent} conflicts with native parent #{native_parent}")
+            affected_parent = declared_parent if isinstance(declared_parent, int) else native_parent
+
+            target_children = self.github.get_direct_sub_issues_strict(repo_name, issue_number)
+            if not isinstance(target_children, list):
+                raise ParentOperationalError(f"cannot establish direct-child membership for Issue #{issue_number}")
+            native_child_numbers: set[int] = set()
+            for child in target_children:
+                child_number = child.get("number") if isinstance(child, dict) else None
+                if isinstance(child_number, int) and not isinstance(child_number, bool):
+                    native_child_numbers.add(child_number)
+            if len(native_child_numbers) != len(target_children):
+                raise ParentOperationalError(f"direct-child membership for Issue #{issue_number} was malformed")
+            if affected_parent is None and (native_child_numbers or any(declaration.parent_number == issue_number for declaration in declarations.values())):
+                affected_parent = issue_number
+
+            if affected_parent is not None:
+                self._reconcile_parent_issue(repo_name, issue_number, target)
+                if refresh_all:
+                    # Materialize newly discovered declarations even when they
+                    # are absent from both the list cache and native membership.
+                    for number, declaration in sorted(declarations.items()):
+                        if number == issue_number or declaration.parent_number != affected_parent:
+                            continue
+                        snapshot = self.github.get_issue_dispatch_snapshot_strict(repo_name, number)
+                        current_declaration = parse_parent_declaration(snapshot.get("body"))
+                        if self._is_open_issue(snapshot) and current_declaration.status is ParentDeclarationStatus.SUPPORTED and current_declaration.parent_number == affected_parent:
+                            self._reconcile_parent_issue(repo_name, number, snapshot)
+                authoritative_set = self._fetch_authoritative_decomposition_set(repo_name, affected_parent)
+                if authoritative_set is None:
+                    raise ParentOperationalError(f"cannot re-read reconciled hierarchy for parent #{affected_parent}")
+
+            refreshed = self.github.get_issue_dispatch_snapshot_strict(repo_name, issue_number)
+            if not isinstance(refreshed, dict) or refreshed.get("number") != issue_number or "pull_request" in refreshed:
+                raise ParentOperationalError("GitHub returned an ambiguous explicit target after relationship preflight")
+            if refresh_all:
+                _record_issue_stage_result(
+                    issue_number,
+                    "issue.explicit-relationship-discovery",
+                    f"issue#{issue_number} explicit relationship discovery",
+                    Outcome.COMPLETED,
+                    {"discovery_source": "cache-aware-open-issue-list", "discovery_payload": "issue-bodies", "relationship_reads": "http-cache-freshness", "live_scope": "target-and-related-family", "authorizes_execution": False},
+                )
+            return refreshed
+        except ParentSpecificationError:
+            raise
+        except ParentOperationalError:
+            raise
+        except Exception as exc:
+            raise ParentOperationalError(f"explicit relationship preflight failed: {exc}") from exc
+
+    @staticmethod
+    def _traced_validation_job(
+        repo_name: str,
+        item_number: int,
+        stage_id: str,
+        label: str,
+        facts: Optional[Dict[str, Any]],
+        fn: Any,
+    ) -> Any:
+        """Run a validation-scheduler operation inside its own fresh execution scope.
+
+        ``ValidationScheduler.submit`` copies the submitting thread's
+        contextvars into the worker-pool thread that runs ``fn``, which
+        would otherwise make this asynchronous job's diagnostic evidence
+        appear to belong to whichever worker most recently opened a scope
+        for the parent Issue. Opening a fresh ``ExecutionScope`` here, before
+        calling ``fn``, gives the job its own execution identity (REQ-002)
+        instead of borrowing the caller's.
+
+        A diagnostic-recorder failure (opening the scope or recording the
+        result) is caught and logged rather than allowed to prevent ``fn``
+        from running or to change the decision it returns (REQ-008).
+
+        This is also the single shared choke point for durable review-audit
+        recording (Issue #1984): every standalone, forced/explicit,
+        retained-owner-reevaluation, parent/child-scheduling, and
+        pending-work-resumption path funnels its ``decide()`` call through
+        here (see ``_submit_individual_validation``, ``_schedule_parent_validations``,
+        and ``IssueReviewService``'s injected ``trace_job``), so wrapping
+        ``fn`` with ``issue_review_audit.run_traced_review`` here — instead
+        of inside the lifecycles themselves — covers every caller with one
+        implementation. That wrapping is itself best-effort and
+        non-authorizing (REQ-007): it never changes ``fn``'s return value or
+        raised exception.
+        """
+        collector = get_trace_collector()
+
+        def run_audited() -> Any:
+            return issue_review_audit.run_traced_review(
+                repository=repo_name,
+                target_number=item_number,
+                stage_id=stage_id,
+                facts=facts,
+                origin="automation_engine._traced_validation_job",
+                fn=fn,
+            )
+
+        try:
+            handle_cm = collector.start_execution(
+                repository=repo_name,
+                item_type="issue",
+                item_number=item_number,
+                origin="validation-scheduler",
+                stage_id=stage_id,
+                label=label,
+                facts=facts,
+            )
+        except Exception:
+            logger.opt(exception=True).debug("Diagnostic trace recording failed opening validation scope for issue#{}; continuing untraced", item_number)
+            return run_audited()
+        with handle_cm as handle:
+            try:
+                decision = run_audited()
+            except BaseException:
+                try:
+                    handle.set_outcome(Outcome.FAILED)
+                except Exception:
+                    logger.opt(exception=True).debug("Diagnostic trace recording failed for issue#{} validation job; continuing", item_number)
+                raise
+            verdict = getattr(decision, "verdict", None)
+            verdict_outcomes = {"READY": Outcome.COMPLETED, "BLOCKED": Outcome.BLOCKED, "ERROR": Outcome.FAILED}
+            outcome = verdict_outcomes.get(verdict, Outcome.UNKNOWN) if isinstance(verdict, str) else Outcome.UNKNOWN
+            try:
+                handle.set_outcome(outcome)
+                collector.record_event(
+                    EventKind.STAGE_RESULT,
+                    stage_id=stage_id,
+                    origin="validation-scheduler",
+                    label=label,
+                    outcome=outcome,
+                    facts={**(facts or {}), "verdict": verdict, "evaluation_source": getattr(decision, "evaluation_source", "unrecorded")},
+                )
+            except Exception:
+                logger.opt(exception=True).debug("Diagnostic trace recording failed for issue#{} validation job; continuing", item_number)
+            return decision
+
+    def _submit_individual_validation(
+        self,
+        repo_name: str,
+        item_number: int,
+        identity_key: str,
+        operation: Any,
+        origin: str,
+        scheduler: Optional[ValidationScheduler] = None,
+        audit_identity: Any = None,
+    ) -> ValidationJob[ValidationDecision]:
+        """Submit every individual review through the diagnostic job boundary.
+
+        The scheduler may return an existing future.  The producing operation is
+        therefore traced inside the submitted callable, while this caller records
+        only that it queued or joined the exact identity.  Diagnostic failures are
+        deliberately isolated by the existing collector APIs.
+        """
+        facts: Dict[str, Any] = {
+            "issue_number": item_number,
+            "review_kind": "individual",
+            "validation_identity": identity_key,
+            "caller_origin": origin,
+            "audit_identity": audit_identity,
+            "audit_queued_time": datetime.now(timezone.utc).isoformat(),
+        }
+        _record_issue_stage_result(
+            item_number,
+            "issue.individual-validation-observation",
+            f"issue#{item_number} individual validation observation",
+            Outcome.DEFERRED,
+            {**facts, "observation": "submitted-or-joined"},
+        )
+        bound = scheduler if scheduler is not None else self.validation_scheduler
+        return bound.submit(
+            f"individual:{identity_key}",
+            partial(
+                self._traced_validation_job,
+                repo_name,
+                item_number,
+                "issue.individual-validation-job",
+                f"issue#{item_number} individual validation job",
+                facts,
+                operation,
+            ),
+        )
+
+    @staticmethod
+    def _consume_individual_validation(
+        item_number: int,
+        identity_key: str,
+        job: ValidationJob[ValidationDecision],
+        origin: str,
+    ) -> ValidationDecision:
+        """Observe a shared result without claiming the producer's execution."""
+        try:
+            decision = job.result()
+        except BaseException as exc:
+            outcome = Outcome.CANCELLED if isinstance(exc, (asyncio.CancelledError, ValidationAdmissionDeferred)) else Outcome.FAILED
+            _record_issue_stage_result(
+                item_number,
+                "issue.individual-validation-observation",
+                f"issue#{item_number} individual validation observation",
+                outcome,
+                {"review_kind": "individual", "validation_identity": identity_key, "caller_origin": origin, "observation": "consume-error"},
+            )
+            raise
+        verdict = decision.verdict
+        decision_identity = getattr(getattr(decision, "identity", None), "key", identity_key)
+        outcome = {"READY": Outcome.COMPLETED, "BLOCKED": Outcome.BLOCKED, "ERROR": Outcome.FAILED}.get(verdict, Outcome.UNKNOWN)
+        _record_issue_stage_result(
+            item_number,
+            "issue.individual-validation-observation",
+            f"issue#{item_number} individual validation observation",
+            outcome,
+            {
+                "review_kind": "individual",
+                "validation_identity": identity_key,
+                "decision_identity": decision_identity,
+                "caller_origin": origin,
+                "observation": "consumed",
+                "verdict": verdict,
+                "evaluation_source": getattr(decision, "evaluation_source", "unrecorded"),
+            },
+        )
+        return decision
+
+    def _schedule_parent_validations(
+        self,
+        repo_name: str,
+        authoritative_set: tuple[Dict[str, Any], List[Dict[str, Any]]],
+        config: Optional[AutomationConfig] = None,
+        selected_child_number: Optional[int] = None,
+        scheduler: Optional[ValidationScheduler] = None,
+    ) -> tuple[Optional[ValidationJob[DecompositionDecision]], dict[int, ValidationJob[ValidationDecision]]]:
+        """Eagerly submit a stable parent generation under the given bound.
+
+        The default shared bound preserves the historical eager paths; Review
+        production callers pass the independent review scheduler (REQ-009).
+        """
+        parent, children = authoritative_set
+        parent_number = int(parent["number"])
+        if isinstance(self.github, GitHubClient):
+            waiting = False
+            for member in [parent, *children]:
+                created_at = member.get("created_at")
+                number = member.get("number")
+                if not isinstance(created_at, str) or not isinstance(number, int) or issue_stabilization_deadline(created_at) is None:
+                    logger.warning("Family reconciliation deferred for {}/#{}: unavailable creation timestamp on Issue #{}", repo_name, parent_number, number)
+                    raise ValidationAdmissionDeferred("family member creation timestamp is unavailable")
+                waiting = self._defer_initial_issue_stabilization(repo_name, member) or waiting
+            if waiting:
+                logger.info("Family reconciliation waiting for creation deadlines for {}/#{}", repo_name, parent_number)
+                raise ValidationAdmissionDeferred("family creation stabilization deadline has not passed")
+        member_numbers = sorted(int(child["number"]) for child in children)
+        set_job: Optional[ValidationJob[DecompositionDecision]] = None
+        if self._is_issue_decomposition_validation_enabled(repo_name, config):
+            decomposition = self._get_decomposition_validator(repo_name)
+            set_identity = decomposition.identity(parent, children)
+            parent_manifest = build_normative_issue_manifest(int(parent["number"]), str(parent.get("title") or ""), str(parent.get("body") or ""))
+            child_inputs = [
+                DecompositionIssue(
+                    build_normative_issue_manifest(int(child["number"]), str(child.get("title") or ""), str(child.get("body") or "")),
+                    str(child.get("body") or ""),
+                )
+                for child in children
+            ]
+            bound = scheduler if scheduler is not None else self.validation_scheduler
+            set_job = bound.submit(
+                f"decomposition:{set_identity.key}",
+                lambda: self._traced_validation_job(
+                    repo_name,
+                    parent_number,
+                    "issue.decomposition-validation-job",
+                    f"issue#{parent_number} decomposition validation job",
+                    {
+                        "parent_number": parent_number,
+                        "member_issue_numbers": member_numbers,
+                        "validation_identity": set_identity.key,
+                        "audit_identity": set_identity,
+                        "audit_queued_time": datetime.now(timezone.utc).isoformat(),
+                    },
+                    lambda: decomposition.decide(set_identity, DecompositionIssue(parent_manifest, str(parent.get("body") or "")), child_inputs),
+                ),
+            )
+        else:
+            _record_issue_stage_result(
+                parent_number,
+                "issue.decomposition-validation-job",
+                f"issue#{parent_number} decomposition validation job",
+                Outcome.SKIPPED,
+                {"parent_number": parent_number, "member_issue_numbers": member_numbers, "reason": "decomposition validation is disabled"},
+            )
+            # This is a genuine "would have reviewed but the flag says no"
+            # decision point feeding directly into scheduling (Issue #1984,
+            # REQ-001, REQ-003): no LLM job or authorization decision is
+            # created for this generation, so it is recorded as a durable
+            # BYPASSED observation rather than silently producing no audit
+            # trail at all.
+            issue_review_audit.record_bypassed(
+                repository=repo_name,
+                target_number=parent_number,
+                review_kind=issue_review_audit.REVIEW_KIND_ISSUE_DECOMPOSITION,
+                origin="automation_engine._schedule_parent_validations:disabled",
+            )
+        child_jobs: dict[int, ValidationJob[ValidationDecision]] = {}
+        if self._is_issue_specification_validation_enabled(repo_name, config):
+            individual = self._get_specification_validator(repo_name)
+            for child in children:
+                number = int(child["number"])
+                if selected_child_number is not None and number != selected_child_number:
+                    continue
+                if not self._is_authoritatively_open_issue(child):
+                    continue
+                title = str(child.get("title") or "")
+                body = str(child.get("body") or "")
+                manifest = build_normative_issue_manifest(number, title, body)
+                relationship_context = self._child_review_context(parent, children, number)
+                identity = individual.identity(number, title, body, relationship_context)
+                child_jobs[number] = self._submit_individual_validation(
+                    repo_name,
+                    number,
+                    identity.key,
+                    partial(individual.decide, manifest, title, body, relationship_context),
+                    "parent-child-scheduling",
+                    scheduler,
+                    identity,
+                )
+        else:
+            # Mirrors the decomposition-disabled BYPASSED observation above,
+            # one per child that would otherwise have been individually
+            # reviewed as part of this family generation.
+            for child in children:
+                number = int(child["number"])
+                if selected_child_number is not None and number != selected_child_number:
+                    continue
+                if not self._is_authoritatively_open_issue(child):
+                    continue
+                issue_review_audit.record_bypassed(
+                    repository=repo_name,
+                    target_number=number,
+                    review_kind=issue_review_audit.REVIEW_KIND_ISSUE_SPECIFICATION,
+                    origin="automation_engine._schedule_parent_validations:disabled",
+                )
+        return set_job, child_jobs
+
+    @staticmethod
+    def _child_review_context(parent: Dict[str, Any], children: List[Dict[str, Any]], issue_number: int) -> IndividualRelationshipContext:
+        """Serialize only caller-reconciled graph evidence for child analysis."""
+
+        def contract(issue: Dict[str, Any]) -> dict[str, object]:
+            number = int(issue["number"])
+            title = str(issue.get("title") or "")
+            body = str(issue.get("body") or "")
+            manifest = build_normative_issue_manifest(number, title, body)
+            return {
+                "issue_number": number,
+                "relationship": "parent" if number == int(parent["number"]) else "sibling",
+                "title": title,
+                "normative_manifest": [{"requirement_id": item.requirement_id, "text": item.text} for item in manifest.requirements],
+                "body_non_normative_evidence": body,
+            }
+
+        related = [contract(parent)] + [contract(child) for child in children if int(child["number"]) != issue_number]
+        return IndividualRelationshipContext(
+            role="child",
+            related_contracts=json.dumps(related, ensure_ascii=False, indent=2),
+            parent_number=int(parent["number"]),
+        )
+
+    def _authorize_and_apply_blocked(
+        self,
+        validator: SpecificationValidationLifecycle,
+        github: object,
+        decision: ValidationDecision,
+        submission_is_current: Optional[Callable[[], bool]] = None,
+    ) -> Optional[str]:
+        """Publish a standalone BLOCKED decision without initiating repair.
+
+        Publication and readiness withdrawal are review effects.  With no
+        specification editor configured, they must not reserve an automatic
+        repair generation or pretend that one completed.
+        """
+        return validator.apply_blocked(github, decision, submission_is_current)
+
+    def _authorize_and_apply_inherited_blocked(
+        self,
+        validator: SpecificationValidationLifecycle,
+        github: object,
+        decision: ValidationDecision,
+        set_is_current: Callable[[], bool],
+    ) -> Optional[str]:
+        """Publish an inherited-child BLOCKED decision without initiating repair."""
+        return validator.apply_inherited_blocked(github, decision, set_is_current)
+
+    def _authorize_and_apply_decomposition_blocked(
+        self,
+        validator: DecompositionValidationLifecycle,
+        github: object,
+        decision: DecompositionDecision,
+        fetch_set: Callable[[int], Optional[tuple[Dict[str, Any], List[Dict[str, Any]]]]],
+    ) -> Optional[str]:
+        """Publish a decomposition BLOCKED decision without initiating repair."""
+        return validator.apply_blocked(github, decision, fetch_set)
+
+    def _family_individual_identities_match(
+        self,
+        validator: SpecificationValidationLifecycle,
+        current_set: tuple[Dict[str, Any], List[Dict[str, Any]]],
+        decisions: dict[int, ValidationDecision],
+    ) -> bool:
+        """Require exact-current individual evidence for every direct child."""
+        parent, children = current_set
+        open_children = [child for child in children if self._is_authoritatively_open_issue(child)]
+        if set(decisions) != {int(child["number"]) for child in open_children}:
+            return False
+        for child in open_children:
+            number = int(child["number"])
+            relationship = self._child_review_context(parent, children, number)
+            identity = validator.identity(number, str(child.get("title") or ""), str(child.get("body") or ""), relationship)
+            if decisions[number].identity != identity:
+                return False
+        return True
+
+    def _join_parent_validations(
+        self,
+        decomposition_job: Optional[ValidationJob[DecompositionDecision]],
+        child_jobs: dict[int, ValidationJob[ValidationDecision]],
+    ) -> tuple[Optional[DecompositionDecision], dict[int, ValidationDecision]]:
+        """Join a submitted batch completely before propagating any failure."""
+        decomposition_decision: Optional[DecompositionDecision] = None
+        child_decisions: dict[int, ValidationDecision] = {}
+        first_error: Optional[BaseException] = None
+        if decomposition_job is not None:
+            try:
+                decomposition_decision = decomposition_job.result()
+                decomposition_identity = getattr(decomposition_decision, "identity", None)
+                parent_identity = getattr(decomposition_identity, "parent", None)
+                ambient_scope = current_scope()
+                parent_number = getattr(parent_identity, "issue_number", ambient_scope.item_number if ambient_scope is not None else -1)
+                identity_key = getattr(decomposition_identity, "key", decomposition_job.identity_key.removeprefix("decomposition:"))
+                _record_issue_stage_result(
+                    parent_number,
+                    "issue.decomposition-validation-observation",
+                    f"issue#{parent_number} decomposition validation observation",
+                    {"READY": Outcome.COMPLETED, "BLOCKED": Outcome.BLOCKED, "ERROR": Outcome.FAILED}.get(decomposition_decision.verdict, Outcome.UNKNOWN),
+                    {
+                        "review_kind": "decomposition",
+                        "validation_identity": identity_key,
+                        "observation": "consumed",
+                        "verdict": decomposition_decision.verdict,
+                    },
+                )
+            except BaseException as exc:
+                first_error = exc
+        for number, job in child_jobs.items():
+            try:
+                identity_key = job.identity_key.removeprefix("individual:")
+                child_decisions[number] = self._consume_individual_validation(number, identity_key, job, "parent-child-consumer")
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
+        return decomposition_decision, child_decisions
+
+    def _standalone_relationship_is_current(self, repo_name: str, issue_number: int, snapshot: Dict[str, Any]) -> bool:
+        """Reject and, when blocked, apply a parent submission discovered late."""
+        if isinstance(self.github, GitHubClient):
+            snapshot = self._preflight_explicit_issue_relationships(repo_name, issue_number)
+        parent_number = self._get_authoritative_parent_number(repo_name, issue_number, snapshot)
+        if parent_number is None:
+            return True
+        authoritative_set = self._fetch_authoritative_decomposition_set(repo_name, parent_number)
+        if authoritative_set is None or issue_number not in {child.get("number") for child in authoritative_set[1]}:
+            return False
+        if is_implementation_ready(authoritative_set[0]):
+            if self._defer_initial_issue_stabilization(repo_name, authoritative_set[0]):
+                return False
+            if self._is_issue_decomposition_validation_enabled(repo_name):
+                validator = self._get_decomposition_validator(repo_name)
+                decomposition_job, child_jobs = self._schedule_parent_validations(repo_name, authoritative_set)
+                decision, _ = self._join_parent_validations(decomposition_job, child_jobs)
+                if decision is not None and decision.verdict == "BLOCKED":
+                    self._authorize_and_apply_decomposition_blocked(
+                        validator,
+                        self.github,
+                        decision,
+                        lambda number: self._fetch_authoritative_decomposition_set(repo_name, number),
+                    )
+        # Even READY was obtained after individual validation started, so this
+        # attempt must restart through the ordered set-before-child workflow.
+        return False
+
+    def _standalone_validation_is_current(self, repo_name: str, decision: ValidationDecision) -> bool:
+        """Verify that an individual identity is still the required standalone identity."""
+        snapshot = self.github.get_issue_dispatch_snapshot_strict(repo_name, decision.identity.issue_number)
+        if not isinstance(snapshot, dict) or not self._is_open_issue(snapshot) or not is_implementation_ready(snapshot):
+            return False
+        if isinstance(self.github, GitHubClient):
+            snapshot = self._reconcile_parent_issue(repo_name, decision.identity.issue_number, snapshot)
+        validator = self._get_specification_validator(repo_name)
+        if validator.identity(decision.identity.issue_number, str(snapshot.get("title") or ""), str(snapshot.get("body") or "")) != decision.identity:
+            return False
+        if self._get_authoritative_parent_number(repo_name, decision.identity.issue_number, snapshot) is not None:
+            return False
+        child_reader = getattr(self.github, "get_direct_sub_issues_strict", None)
+        children = child_reader(repo_name, decision.identity.issue_number) if callable(child_reader) else []
+        return isinstance(children, list) and not children
+
+    def _validate_submitted_parent_generation_for_child(
+        self,
+        repo_name: str,
+        issue_number: int,
+        snapshot: Dict[str, Any],
+        *,
+        target_only: bool = False,
+        relationships_preflight_done: bool = False,
+    ) -> None:
+        """Materialize validation evidence triggered by one authoritative child change.
+
+        Webhooks invalidate only the edited Issue.  Resolve its live relationship
+        before closed-state and implementation-owner filtering so those concerns
+        cannot consume the invalidation without validating the changed set.
+        """
+        declaration = parse_parent_declaration(snapshot.get("body"))
+        if isinstance(self.github, GitHubClient) and not relationships_preflight_done:
+            snapshot = self._preflight_explicit_issue_relationships(repo_name, issue_number)
+            declaration = parse_parent_declaration(snapshot.get("body"))
+        parent_number = self._get_authoritative_parent_number(repo_name, issue_number, snapshot)
+        # This eager hook exists to discover a submitted identity. An unrelated
+        # non-ready leaf has none, so leave its full reconciliation to the common
+        # dispatch path rather than adding redundant authoritative reads.
+        if parent_number is None and declaration.status is ParentDeclarationStatus.ABSENT:
+            return
+        snapshot = self._reconcile_parent_issue(repo_name, issue_number, snapshot)
+        parent_number = self._get_authoritative_parent_number(repo_name, issue_number, snapshot)
+        if parent_number is None:
+            return
+        authoritative_set = self._fetch_authoritative_decomposition_set(repo_name, parent_number)
+        if authoritative_set is None or issue_number not in {child.get("number") for child in authoritative_set[1]}:
+            return
+        if not is_implementation_ready(authoritative_set[0]):
+            return
+        if self._defer_initial_issue_stabilization(repo_name, authoritative_set[0]):
+            return
+        if target_only:
+            decomposition_job, child_jobs = self._schedule_parent_validations(
+                repo_name,
+                authoritative_set,
+                selected_child_number=issue_number,
+                scheduler=self.review_scheduler,
+            )
+        else:
+            decomposition_job, child_jobs = self._schedule_parent_validations(repo_name, authoritative_set, scheduler=self.review_scheduler)
+        # Do not acknowledge the durable invalidation until every missing
+        # identity has either persisted reusable evidence or returned ERROR.
+        failures: list[str] = []
+        try:
+            decomposition_decision, child_decisions = self._join_parent_validations(decomposition_job, child_jobs)
+            if decomposition_decision is not None and decomposition_decision.verdict == "ERROR":
+                reason = f": {decomposition_decision.remediation_reason}" if decomposition_decision.remediation_reason else ""
+                failures.append(f"decomposition validation failed{reason}")
+            failed_children: list[str] = []
+            for num, decision in sorted(child_decisions.items()):
+                if decision.verdict == "ERROR":
+                    reason = f": {decision.remediation_reason}" if decision.remediation_reason else ""
+                    failed_children.append(f"#{num}{reason}")
+            if failed_children:
+                failures.append(f"individual validation failed for {', '.join(failed_children)}")
+        except ValidationAdmissionDeferred:
+            failures.append("validation was deferred")
+        except Exception as exc:
+            logger.exception("Parent validations join failed: %s", exc)
+            failures.append(f"validation raised {type(exc).__name__}")
+        if failures:
+            raise RuntimeError(f"validation batch incomplete while processing child invalidation: {', '.join(failures)}")
+
+    def _authorize_stale_jules_dispatch(self, repo_name: str, issue_number: int, snapshot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Apply set, ordering, and Issue authorization to daemon replacement work."""
+        current = self.github.get_issue_dispatch_snapshot_strict(repo_name, issue_number)
+        if not isinstance(current, dict) or current.get("number") != issue_number or not self._is_open_issue(current):
+            return None
+        if isinstance(self.github, GitHubClient) and parse_parent_declaration(current.get("body")).status is not ParentDeclarationStatus.ABSENT:
+            try:
+                current = self._reconcile_parent_issue(repo_name, issue_number, current)
+            except (ParentSpecificationError, ParentOperationalError):
+                return None
+
+        direct_children = self.github.get_direct_sub_issues_strict(repo_name, issue_number)
+        if not isinstance(direct_children, list):
+            return None
+        # A stale parent session cannot be replaced as standalone work. Analyze
+        # the newly observed submission, but leave child selection to the normal
+        # sequential candidate workflow.
+        if direct_children:
+            if is_implementation_ready(current):
+                if self._get_decomposition_validator(repo_name).is_reissue_required(issue_number) is True:
+                    return None
+                if self._defer_initial_issue_stabilization(repo_name, current):
+                    return None
+                authoritative_set = self._fetch_authoritative_decomposition_set(repo_name, issue_number)
+                if authoritative_set is None:
+                    return None
+                if self._is_issue_decomposition_validation_enabled(repo_name):
+                    parent_validator = self._get_decomposition_validator(repo_name)
+                    decomposition_job, child_jobs = self._schedule_parent_validations(repo_name, authoritative_set)
+                    parent_decision, _ = self._join_parent_validations(decomposition_job, child_jobs)
+                    if parent_decision is not None and parent_decision.verdict == "BLOCKED":
+                        self._authorize_and_apply_decomposition_blocked(
+                            parent_validator,
+                            self.github,
+                            parent_decision,
+                            lambda number: self._fetch_authoritative_decomposition_set(repo_name, number),
+                        )
+            return None
+
+        parent_number = self._get_authoritative_parent_number(repo_name, issue_number, current)
+        decomposition_validator: Optional[DecompositionValidationLifecycle] = None
+        decomposition_decision: Optional[DecompositionDecision] = None
+        joined_child_decisions: dict[int, ValidationDecision] = {}
+        decomposition_enabled = self._is_issue_decomposition_validation_enabled(repo_name)
+        if parent_number is not None:
+            authoritative_set = self._fetch_authoritative_decomposition_set(repo_name, parent_number)
+            if authoritative_set is None or issue_number not in {child.get("number") for child in authoritative_set[1]}:
+                return None
+            # A native child is authorized only through a live submitted parent;
+            # its own label is never a fallback after the parent is withdrawn.
+            if not self._is_open_issue(authoritative_set[0]) or not is_implementation_ready(authoritative_set[0]):
+                return None
+            if self._defer_initial_issue_stabilization(repo_name, authoritative_set[0]):
+                return None
+            decomposition_validator = self._get_decomposition_validator(repo_name)
+            if decomposition_validator.is_reissue_required(parent_number) is True:
+                return None
+            # The Review lane owns semantic execution for the submitted
+            # family; this intake path observes durable decisions (REQ-010).
+            decomposition_job, child_jobs = self._schedule_parent_validations(repo_name, authoritative_set, scheduler=self.review_scheduler)
+            decomposition_decision, joined_child_decisions = self._join_parent_validations(decomposition_job, child_jobs)
+            if decomposition_enabled and decomposition_decision is not None:
+                if decomposition_decision.verdict == "BLOCKED":
+                    self._authorize_and_apply_decomposition_blocked(
+                        decomposition_validator,
+                        self.github,
+                        decomposition_decision,
+                        lambda number: self._fetch_authoritative_decomposition_set(repo_name, number),
+                    )
+                    return None
+                if decomposition_decision.verdict != "READY":
+                    return None
+        if parent_number is None and not is_implementation_ready(current):
+            return None
+        if parent_number is None and self._defer_initial_issue_stabilization(repo_name, current):
+            return None
+        snapshot = current
+        title = str(snapshot.get("title") or "")
+        body = str(snapshot.get("body") or "")
+        manifest = build_normative_issue_manifest(issue_number, title, body)
+        if manifest.error:
+            return None
+        validator = self._get_specification_validator(repo_name)
+        if validator.is_reissue_required(issue_number) is True:
+            return None
+        relationship_context = self._child_review_context(*cast(tuple[dict, list[dict]], authoritative_set), issue_number) if parent_number is not None else None
+        individual_identity = validator.identity(issue_number, title, body, relationship_context)
+        spec_validation_enabled = self._is_issue_specification_validation_enabled(repo_name)
+        decision: Optional[ValidationDecision] = None
+        if spec_validation_enabled:
+            if parent_number is not None:
+                if any(child_decision.verdict == "ERROR" for child_decision in joined_child_decisions.values()):
+                    return None
+                blocked_children = [child_decision for child_decision in joined_child_decisions.values() if child_decision.verdict == "BLOCKED"]
+                if blocked_children:
+
+                    def _family_is_current() -> bool:
+                        latest = self._fetch_authoritative_decomposition_set(repo_name, parent_number)
+                        return latest is not None and self._is_open_issue(latest[0]) and is_implementation_ready(latest[0]) and self._family_individual_identities_match(validator, latest, joined_child_decisions)
+
+                    for blocked_child in blocked_children:
+                        self._authorize_and_apply_inherited_blocked(validator, self.github, blocked_child, _family_is_current)
+                    return None
+            if parent_number is not None:
+                decision = joined_child_decisions[issue_number]
+            else:
+                # Semantic review is owned by the Review lane; this intake
+                # path observes the durable decision instead of submitting a
+                # new validation job (REQ-010).
+                decision, lane_applied = self._review_individual_via_lane(repo_name, issue_number, title, body, None, "standalone-intake", snapshot)
+            if decision is None:
+                return None
+            if decision.verdict == "BLOCKED":
+                if parent_number is not None:
+
+                    def _set_is_current() -> bool:
+                        latest = self._fetch_authoritative_decomposition_set(repo_name, parent_number)
+                        if latest is None or not self._is_open_issue(latest[0]) or not is_implementation_ready(latest[0]) or issue_number not in {child.get("number") for child in latest[1]}:
+                            return False
+                        relationship = self._child_review_context(*latest, issue_number)
+                        if validator.identity(issue_number, title, body, relationship) != decision.identity:
+                            return False
+                        if decomposition_enabled and decomposition_decision is not None and decomposition_validator is not None:
+                            return decomposition_validator.identity(*latest) == decomposition_decision.identity
+                        return True
+
+                    self._authorize_and_apply_inherited_blocked(
+                        validator,
+                        self.github,
+                        decision,
+                        _set_is_current,
+                    )
+                else:
+                    self._authorize_and_apply_blocked(
+                        validator,
+                        self.github,
+                        decision,
+                        lambda: self._standalone_validation_is_current(repo_name, decision),
+                    )
+                return None
+            if decision.verdict != "READY":
+                return None
+        elif parent_number is None:
+            issue_review_audit.record_bypassed(
+                repository=repo_name,
+                target_number=issue_number,
+                review_kind=issue_review_audit.REVIEW_KIND_ISSUE_SPECIFICATION,
+                origin="automation_engine.standalone-intake:disabled",
+                policy_identity=individual_identity.policy_identity,
+                related_issue_membership=str(dataclasses.asdict(individual_identity)),
+            )
+        refreshed = self.github.get_issue_dispatch_snapshot_strict(repo_name, issue_number)
+        if not isinstance(refreshed, dict) or not self._is_open_issue(refreshed):
+            return None
+        refreshed_children = self.github.get_direct_sub_issues_strict(repo_name, issue_number)
+        refreshed_parent = self._get_authoritative_parent_number(repo_name, issue_number, refreshed)
+        if refreshed_children or refreshed_parent != parent_number:
+            return None
+        if parent_number is not None:
+            refreshed_set = self._fetch_authoritative_decomposition_set(repo_name, parent_number)
+            if refreshed_set is None or not self._is_open_issue(refreshed_set[0]) or not is_implementation_ready(refreshed_set[0]) or issue_number not in {child.get("number") for child in refreshed_set[1]}:
+                return None
+            if decomposition_enabled and decomposition_decision is not None and decomposition_validator is not None:
+                if decomposition_validator.identity(*refreshed_set) != decomposition_decision.identity:
+                    return None
+        elif not is_implementation_ready(refreshed):
+            return None
+        refreshed_relationship = self._child_review_context(*cast(tuple[dict, list[dict]], refreshed_set), issue_number) if parent_number is not None else None
+        identity = validator.identity(issue_number, str(refreshed.get("title") or ""), str(refreshed.get("body") or ""), refreshed_relationship)
+        expected_identity = decision.identity if spec_validation_enabled and decision is not None else individual_identity
+        if identity != expected_identity:
+            return None
+        if isinstance(self.github, GitHubClient) and hasattr(self.github, "token"):
+            try:
+                dependency_satisfaction = self._reconcile_sibling_dependencies(repo_name, issue_number, refreshed)
+            except Exception:
+                return None
+            if dependency_satisfaction is not DependencySatisfaction.SATISFIED:
+                return None
+        return refreshed
+
+    def _wake_pending_work(self) -> None:
+        if self.pending_work_scheduler is not None:
+            self.pending_work_scheduler.wake()
+
+    def _bind_pending_work_scheduler(self, repo_name: str) -> None:
+        """Install the repository boundary and every production stage handler."""
+        repository_key = repository_ownership_key(repo_name)
+        if self._pending_work_repository_key not in {None, repository_key}:
+            raise PendingWorkOwnershipError("AutomationEngine pending work is already repository-bound")
+        # READY is established from the repository's own durable destination
+        # before any dependent work; a non-ready store refuses here and never
+        # falls back to shared storage or an empty queue.
+        store = get_pending_work_store(repo_name)
+        self._pending_work_repository_key = repository_key
+        slots = self._get_implementation_slots(repo_name)
+        composition = IssueRuntimeComposition(
+            repo_name,
+            store,
+            self._get_issue_job_runtime(repo_name, slots),
+            self._codex_retry_reconciler(repo_name),
+        )
+        self.pending_work_scheduler = composition.register(
+            {
+                STARTUP_RECONCILIATION_STAGE: _StartupReconciliationHandler(self, repo_name),
+                PR_PROCESSING_STAGE: _PrProcessingStageHandler(self, repo_name),
+                ISSUE_PROCESSING_STAGE: _IssueProcessingStageHandler(self, repo_name),
+                CODEX_RETRY_HANDOFF_STAGE: _CodexRetryHandoffStageHandler(composition.retry_reconciler, repo_name),
+                VALIDATION_PUBLICATION_STAGE: _ValidationPublicationStageHandler(self, repo_name),
+                DECOMPOSITION_PUBLICATION_STAGE: _DecompositionPublicationStageHandler(self, repo_name),
+            }
+        )
+        self._issue_runtime_composition = composition
+
+    async def start_automation(self, repo_name: str, concurrency: Optional[int] = None) -> None:
+        """Start independent Issue and PR pools with ``concurrency`` workers each."""
+        self._get_local_job_store()
+        self._bind_pending_work_scheduler(repo_name)
+        if concurrency is None:
+            concurrency = self.config.MAX_CONCURRENT_TASKS
+        self._loop = asyncio.get_running_loop()
+
+        from .pr_correction_job import resume_pr_correction_publication
+        from .pr_local_job_runtime import build_pr_local_job_adapters, build_pr_repair_finalizer
+
+        # PR and Issue lanes must read the same durable authority used by
+        # admission and explicit recovery paths.
+        local_job_store = self._get_local_job_store()
+
+        def wake_published_head(repository: str, number: int, _head_sha: str) -> bool:
+            assert self._loop is not None
+            wake = asyncio.run_coroutine_threadsafe(self.invalidate_entity(repository, "pr", number), self._loop)
+            wake.result()
+            return True
+
+        repair_finalizer = build_pr_repair_finalizer(
+            self.github,
+            local_job_store,
+            wake_published_head,
+            self._get_implementation_slots(repo_name),
+        )
+
+        from .local_pr_repair_recovery import (
+            LOCAL_PR_REPAIR_FINALIZATION_STAGE,
+            LocalPRRepairFinalizationHandler,
+            rediscover_pr_repair_finalizations,
+        )
+
+        assert self.pending_work_scheduler is not None
+        self.pending_work_scheduler.register_handler(
+            LOCAL_PR_REPAIR_FINALIZATION_STAGE,
+            LocalPRRepairFinalizationHandler(repo_name, local_job_store, repair_finalizer),
+        )
+
+        def wake_pr_validation(job: Any) -> None:
+            assert self._loop is not None
+            if job.kind in {LocalJobKind.PR_MERGE_CONFLICT, LocalJobKind.PR_CI_FAILURE}:
+                rediscover_pr_repair_finalizations(repo_name, local_job_store, get_pending_work_store(repo_name))
+                self._wake_pending_work()
+                return
+            phase = resume_pr_correction_publication(job, local_job_store)
+            wake = asyncio.run_coroutine_threadsafe(self.invalidate_entity(job.repository, "pr", job.target_number), self._loop)
+            wake.result()
+            claim = LocalJobClaim(job, True)
+            local_job_store.record_effect(claim, "pr-validation-wake", "completed", f"durable PR invalidation scheduled after {phase}")
+            local_job_store.settle(claim, "PR validation wake scheduled")
+
+        local_job_runner = LocalJobRunner(
+            local_job_store,
+            self.invocation_gate,
+            repository=repo_name,
+            capacity=max(1, concurrency),
+            adapters=build_pr_local_job_adapters(self.github, self.config, local_job_store),
+            completion_wake=wake_pr_validation,
+        )
+        self._pr_local_job_runner = local_job_runner
+
+        async def poll_local_jobs() -> None:
+            assert self._shutdown_event is not None
+            while not self._shutdown_event.is_set():
+                await asyncio.to_thread(local_job_runner.poll)
+                try:
+                    await asyncio.wait_for(self._shutdown_event.wait(), timeout=0.2)
+                except asyncio.TimeoutError:
+                    pass
+
+        logger.info(f"Starting automation for repository: {repo_name} with {concurrency} Issue workers and {concurrency} PR workers")
+
+        def recover_startup_stores() -> None:
+            self.issue_stage_routing.recover(repo_name)
+            recovered_identities = self.invalidations.recover(repo_name)
+            self._record_recovered_dependency_work(repo_name, recovered_identities)
+
+        # Both recoveries acquire SQLite write locks.  The private bridge is
+        # already serving at this point, so never make its event loop wait for
+        # a contended database transaction.
+        await asyncio.to_thread(recover_startup_stores)
+        await self._enqueue_pending_invalidations(repo_name)
+
+        # Record resource usage and unhandled asyncio errors for the whole run
+        self._shutdown_event = asyncio.Event()
+        self._force_stop_event = asyncio.Event()
+        if self.is_draining:
+            self._shutdown_event.set()
+
+        # The pending-work scheduler must be available (supervising its own
+        # durable obligations, including any left 'running' by a controller
+        # that stopped mid-dispatch) before startup reconciliation finishes,
+        # so retained work from a previous run is never orphaned by a fresh
+        # enumeration that only marks entities dirty again.
+        self._startup_reconciliation_event = asyncio.Event()
+        assert self.pending_work_scheduler is not None
+        assert self._issue_runtime_composition is not None
+
+        def wake_issue_publication(_job: Any) -> None:
+            self._resume_local_issue_publications(repo_name, self._get_implementation_slots(repo_name))
+
+        pending_work_task = self._issue_runtime_composition.start_recovery(
+            self._shutdown_event,
+            schedule_retry=lambda request_id, issue_number: self._rediscover_codex_retry_handoff(repo_name, request_id, issue_number),
+        )
+
+        # A pending approval/merge effect (Issue #1939) is resumed by its own
+        # dedicated scheduler rather than PR_PROCESSING_STAGE: its deadlines,
+        # throttle counters, and receipts already live durably in
+        # MergeOperationStore (Issue #1937), so this loop reads that store's
+        # own due() timings directly instead of duplicating them into a
+        # second obligation store.
+        self.merge_operation_scheduler.register_resume_handler(_MergeOperationResumeHandler(self, repo_name), repository=repo_name)
+        merge_operation_task = asyncio.create_task(self.merge_operation_scheduler.run(self._shutdown_event), name="merge-operation-scheduler")
+        claude_followup_recovery_task = asyncio.create_task(
+            self._claude_followup_recovery_loop(repo_name),
+            name="claude-followup-quota-recovery",
+        )
+
+        if not self.is_draining:
+            # Webhooks are not a durable event log. Recover work missed while
+            # this process was offline (including open PR ownership, which
+            # must be discovered before releasing startup reservations)
+            # before claiming steady-state correctness. A local admission
+            # deferral or an actual GitHub throttle/authentication/forbidden
+            # response does not terminate the daemon here: it is retained as
+            # a durable pending-work obligation and retried by the
+            # pending-work scheduler, independent of the ordinary worker
+            # pool started below, which must not begin before recovery
+            # succeeds.
+            if not await self._reconcile_startup_or_retain_failure(repo_name, [pending_work_task, merge_operation_task, claude_followup_recovery_task]):
+                local_job_runner.close(wait=False)
+                return
+
+        local_job_task = asyncio.create_task(poll_local_jobs(), name="durable-local-job-runner")
+
+        # Sync repo_name to environment for subprocesses (like test.sh)
+        os.environ["REPO_NAME"] = repo_name
+
+        self._wake_up_event = asyncio.Event()
+        self._pr_merged_or_closed = False
+        install_asyncio_diagnostics(self._loop)
+        get_health_monitor().start()
+        heartbeat("engine:start", repo_name)
+
+        # Maintenance and GitHub work have independent scheduling paths.
+        producer_task = asyncio.create_task(self._producer_loop(repo_name), name="producer")
+        invalidation_task = asyncio.create_task(self._invalidation_loop(repo_name), name="github-invalidations")
+        # Accepted Codex runs are durable and therefore need no webhook to
+        # resume initial-PR recovery after registration or process restart.
+        slot_repository = self._get_implementation_slots(repo_name)
+        if isinstance(slot_repository, ImplementationSlotRepository):
+            from .codex_work_reconstruction import reconstruct_active_codex_work
+
+            try:
+                await asyncio.to_thread(reconstruct_active_codex_work, repo_name, slot_repository)
+            except Exception as exc:
+                # Incomplete reconstruction must remain fail-closed. Senders
+                # independently require current accounting before transport.
+                logger.error(f"Codex work reconstruction is incomplete for {repo_name}: {type(exc).__name__}: {exc}")
+        from .cloud_run import CloudRunRepository
+        from .codex_observation import CodexObservationService
+        from .codex_pr_recovery import CodexPRRecoveryMonitor, CodexPRRecoveryStore
+        from .codex_wham_client import CodexWhamClient
+
+        codex_recovery_task: Optional[asyncio.Task[Any]] = None
+        try:
+            cloud_runs = CloudRunRepository(repo_name)
+            wham = CodexWhamClient()
+            recovery = CodexPRRecoveryMonitor(
+                cloud_runs,
+                CodexObservationService(self.github, cloud_runs, wham),
+                wham,
+                CodexPRRecoveryStore(),
+                lambda number: self.invalidate_entity(repo_name, "pr", number),
+            )
+            codex_recovery_task = asyncio.create_task(recovery.run(self._shutdown_event), name="codex-initial-pr-recovery")
+        except Exception as exc:
+            # Corrupt/unwritable claim state fails closed for reminders without
+            # preventing ordinary Issue/PR work from serving the repository.
+            logger.error(f"Codex initial-PR recovery is unavailable for {repo_name}: {type(exc).__name__}")
+        capacity_task = asyncio.create_task(self._capacity_refill_loop(repo_name), name="implementation-capacity-refill") if isinstance(slot_repository, ImplementationSlotRepository) else None
+        local_runner, local_runner_task = self._issue_runtime_composition.start_local_jobs(
+            self._shutdown_event,
+            capacity=self.config.MAX_CONCURRENT_IMPLEMENTATIONS,
+            completion_wake=wake_issue_publication,
+        )
+
+        # Reserve worker capacity for each type so either lane can make progress.
+        workers = [asyncio.create_task(self._worker_loop(repo_name, offset * concurrency + i, item_type), name=f"{item_type}-worker-{i}") for offset, item_type in enumerate(("issue", "pr")) for i in range(concurrency)]
+
+        all_loop_tasks = [producer_task, invalidation_task, pending_work_task, merge_operation_task, claude_followup_recovery_task, local_job_task, *workers]
+        if codex_recovery_task is not None:
+            all_loop_tasks.append(codex_recovery_task)
+        if capacity_task is not None:
+            all_loop_tasks.append(capacity_task)
+        all_loop_tasks.append(local_runner_task)
+        shutdown_wait = asyncio.create_task(self._shutdown_event.wait(), name="graceful-shutdown-request")
+        try:
+            # Serving starts only after every required steady-state task exists
+            # and immediately before their supervising wait becomes active.
+            self.daemon_serving = self.lifecycle is EngineLifecycle.RUNNING and self.startup_reconciled and all(not task.done() for task in all_loop_tasks)
+            try:
+                done, _ = await asyncio.wait({*all_loop_tasks, shutdown_wait}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                # Cancellation and exceptions skip the statement following an
+                # await.  Clear readiness before any cancellation joins so a
+                # still-responsive bridge cannot report a dead supervisor as
+                # serving while cleanup is blocked on owned work.
+                self.daemon_serving = False
+            if shutdown_wait in done:
+                await self._complete_graceful_drain(all_loop_tasks)
+                return
+
+            shutdown_wait.cancel()
+            await asyncio.gather(shutdown_wait, return_exceptions=True)
+            core_loops_exited = producer_task.done() and all(worker.done() for worker in workers)
+            for task in all_loop_tasks:
+                task.cancel()
+            await asyncio.gather(*all_loop_tasks, return_exceptions=True)
+            for completed_task in done:
+                if completed_task in all_loop_tasks and not completed_task.cancelled():
+                    completed_task.result()
+            if core_loops_exited:
+                # Producer and workers returning together is the historical
+                # silent-stop boundary. Companion loops are deliberately
+                # cancelled because they otherwise wait indefinitely.
+                logger.warning("Automation engine stopped: producer and all workers exited without being cancelled")
+                get_health_monitor().record_event("engine_stop", "all engine tasks exited", f"workers={len(workers)}")
+            else:
+                logger.warning("Automation engine stopped: an orchestration loop exited unexpectedly")
+                get_health_monitor().record_event("engine_stop", "engine task exited", f"workers={len(workers)}")
+        except asyncio.CancelledError:
+            for task in all_loop_tasks:
+                task.cancel()
+            await asyncio.gather(*all_loop_tasks, return_exceptions=True)
+            logger.info("Automation engine stopped")
+            get_health_monitor().record_event("engine_stop", "cancelled", "")
+            raise
+        except BaseException as e:
+            logger.opt(exception=True).error(f"Automation engine stopped by an unhandled error: {e}")
+            get_health_monitor().record_event("engine_stop", f"unhandled error: {type(e).__name__}: {e}", "")
+            raise
+        finally:
+            self.daemon_serving = False
+            if local_runner is not None:
+                local_runner.close(wait=False)
+            shutdown_wait.cancel()
+            local_job_runner.close(wait=False)
+            get_health_monitor().log_snapshot(reason="engine_stop")
+
+    async def _complete_graceful_drain(self, tasks: list[asyncio.Task[Any]]) -> None:
+        """Use the same owned checkpoints for serving and failed-startup drains."""
+        # Admission stopped synchronously when the lifecycle changed.
+        # Cancel loop waiters, but shielded synchronous operations retain
+        # ownership and make their callers wait for the true boundary.
+        for task in tasks:
+            task.cancel()
+        await self._wait_for_protected_invocations()
+        await self._wait_for_interrupted_local_work()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        if self.lifecycle is EngineLifecycle.FORCED:
+            logger.error("Automation engine force-stopped before its local drain completed")
+            get_health_monitor().record_event("engine_stop", "forced", "")
+        else:
+            with self._lifecycle_lock:
+                self._lifecycle = EngineLifecycle.STOPPED
+            logger.info("Automation engine graceful drain completed")
+            get_health_monitor().record_event("engine_stop", "gracefully drained", "")
+            if self.graceful_terminal_observer is not None:
+                await asyncio.to_thread(self.graceful_terminal_observer, "graceful drain completed")
+
+    async def _reconcile_startup_or_retain_failure(self, repo_name: str, tasks: list[asyncio.Task[Any]]) -> bool:
+        """Irrevocably abandon this startup lifetime, then await normal shutdown.
+
+        This is a controller disposition, not a claim that an exception type
+        proves a permanent external cause. Operational/deferred errors and
+        cancellation are not failure authority.
+        This applies only to a managed release bridge, never an ordinary CLI or
+        beta daemon, and only before the steady-state task set is created.
+        """
+        try:
+            await self._perform_startup_reconciliation(repo_name)
+            return True
+        except Exception as error:
+            # An explicit operational cause remains operational even when a
+            # reconciliation adapter wraps it. Never turn deferral, transport,
+            # storage unavailability or cancellation into failure authority.
+            pending: list[BaseException] = [error]
+            seen: set[int] = set()
+            while pending:
+                cause = pending.pop()
+                if id(cause) in seen:
+                    continue
+                seen.add(id(cause))
+                if isinstance(
+                    cause, (GitHubRequestError, GitHubReadCancelled, LocalJobStoreUnavailable, PendingWorkPersistenceError, ImplementationSlotUnavailable, ImplementationHierarchyUnavailable, ParentOperationalError, GovernorStateError, OSError, sqlite3.Error, httpx.HTTPError, asyncio.CancelledError)
+                ):
+                    raise
+                pending.extend(value for value in (cause.__cause__, cause.__context__) if value is not None)
+                if isinstance(cause, BaseExceptionGroup):
+                    pending.extend(cause.exceptions)
+            if not self.startup_failure_recovery_enabled or self.daemon_serving:
+                raise
+            with self._lifecycle_lock:
+                if self._lifecycle is not EngineLifecycle.RUNNING:
+                    raise
+                self.startup_failure = StartupReconciliationFailure(uuid.uuid4().hex)
+                self.startup_reconciled = False
+                self._lifecycle = EngineLifecycle.FAILED_AWAITING_DRAIN
+                self.daemon_serving = False
+            self.invocation_gate.close_admission("startup_reconciliation_abandoned")
+            logger.error("Managed release startup reconciliation abandoned; retaining owned work until graceful drain")
+            get_health_monitor().record_event("engine_startup_failure", "startup_reconciliation_abandoned", "")
+            assert self._shutdown_event is not None
+            try:
+                await self._shutdown_event.wait()
+                await self._complete_graceful_drain(tasks)
+            finally:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+            return False
+
+    def _get_local_job_store(self) -> LocalJobStore:
+        """Return the engine-wide durable authority for daemon and explicit routes."""
+        if self.local_job_store is None:
+            self.local_job_store = LocalJobStore()
+        return self.local_job_store
+
+    def _issue_job_authorization_ports(self) -> IssueJobAuthorizationPorts:
+        """Expose only the policy operations required at provider entry."""
+        return IssueJobAuthorizationPorts(
+            github=cast(IssueJobGitHubPort, self.github),
+            main_branch=self.config.MAIN_BRANCH,
+            author_allowed=self._is_issue_author_allowed,
+            authorize_dispatch=self._authorize_stale_jules_dispatch,
+            parent_number=self._get_authoritative_parent_number,
+            decomposition_set=self._fetch_authoritative_decomposition_set,
+            implementation_generation=self._compute_implementation_generation,
+        )
+
+    def _get_issue_job_runtime(self, repo_name: str, slots: ImplementationSlotRepository) -> IssueJobRuntime:
+        """Lazily assemble the shared local Issue runtime for a repository."""
+        store = self._get_local_job_store()
+        existing = self._issue_job_runtimes.get(repo_name)
+        if existing is not None and existing.store is store and existing.slots is slots:
+            return existing
+
+        from .issue_processor import _create_pr_for_issue
+
+        def create_pr(record: Any, summary: str) -> object:
+            issue = self.github.get_issue(repo_name, record.target_number)
+            if not isinstance(issue, dict):
+                issue = {"number": record.target_number, "title": getattr(issue, "title", "Unknown"), "body": getattr(issue, "body", "") or "", "labels": getattr(issue, "labels", []) or []}
+            return _create_pr_for_issue(repo_name, issue, record.work_branch, self.config.MAIN_BRANCH, summary, self.github, self.config, None)
+
+        def observe(result: IssuePublicationResult, origin: str, owner_restored: bool) -> None:
+            outcome = Outcome.COMPLETED if result.disposition in {"published", "no_change"} else Outcome.FAILED if result.disposition in {"cannot_fix", "failed", "interrupted"} else Outcome.DEFERRED
+            get_trace_collector().record_event(
+                EventKind.STAGE_RESULT,
+                stage_id="issue.local-publication-finalization",
+                origin=origin,
+                label=f"issue job {result.job_id} publication finalization",
+                outcome=outcome,
+                facts={"job_id": result.job_id, "disposition": result.disposition, "pr_number": result.pr_number, "diagnostic": result.diagnostic, "owner_restored": owner_restored},
+            )
+
+        runtime = IssueJobRuntime(
+            repo_name,
+            store,
+            slots,
+            self.invocation_gate,
+            self._issue_job_authorization_ports(),
+            Path.cwd(),
+            lambda repository, branch: self.github.find_pr_by_head_branch_strict(repository, branch),
+            create_pr,
+            observe,
+        )
+        self._issue_job_runtimes[repo_name] = runtime
+        return runtime
+
+    async def _perform_startup_reconciliation(self, repo_name: str) -> None:
+        """Complete startup recovery, retrying governed admission failures durably.
+
+        The first attempt runs inline. A ``GitHubRequestError`` -- a local
+        admission deferral or an actual GitHub throttle, authentication, or
+        forbidden response -- does not terminate the daemon: the attempt is
+        retained as a durable pending-work obligation with a stable
+        repository-scoped identity (stable across restarts, since it is keyed
+        only by repository and stage) and retried by the already-running
+        pending-work scheduler, independent of the ordinary worker pool. This
+        method then waits for that obligation to resolve -- or for shutdown --
+        without blocking the event loop, so webhook receipt, status, and
+        graceful shutdown remain responsive while recovery is incomplete. Any
+        other exception is a genuine defect and continues to propagate.
+        """
+        self.issue_admission_cache.invalidate(repo_name)
+        self.dependency_observations = DependencyObservationCache()
+        identity = WorkIdentity(repo_name, "startup", STARTUP_RECONCILIATION_STAGE)
+        try:
+            await self._attempt_startup_reconciliation(repo_name)
+            # A prior process may have left this identity retained (waiting on
+            # a not-yet-due retry, or blocked on an operational failure) before
+            # this fresh inline attempt succeeded outright; clear it so the
+            # scheduler never repeats a full enumeration for already-completed
+            # recovery merely because that old obligation's deadline arrives.
+            await asyncio.to_thread(get_pending_work_store(repo_name).supersede, identity)
+            return
+        except GitHubRequestError as exc:
+            obligation = await asyncio.to_thread(get_pending_work_store(repo_name).defer, identity, exc, (STARTUP_RECONCILIATION_EFFECT,))
+            logger.warning(f"Startup GitHub reconciliation for {repo_name} deferred ({obligation.reason.value}); " f"the daemon stays up and the pending-work scheduler will retry automatically " f"(next eligible at {obligation.not_before})")
+            self._wake_pending_work()
+        except LocalJobStoreUnavailable as exc:
+            await asyncio.to_thread(
+                get_pending_work_store(repo_name).ensure_reevaluation,
+                identity,
+                (STARTUP_RECONCILIATION_EFFECT,),
+            )
+            logger.warning("Startup local-job reconciliation for {} deferred: {}", repo_name, exc)
+            self._wake_pending_work()
+
+        assert self._startup_reconciliation_event is not None and self._shutdown_event is not None
+        wait_ready = asyncio.ensure_future(self._startup_reconciliation_event.wait())
+        wait_shutdown = asyncio.ensure_future(self._shutdown_event.wait())
+        try:
+            await asyncio.wait({wait_ready, wait_shutdown}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for pending_wait in (wait_ready, wait_shutdown):
+                if not pending_wait.done():
+                    pending_wait.cancel()
+            await asyncio.gather(wait_ready, wait_shutdown, return_exceptions=True)
+
+    async def _attempt_startup_reconciliation(self, repo_name: str) -> None:
+        """One full attempt at startup recovery: PR ownership, then Issue/PR enumeration.
+
+        Used for both the inline first attempt and every scheduler-driven
+        retry, so a resumed scan always performs a complete fresh discovery
+        rather than resuming from stale partial state.
+        """
+        # Strict local-job enumeration is part of the admission barrier. An
+        # unavailable/corrupt authority is not equivalent to an empty store;
+        # the startup pending-work controller retries this whole phase.
+        if self._pr_local_job_runner is not None:
+            await asyncio.to_thread(self._pr_local_job_runner.recover_unsettled, strict=True)
+            from .local_pr_repair_recovery import rediscover_pr_repair_finalizations
+
+            await asyncio.to_thread(
+                rediscover_pr_repair_finalizations,
+                repo_name,
+                self._get_local_job_store(),
+                get_pending_work_store(repo_name),
+                strict=True,
+            )
+            self._wake_pending_work()
+
+        # Discover open PR ownership before releasing startup reservations. A
+        # PR linked only by branch metadata has no Issue timeline event and
+        # may not have been recorded if the previous process stopped before
+        # its first candidate scan.
+        slots = self._get_implementation_slots(repo_name)
+        await asyncio.to_thread(slots.reconcile, self.github, True)
+        await asyncio.to_thread(self._resume_local_issue_publications, repo_name, slots)
+        from .local_job_workspace_cleanup import reclaim_finalized_workspaces
+
+        await asyncio.to_thread(reclaim_finalized_workspaces, self._get_local_job_store())
+        # Issue #2148 REQ-002: recover terminal-PR-backed reclamation candidates
+        # and unfinished obligations, including owners whose PRs closed while
+        # this daemon was offline and are therefore absent from the open-PR
+        # enumeration above. This only schedules a check; run_due_reclamation_checks
+        # (serviced from the capacity-refill loop) performs the actual fresh
+        # observation before retiring anything.
+        await asyncio.to_thread(recover_obligations_at_startup, slots)
+        await self._reconcile_open_github_entities(repo_name)
+        # Explicit rerun acceptance precedes its wake.  If the prior process
+        # stopped in that gap, the authority journal remains the durable
+        # source from which Review-only routing is reconstructed here.
+        await asyncio.to_thread(self._recover_issue_review_reruns, repo_name)
+
+    def _resume_local_issue_publications(self, repo_name: str, slots: ImplementationSlotRepository, *, job_id: Optional[str] = None, origin: str = "startup-recovery") -> tuple[IssuePublicationResult, ...]:
+        """Resume exact job-owned publication effects without model re-entry."""
+        from .local_job_handoff import InvocationOutcome, LocalJobState
+
+        store = self._get_local_job_store()
+        jobs = (store.get(job_id),) if job_id is not None else store.discover_unsettled()
+        restored_jobs: set[str] = set()
+        for job in jobs:
+            if job is None or job.repository != repo_name or job.kind is not LocalJobKind.ISSUE_IMPLEMENTATION or job.invocation_outcome is not InvocationOutcome.COMPLETED or job.state not in {LocalJobState.RESULT_RECORDED, LocalJobState.DOWNSTREAM_EFFECTS_PENDING}:
+                continue
+            owner = ImplementationOwner("issue", job.target_number)
+            try:
+                with slots.serialize(owner):
+                    if slots.owner_incarnation(owner) is not None:
+                        continue
+                    snapshot = self.github.get_issue_dispatch_snapshot_strict(repo_name, job.target_number)
+                    if snapshot.get("state", "").lower() != "open" or not self._is_issue_author_allowed(snapshot):
+                        continue
+                    parent = self._get_authoritative_parent_number(repo_name, job.target_number, snapshot)
+                    family = self._fetch_authoritative_decomposition_set(repo_name, parent) if parent is not None else None
+                    generation = self._compute_implementation_generation(repo_name, snapshot, family)
+                    if slots.restore_local_issue_execution(job, generation):
+                        restored_jobs.add(job.job_id)
+            except Exception as exc:
+                logger.warning("Retaining local publication {} without owner restoration: {}", job.job_id, exc)
+
+        return self._get_issue_job_runtime(repo_name, slots).finalize(job_id=job_id, origin=origin, restored_job_ids=frozenset(restored_jobs))
+
+    def _resume_explicit_issue(self, repo_name: str, number: int) -> CandidateProcessingResult:
+        """Resolve retained ownership directly, without admitting a new implementation."""
+        from .issue_dispatch import DispatchOutcome, DispatchResult, IssueAttemptIdentity
+        from .security_utils import redact_string
+
+        result = CandidateProcessingResult(type="issue", number=number, success=False, target_outcome=ExplicitTargetOutcome.DEFERRED)
+        with get_trace_collector().start_execution(repository=repo_name, item_type="issue", item_number=number, origin="explicit-single-target", stage_id="issue.local-session-resume", label=f"issue#{number} session resume") as handle:
+            try:
+                store = self._get_local_job_store()
+                slots = self._get_implementation_slots(repo_name)
+                active_ids = slots.active_execution_ids(ImplementationOwner("issue", number))
+                evidence = store.issue_job_evidence(repo_name, number)
+                bound = [entry.job for entry in evidence if entry.job.implementation_execution_id in active_ids]
+                if not bound and len(evidence) == 1:
+                    bound = [evidence[0].job]
+                if len(bound) != 1:
+                    raise RuntimeError("No unambiguous retained local job exists for this Issue")
+                job = bound[0]
+                from .local_job_handoff import LocalJobState
+
+                if job.state is LocalJobState.PENDING or (job.state is LocalJobState.RUNNING and not job.provider_entered):
+                    raise RuntimeError("Retained job has not entered a provider; use ordinary processing")
+                repo_owner, repo_name_part = repo_name.split("/", 1)
+                identity = IssueAttemptIdentity(repo_owner, repo_name_part, number, job.upstream_attempt)
+                result.dispatch_result = DispatchResult(identity, DispatchOutcome.LOCAL_ACCEPTED, job.backend_name, "local", job.job_id, claim_incarnation=job.upstream_incarnation)
+                self._run_explicit_local_issue(repo_name, result, resume=True)
+            except Exception as exc:
+                result.target_reason = redact_string(f"Cannot resume Issue #{number}: {exc}")[:2000]
+                result.error = result.target_reason
+                result.actions.append(result.target_reason)
+            get_trace_collector().record_event(
+                EventKind.STAGE_RESULT,
+                stage_id="issue.local-session-resume",
+                origin="explicit-single-target",
+                label="Retained Issue session resume",
+                outcome=_map_candidate_result_outcome(result),
+                facts={"job_id": result.dispatch_result.provider_reference if result.dispatch_result else "", "backend": result.dispatch_result.backend_name if result.dispatch_result else "", "reason": result.target_reason or ""},
+            )
+            handle.set_outcome(_map_candidate_result_outcome(result))
+        return result
+
+    def _complete_explicit_local_issue(self, repo_name: str, result: CandidateProcessingResult) -> None:
+        """Keep target-scoped completion evidence after dispatch releases its scope."""
+        with get_trace_collector().start_execution(repository=repo_name, item_type="issue", item_number=cast(int, result.number), origin="explicit-single-target", stage_id="issue.local-completion", label=f"issue#{result.number} local completion") as handle:
+            self._run_explicit_local_issue(repo_name, result)
+            handle.set_outcome(_map_candidate_result_outcome(result))
+
+    def _run_explicit_local_issue(self, repo_name: str, result: CandidateProcessingResult, *, resume: bool = False) -> None:
+        """Drive only the accepted target through execution and publication."""
+        from .local_job_handoff import LocalJobState
+
+        dispatch = result.dispatch_result
+        assert dispatch is not None
+        store = self._get_local_job_store()
+        job_id = dispatch.provider_reference
+        job = store.get(job_id)
+        if job is None or job.repository != repo_name or job.kind is not LocalJobKind.ISSUE_IMPLEMENTATION or job.target_number != result.number or job.upstream_incarnation != dispatch.claim_incarnation:
+            raise RuntimeError("Accepted local implementation job does not match the explicit target")
+        slots = self._get_implementation_slots(repo_name)
+        self._get_issue_job_runtime(repo_name, slots).wait_for_target(job_id, resume=resume)
+        job = store.get(job_id)
+        if job is None:
+            raise RuntimeError("Accepted local implementation job disappeared")
+        result.success = False
+        result.target_outcome = ExplicitTargetOutcome.DEFERRED
+        result.target_reason = f"Local implementation job {job_id} remains {job.state.value}: {job.diagnostic or 'execution requires reconciliation'}"
+        if job.state in {LocalJobState.RESULT_RECORDED, LocalJobState.DOWNSTREAM_EFFECTS_PENDING, LocalJobState.SETTLED}:
+            publication = self._resume_local_issue_publications(repo_name, slots, job_id=job_id, origin="explicit-single-target")[0]
+            if publication.disposition in {"published", "no_change"}:
+                result.success = True
+                result.target_outcome = ExplicitTargetOutcome.SUCCESS
+                result.target_reason = f"Published PR #{publication.pr_number} for issue #{result.number}" if publication.disposition == "published" else f"Local implementation completed with no changes for issue #{result.number}"
+            elif publication.disposition in {"cannot_fix", "failed", "interrupted"}:
+                result.target_outcome = ExplicitTargetOutcome.FAILED
+                result.target_reason = f"Local implementation {publication.disposition} for issue #{result.number}"
+            else:
+                result.target_reason = f"Local implementation publication deferred: {publication.diagnostic}"
+        result.actions.append(result.target_reason)
+        result.error = None if result.success else result.target_reason
+
+    def _retire_superseded_pending_pr_repair(self, repo_name: str, job: LocalJobRecord, slots: ImplementationSlotRepository) -> bool:
+        """Release only an unentered stale claim before normal PR re-evaluation."""
+        from .local_job_handoff import LocalJobState
+
+        if job.repository != repo_name or job.state is not LocalJobState.PENDING or job.provider_entered or job.execution_incarnation:
+            return False
+        store = self._get_local_job_store()
+        claim = store.get_pr_repair_claim(job.job_id)
+        if claim is None:
+            return False
+        try:
+            metadata = self.github.get_pull_request_metadata_strict(repo_name, job.target_number)
+            head, base = metadata.get("head") or {}, metadata.get("base") or {}
+            current = ((head.get("repo") or {}).get("full_name"), head.get("ref"), head.get("sha"), (base.get("repo") or {}).get("full_name"), base.get("ref"), base.get("sha") or base.get("identity"))
+            retained = (claim.head_repository, claim.head_ref, claim.head_sha, claim.base_repository, claim.base_ref, claim.base_identity)
+            if not all(current) or not all(retained) or current == retained:
+                return False
+        except Exception:
+            return False
+        reason = "Retired unentered local PR repair because authoritative PR head/base changed"
+        if not store.settle_unentered_pr_repair(job, reason):
+            return False
+        slots.finish_execution_by_id(job.implementation_execution_id)
+        _record_pr_stage_result(
+            job.target_number,
+            "pr.repair-delegation",
+            f"pr#{job.target_number} local repair admission",
+            Outcome.DEFERRED,
+            {"effect": "local-pr-repair-admission", "admission_status": "superseded", "job_id": job.job_id, "backend": job.backend_name, "repair_kind": claim.repair_kind, "reason": reason, "provider_started": False},
+        )
+        return True
+
+    def _complete_explicit_local_pr_repair(self, repo_name: str, result: CandidateProcessingResult) -> None:
+        """Wake and observe only the durable PR job accepted by ``--only``."""
+        from .pr_local_job_runtime import build_pr_local_job_adapters, build_pr_repair_finalizer
+
+        repair = result.repair_result
+        handoff = repair.local_handoff if repair is not None else None
+        if handoff is None:
+            return
+        store = self._get_local_job_store()
+        job = store.get(handoff.job_id)
+        if job is None or job.repository != repo_name or job.target_number != result.number or job.kind not in {LocalJobKind.PR_CI_FAILURE, LocalJobKind.PR_MERGE_CONFLICT} or job.implementation_execution_id != handoff.implementation_execution_id:
+            raise RuntimeError("Accepted local PR repair job does not match the explicit target")
+        slots = self._get_implementation_slots(repo_name)
+
+        def wake_published_head(repository: str, number: int, head_sha: str) -> bool:
+            if repository != repo_name or number != result.number or not head_sha:
+                return False
+            try:
+                transition = self.invalidations.invalidate_with_transition(EntityIdentity(repository, "pr", number))
+                self.review_adjudications.mark_unavailable(repository, number, f"PR repair published {head_sha}")
+            except Exception:
+                logger.opt(exception=True).error(f"Could not retain explicit PR #{number} publication invalidation")
+                return False
+            if transition.accepted and self._loop is not None and self._invalidation_wake_event is not None:
+                self._loop.call_soon_threadsafe(self._invalidation_wake_event.set)
+            return transition.accepted
+
+        finalizer = build_pr_repair_finalizer(self.github, store, wake_published_head, slots)
+        runner = LocalJobRunner(
+            store,
+            self.invocation_gate,
+            repository=repo_name,
+            capacity=1,
+            adapters=build_pr_local_job_adapters(self.github, self.config, store),
+            completion_wake=lambda completed: finalizer.finalize(completed.job_id),
+            job_ids=frozenset({job.job_id}),
+        )
+        try:
+            runner.poll()
+            while runner.active_count():
+                time.sleep(0.1)
+            runner.recover_unsettled()
+            runner.wake_downstream()
+        finally:
+            runner.close(wait=True)
+        current = store.get(job.job_id)
+        if current is None:
+            raise RuntimeError("Accepted local PR repair job disappeared")
+        publication = finalizer.finalize(job.job_id)
+        candidate_sha = str(getattr(publication, "candidate_sha", ""))
+        artifact = store.get_execution_result_artifact(job.job_id, current.execution_incarnation)
+        if artifact is not None:
+            try:
+                from .pr_processing_evidence import restore_editing_invocations
+                from .pr_repair_workspace import PRRepairWorkspaceProducer
+
+                verified = PRRepairWorkspaceProducer(store).revalidate_result(current, artifact, candidate_sha=candidate_sha)
+                restore_editing_invocations(verified.manifest.editing_invocations)
+            except Exception:
+                logger.opt(exception=True).warning("Could not project retained editing evidence for local PR repair {}", job.job_id)
+        from .pr_repair_dispatch import PRRepairResult, RepairDisposition, RepairFactState
+
+        publication_disposition = getattr(getattr(publication, "disposition", None), "value", "")
+        if publication_disposition == "published":
+            result.repair_result = PRRepairResult(
+                RepairDisposition.APPLIED,
+                tuple(result.actions),
+                "Exact local PR repair candidate was published; fresh PR validation remains required",
+                attempt_started=True,
+                receipt_state=RepairFactState.AVAILABLE,
+                receipt=job.job_id,
+                resulting_head_state=RepairFactState.AVAILABLE,
+                resulting_head=candidate_sha,
+                synchronization_state=RepairFactState.AVAILABLE,
+                synchronized=True,
+                repository=repo_name,
+                pr_number=int(result.number or 0),
+                input_head=handoff.input_head,
+                local_handoff=handoff,
+            )
+        result.target_outcome = ExplicitTargetOutcome.DEFERRED
+        result.success = False
+        result.target_reason = f"Local PR repair job {job.job_id} is {current.state.value}; fresh PR validation remains required"
+        if current.diagnostic and publication_disposition != "published":
+            result.target_reason += f": {current.diagnostic}"
+        result.actions.append(result.target_reason)
+        result.error = None
+
+    async def _reconcile_open_github_entities(self, repo_name: str) -> None:
+        """One attempt at recovery through the normal invalidation path.
+
+        Enumeration observations never complete or clean an entity. They only
+        mark its stable identity dirty; workers subsequently perform the same
+        strict current-state fetch and eligibility decision used for webhooks.
+        Consequently, a webhook arriving after an older enumeration observation
+        cannot be cleared by reconciliation. A malformed or incomplete page
+        fails the whole operation (see ``get_open_entities_strict``), so a
+        caller never advertises recovery as complete from a partial result.
+        """
+        self.startup_reconciled = False
+        self.startup_reconciliation_error = None
+        try:
+            observation_revision = self.open_target_observations.revision()
+            entities = await asyncio.to_thread(self.github.get_open_entities_strict, repo_name)
+            open_issue_numbers = {issue.number for issue in entities.issues}
+            for issue in entities.issues:
+                not_before = issue_stabilization_deadline(issue.created_at) if issue.created_at is not None else None
+                await self.invalidate_entity(repo_name, "issue", issue.number, not_before=not_before)
+            # Webhooks are not an event log. A lane target may have closed or
+            # been reparented while the daemon was offline and therefore be
+            # absent from the open enumeration; explicitly re-authorize every
+            # such durable target so stale eligibility cannot survive restart.
+            for number in self.issue_stage_routing.targets(repo_name):
+                if number not in open_issue_numbers:
+                    await self.invalidate_entity(repo_name, "issue", number)
+            for number in entities.pull_requests:
+                await self.invalidate_entity(repo_name, "pr", number)
+            # A publication interrupted before confirmation remains a durable
+            # targeted obligation even if an enumeration implementation omits
+            # it. The subsequent PR worker always performs a fresh strict read.
+            for number in self.review_adjudications.store.tracked_prs(repo_name):
+                if number not in entities.pull_requests:
+                    await self.invalidate_entity(repo_name, "pr", number)
+        except BaseException as exc:
+            self.startup_reconciliation_error = f"{type(exc).__name__}: {exc}"
+            self.open_target_observations.fail(self.startup_reconciliation_error)
+            logger.opt(exception=True).error(f"Startup GitHub reconciliation failed for {repo_name}: {exc}")
+            raise
+        self.open_target_observations.complete(
+            [OpenTarget("issue", issue.number, created_at=issue.created_at or "") for issue in entities.issues] + [OpenTarget("pr", number) for number in entities.pull_requests],
+            observation_revision,
+        )
+        with self._lifecycle_lock:
+            if self.startup_failure is None:
+                self.startup_reconciled = True
+        logger.info(f"Startup GitHub reconciliation completed for {repo_name}: " f"{len(entities.issues)} Issues and {len(entities.pull_requests)} PRs invalidated")
+
+    async def _producer_loop(self, repo_name: str) -> None:
+        """Run time-based maintenance without polling GitHub for candidate work."""
+        logger.info("Producer started")
+        get_trace_logger().log("System", "Producer started", details={"repo_name": repo_name})
+
+        # Check closed branch once at start (as per original run method)
+        if not await self._run_local_critical("startup closed-branch reconciliation", self._check_and_handle_closed_branch, repo_name):
+            logger.info("Closed item handled on startup, continuing to producer loop")
+            get_health_monitor().record_event("producer_startup", "closed item handled on startup", repo_name)
+
+        skip_jules_sessions = False
+        iteration = 0
+        while True:
+            try:
+                iteration += 1
+                # This targeted durable consumer runs immediately on startup and
+                # at the 60-second maintenance cadence. It never calls the
+                # account-wide Jules listing used by the separate hourly cycle.
+                from .speculative_jules_lifecycle import consume_due_speculative_work
+
+                await self._run_local_critical(
+                    "speculative Jules competition maintenance",
+                    consume_due_speculative_work,
+                    repo_name,
+                    self.github,
+                    lambda number: self.invalidate_entity(repo_name, "issue", number),
+                    lambda number: self.invalidate_entity(repo_name, "pr", number),
+                )
+                if self.is_draining:
+                    return
+                heartbeat("producer:check-updates", f"iteration {iteration}")
+                # Check updates
+                await self._run_local_critical("update check", check_for_updates_and_restart)
+                if self.is_draining:
+                    return
+
+                if not skip_jules_sessions and self._claim_jules_session_list_refresh():
+                    # All list-dependent maintenance shares this cycle's fresh listing.
+                    invalidate_jules_sessions_cache()
+
+                    from .local_job_workspace_cleanup import reclaim_finalized_workspaces
+
+                    await self._run_local_critical(
+                        "local job workspace reclamation",
+                        reclaim_finalized_workspaces,
+                        self._get_local_job_store(),
+                    )
+
+                    # Resume sessions
+                    heartbeat("producer:jules-sessions", f"iteration {iteration}")
+                    await self._run_local_critical("remote session reconciliation", check_and_resume_or_archive_sessions, repo_name)
+                    if self.is_draining:
+                        return
+
+                    # Take issues away from Jules sessions that timed out without creating a PR
+                    await self._run_local_critical("stale remote session reconciliation", self.handle_stale_jules_issue_sessions, repo_name)
+
+                    if self.is_draining:
+                        return
+
+                    # Check and start recurrent Jules tasks
+                    await self.check_and_start_recurrent_jules_tasks_async(repo_name)
+                    if self.is_draining:
+                        return
+                elif skip_jules_sessions:
+                    logger.info("Resumed loop early after PR merge/close; skipping Jules session enumeration")
+                    skip_jules_sessions = False
+
+                if self.is_draining:
+                    return
+
+                heartbeat("producer:maintenance-sleep", f"{MAINTENANCE_INTERVAL_SECONDS}s")
+                woken_early = await self._sleep_or_wake(MAINTENANCE_INTERVAL_SECONDS)
+                if woken_early:
+                    skip_jules_sessions = True
+
+            except asyncio.CancelledError:
+                logger.info("Producer loop cancelled")
+                get_health_monitor().record_event("producer_exit", "cancelled", f"iteration {iteration}")
+                raise
+            except Exception as e:
+                logger.opt(exception=True).error(f"Error in producer loop: {e}")
+                get_health_monitor().record_event("producer_error", f"{type(e).__name__}: {e}", f"iteration {iteration}")
+                await asyncio.sleep(60)  # Sleep on error
+
+    async def _invalidation_loop(self, repo_name: str) -> None:
+        """Consume durable invalidations promptly, including delayed Issue work."""
+        self._invalidation_wake_event = asyncio.Event()
+        while True:
+            # Clear first so an invalidation arriving during the drain remains
+            # observable instead of being erased by a later clear.
+            self._invalidation_wake_event.clear()
+            await self._drain_ci_webhooks(repo_name)
+            await self._enqueue_pending_invalidations(repo_name)
+            delay = await asyncio.to_thread(self.invalidations.seconds_until_next_ready, repo_name)
+            ci_delay = await asyncio.to_thread(self.invalidations.seconds_until_next_ci, repo_name)
+            if ci_delay is not None:
+                delay = ci_delay if delay is None else min(delay, ci_delay)
+            try:
+                if delay is None:
+                    await self._invalidation_wake_event.wait()
+                else:
+                    await asyncio.wait_for(self._invalidation_wake_event.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                pass
+
+    async def _claude_followup_recovery_loop(self, repo_name: str) -> None:
+        """Re-enter authoritative PR evaluation when retained quota waits mature."""
+        store = get_claude_followup_wait_store()
+        assert self._shutdown_event is not None
+        while not self._shutdown_event.is_set():
+            try:
+                due_prs = await asyncio.to_thread(store.due_prs, repo_name)
+                for pr_number in due_prs:
+                    evaluation_started = time.time()
+                    raw_pr = await asyncio.to_thread(self.github.get_pull_request_metadata_strict, repo_name, pr_number)
+                    pr_data = self.github.get_pr_details(raw_pr)
+                    if str(pr_data.get("state") or raw_pr.get("state") or "").lower() == "closed":
+                        await asyncio.to_thread(store.retire_obsolete_pr_work, repo_name, pr_number, evaluation_started)
+                        continue
+                    result = await self._run_local_critical(
+                        f"Claude follow-up recovery for PR #{pr_number}",
+                        partial(
+                            self._process_single_candidate,
+                            origin="claude-followup-quota-recovery",
+                        ),
+                        repo_name,
+                        Candidate(type="pr", data=pr_data, priority=0),
+                    )
+                    if result.success and not result.error and result.outcome is PRProcessingOutcome.SUCCESS:
+                        await asyncio.to_thread(store.retire_obsolete_pr_work, repo_name, pr_number, evaluation_started)
+                next_due = await asyncio.to_thread(store.next_due_at, repo_name)
+                delay = 60.0 if next_due is None else max(1.0, next_due - time.time())
+            except Exception as exc:
+                logger.opt(exception=True).error("Claude follow-up recovery failed repository={}: {}", repo_name, exc)
+                delay = 60.0
+            try:
+                await asyncio.wait_for(self._shutdown_event.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                pass
+
+    async def _drain_ci_webhooks(self, repo_name: str) -> None:
+        """Resolve due SHA obligations, then promote quiet CI batches."""
+        while sha := await asyncio.to_thread(self.invalidations.claim_ci_correlation, repo_name):
+            try:
+                numbers = await asyncio.to_thread(self.github.get_pull_request_numbers_for_commit, repo_name, sha)
+            except Exception as exc:
+                logger.warning(f"CI correlation pending repository={repo_name} sha={sha[:12]} error={type(exc).__name__}")
+                await asyncio.to_thread(self.invalidations.release_ci_correlation, repo_name, sha)
+                break
+            completed = await asyncio.to_thread(self.invalidations.finish_ci_correlation, repo_name, sha, numbers)
+            if completed:
+                logger.info(f"CI correlation complete repository={repo_name} sha={sha[:12]} targets={len(numbers)}")
+            else:
+                logger.info(f"CI correlation superseded repository={repo_name} sha={sha[:12]}; retained for reevaluation")
+                # A sustained burst may already have exhausted the bounded
+                # quiet window. Service ready PRs before retrying this SHA.
+                break
+        promoted = await asyncio.to_thread(self.invalidations.promote_due_ci, repo_name)
+        promoted += await asyncio.to_thread(self.invalidations.promote_due_ci_watches, repo_name)
+        if promoted:
+            logger.info(f"Promoted coalesced CI batches repository={repo_name} count={promoted}")
+
+    @staticmethod
+    def _issue_refill_priority(issue: Dict[str, Any]) -> int:
+        """Apply the configured candidate scan's Issue priority semantics."""
+        labels = issue.get("labels", []) or []
+        names = {label if isinstance(label, str) else label.get("name") for label in labels if isinstance(label, (str, dict))}
+        if names.intersection({"breaking-change", "breaking", "api-change", "deprecation", "version-major"}):
+            return 7
+        return 3 if "urgent" in names else 0
+
+    @staticmethod
+    def _is_open_issue(issue: Dict[str, Any]) -> bool:
+        """Return whether an authoritative Issue snapshot is currently open."""
+        # Legacy GitHub adapters omit state for successfully fetched open
+        # Issues; an explicit closed state is nevertheless authoritative.
+        return str(issue.get("state") or "open").lower() == "open"
+
+    def _is_authoritatively_open_issue(self, issue: Dict[str, Any]) -> bool:
+        """Accept open-state evidence only when the strict snapshot supplies it."""
+        state = issue.get("state")
+        if state is None and not isinstance(self.github, GitHubClient):
+            # Small legacy/local adapters historically represent only
+            # successfully fetched open Issues and omit the REST state field.
+            return True
+        if not isinstance(state, str) or state.lower() not in {"open", "closed"}:
+            raise ParentOperationalError("authoritative Issue snapshot has unavailable or malformed state")
+        return state.lower() == "open"
+
+    @staticmethod
+    def _routing_contract(repo_name: str, snapshot: Dict[str, Any], role: str) -> ContractIdentity:
+        number = snapshot.get("number")
+        if not isinstance(number, int) or isinstance(number, bool):
+            raise ParentOperationalError("authoritative Issue snapshot omitted its number")
+        stable_id = snapshot.get("id")
+        issue_id = stable_id if isinstance(stable_id, int) and not isinstance(stable_id, bool) else number
+        return ContractIdentity(repo_name, number, issue_id, str(snapshot.get("title") or ""), str(snapshot.get("body") or ""), role)
+
+    def _compute_implementation_generation(
+        self,
+        repo_name: str,
+        snapshot: Dict[str, Any],
+        family_set: Optional[tuple[Dict[str, Any], List[Dict[str, Any]]]],
+    ) -> str:
+        """Recompute the exact Implementation generation from freshly authoritative state.
+
+        Mirrors ``_route_standalone_issue``/``_route_issue_family`` exactly
+        (same ``ContractIdentity`` construction, same family-key set) so the
+        generation bound at production ownership-acquisition time (#2061)
+        always agrees with the generation the routing store itself would
+        compute for the same authoritative snapshot (#2053).
+        """
+        if family_set is None:
+            return implementation_generation(self._routing_contract(repo_name, snapshot, "standalone"))
+        parent, children = family_set
+        parent_contract = self._routing_contract(repo_name, parent, "parent")
+        child_contracts = {int(child["number"]): self._routing_contract(repo_name, child, "child") for child in children if isinstance(child.get("number"), int)}
+        family_keys = (parent_contract.key, *(contract.key for contract in child_contracts.values()))
+        target_number = snapshot.get("number")
+        if not isinstance(target_number, int) or target_number not in child_contracts:
+            raise ParentOperationalError("authoritative family snapshot omitted the target child")
+        return implementation_generation(child_contracts[target_number], family_keys)
+
+    def _start_issue_implementation_execution(
+        self,
+        repo_name: str,
+        slots: ImplementationSlotRepository,
+        owner: ImplementationOwner,
+        generation: Optional[str],
+        **start_kwargs: Any,
+    ) -> tuple[Optional[str], bool]:
+        """Start a durable local execution, binding it to production ownership (#2061).
+
+        Returns ``(execution_id, already_owned)``. ``already_owned`` is
+        ``True`` only when this exact Implementation generation already has a
+        durable production start recorded elsewhere (REQ-002, REQ-006) and
+        must not be attempted again; every other refusal is an ordinary
+        capacity/hierarchy/generation-conflict deferral indicated by a
+        ``None`` execution id, identical to today's behavior.
+
+        ``generation`` is ``None`` for owners the ownership adapter does not
+        track (a standalone PR, or a recurrent provider-owned task); in that
+        case this is a plain passthrough to ``slots.start_execution``.
+        """
+        if generation is None:
+            return slots.start_execution(owner, **start_kwargs), False
+        routing = self.issue_stage_routing
+        gate = evaluate_implementation_start(routing, slots, repo_name, owner, generation)
+        if gate.decision is OwnershipStartDecision.ALREADY_OWNED:
+            return None, True
+        if not gate.may_start:
+            return None, False
+        begin_implementation_ownership(routing, repo_name, owner, gate)
+        execution_id = slots.start_execution(owner, generation=generation, **start_kwargs)
+        if execution_id is not None:
+            confirm_implementation_ownership(routing, repo_name, owner, generation)
+        return execution_id, False
+
+    def _pending_stale_jules_recovery(self, repo_name: str, item_number: int, generation: str) -> Optional[ImplementationRetryRequest]:
+        """Return this Issue's pending automatic stale-Jules recovery, if still current.
+
+        A pending recovery captured (by ``_close_stale_jules_pr``, Issue
+        #2286) against a since-superseded Implementation generation is
+        permanently invalidated here rather than silently reused or left to
+        linger (REQ-005); the caller then falls through to ordinary
+        admission with no special retry semantics.
+        """
+        pending = find_pending_stale_jules_recovery(self.issue_stage_routing, repo_name, item_number)
+        if pending is None:
+            return None
+        if pending.generation != generation:
+            self.issue_stage_routing.invalidate_retry_request(
+                pending.request_id,
+                generation,
+                reason="Implementation generation changed since the automatic stale-Jules recovery was captured",
+            )
+            return None
+        return pending
+
+    def _routing_members_are_stable(self, repo_name: str, members: List[Dict[str, Any]]) -> bool:
+        """Retain creation-anchored invalidations until every member is stable."""
+        stable = True
+        now = time.time()
+        for member in members:
+            number = member.get("number")
+            created_at = member.get("created_at")
+            if not isinstance(number, int) or not isinstance(created_at, str):
+                if isinstance(self.github, GitHubClient):
+                    raise ParentOperationalError("authoritative routing snapshot omitted creation evidence")
+                # Legacy test/local adapters do not claim complete GitHub
+                # authority and historically omit creation timestamps.
+                continue
+            deadline = issue_stabilization_deadline(created_at)
+            if deadline is None:
+                raise ParentOperationalError(f"Issue #{number} has an invalid creation timestamp")
+            if deadline > now:
+                self.invalidations.invalidate(EntityIdentity(repo_name, "issue", number), not_before=deadline)
+                stable = False
+        return stable
+
+    def _route_standalone_issue(self, repo_name: str, issue: Dict[str, Any]) -> None:
+        number = int(issue["number"])
+        contract = self._routing_contract(repo_name, issue, "standalone")
+        requirements: list[ReviewRequirement] = []
+        issue_is_open = self._is_authoritatively_open_issue(issue)
+        if not issue_is_open:
+            self._revoke_closed_issue_eligibility(repo_name, number)
+        if issue_is_open and self._is_issue_specification_validation_enabled(repo_name):
+            validator = self._get_specification_validator(repo_name)
+            identity = validator.identity(number, contract.title, contract.body)
+            decision = validator.store.get(identity)
+            requirements.append(ReviewRequirement("individual", number, identity.key, decision.verdict if decision is not None else None))
+        admitted = issue_is_open and is_implementation_ready(issue) and self._routing_members_are_stable(repo_name, [issue])
+        priority = self._issue_refill_priority(issue)
+        review_generation = standalone_review_generation(contract, requirements)
+        implementation_key = implementation_generation(contract)
+        self.issue_stage_routing.reconcile(review_classification(repo_name, number, review_generation, priority, admitted, requirements))
+        self.issue_stage_routing.reconcile(implementation_classification(repo_name, number, implementation_key, priority, admitted, requirements))
+
+    def _route_issue_family(self, repo_name: str, parent: Dict[str, Any], children: List[Dict[str, Any]]) -> None:
+        parent_number = int(parent["number"])
+        parent_contract = self._routing_contract(repo_name, parent, "parent")
+        child_contracts = [self._routing_contract(repo_name, child, "child") for child in children]
+        requirements: list[ReviewRequirement] = []
+        if self._is_issue_decomposition_validation_enabled(repo_name):
+            decomposition_validator = self._get_decomposition_validator(repo_name)
+            decomposition_identity = decomposition_validator.identity(parent, children)
+            decomposition_decision = decomposition_validator.store.get(decomposition_identity)
+            requirements.append(
+                ReviewRequirement(
+                    "decomposition",
+                    parent_number,
+                    decomposition_identity.key,
+                    decomposition_decision.verdict if decomposition_decision is not None else None,
+                )
+            )
+        for child in children:
+            if not self._is_authoritatively_open_issue(child):
+                self._revoke_closed_issue_eligibility(repo_name, int(child["number"]))
+        if self._is_issue_specification_validation_enabled(repo_name):
+            individual_validator = self._get_specification_validator(repo_name)
+            for child in children:
+                if not self._is_authoritatively_open_issue(child):
+                    continue
+                number = int(child["number"])
+                relationship = self._child_review_context(parent, children, number)
+                individual_identity = individual_validator.identity(number, str(child.get("title") or ""), str(child.get("body") or ""), relationship)
+                individual_decision = individual_validator.store.get(individual_identity)
+                requirements.append(
+                    ReviewRequirement(
+                        "individual",
+                        number,
+                        individual_identity.key,
+                        individual_decision.verdict if individual_decision is not None else None,
+                    )
+                )
+        stable = self._routing_members_are_stable(repo_name, [parent, *children])
+        admitted = self._is_open_issue(parent) and is_implementation_ready(parent) and stable
+        open_members = [member for member in [parent, *children] if self._is_open_issue(member)]
+        priority = max((self._issue_refill_priority(member) for member in open_members), default=0)
+        generation = family_review_generation(repo_name, parent_contract, child_contracts, requirements)
+        self.issue_stage_routing.reconcile(review_classification(repo_name, parent_number, generation, priority, admitted, requirements))
+        family_keys = (parent_contract.key, *(child.key for child in child_contracts))
+        current_child_numbers = tuple(int(child["number"]) for child in children)
+        self.issue_stage_routing.remove_departed_family_children(repo_name, parent_number, current_child_numbers)
+        for child, contract in zip(children, child_contracts):
+            number = int(child["number"])
+            # A child's own readiness label is intentionally not consulted.
+            child_admitted = admitted and self._is_open_issue(child)
+            child_priority = self._issue_refill_priority(child)
+            implementation_key = implementation_generation(contract, family_keys)
+            self.issue_stage_routing.reconcile(
+                implementation_classification(
+                    repo_name,
+                    number,
+                    implementation_key,
+                    child_priority,
+                    child_admitted,
+                    requirements,
+                    family_parent_number=parent_number,
+                )
+            )
+            self.issue_stage_routing.remove(repo_name, REVIEW_STAGE, number)
+        # Tracking parents never enter the Implementation lane.
+        self.issue_stage_routing.remove(repo_name, IMPLEMENTATION_STAGE, parent_number)
+
+    def _withdraw_closed_individual_authority(self, repo_name: str, issue_number: int, closed_period: int) -> None:
+        """Durably fence work admitted before authoritative closure was observed."""
+        reruns = self._get_specification_validator(repo_name).reruns
+        subject = ReviewSubject(repo_name, "individual", issue_number)
+        closure_request = f"observed-closure:{subject.key}:{closed_period}"
+        status = reruns.accept(closure_request, (subject,))[0]
+        reruns.defer(subject, status.authority, f"individual review for Issue #{issue_number} is deferred because the subject is closed")
+
+    def _issue_routing_lock(self, repo_name: str, issue_number: int) -> threading.RLock:
+        """Serialize strict classification and closure effects for one Issue."""
+        key = (repo_name, issue_number)
+        with self._issue_routing_locks_guard:
+            return self._issue_routing_locks.setdefault(key, threading.RLock())
+
+    def _revoke_closed_issue_eligibility(self, repo_name: str, issue_number: int) -> None:
+        """Persist every locally owned closure effect before hierarchy work.
+
+        The authority withdrawal and lane cleanup are individually idempotent.
+        If either durable write fails, the invalidation remains incomplete and
+        a later retry finishes the outstanding effect without requiring parent
+        metadata to be readable or consistent.
+        """
+        with self._issue_routing_lock(repo_name, issue_number):
+            closed_period = self.issue_stage_routing.observe_lifecycle_state(repo_name, issue_number, "closed")
+            self._withdraw_closed_individual_authority(repo_name, issue_number, closed_period)
+            self.issue_stage_routing.revoke_closed_target(repo_name, issue_number)
+
+    def _route_issue_stages_authoritatively(self, repo_name: str, issue_number: int, snapshot: Dict[str, Any]) -> None:
+        """Classify one invalidated Issue from current GitHub and decision stores."""
+        with self._issue_routing_lock(repo_name, issue_number):
+            state = snapshot.get("state")
+            if state == "open":
+                self.issue_stage_routing.observe_lifecycle_state(repo_name, issue_number, "open")
+            # Closure is authority from this exact strict snapshot. Revoke local
+            # eligibility before declaration reconciliation or hierarchy reads.
+            if state == "closed":
+                self._revoke_closed_issue_eligibility(repo_name, issue_number)
+            current = self._reconcile_validation_snapshot(repo_name, issue_number, snapshot)
+            parent_number = self._get_authoritative_parent_number(repo_name, issue_number, current)
+            if parent_number is not None:
+                family = self._fetch_authoritative_decomposition_set(repo_name, parent_number)
+                if family is None or issue_number not in {child.get("number") for child in family[1]}:
+                    raise ParentOperationalError("authoritative child family is unavailable")
+                self._route_issue_family(repo_name, *family)
+                return
+            members = self._native_direct_children(repo_name, issue_number)
+            if members is None:
+                members = []
+            if not isinstance(members, list):
+                if isinstance(self.github, GitHubClient):
+                    raise ParentOperationalError("authoritative direct-child membership is unavailable")
+                members = []
+            if members:
+                family = self._fetch_authoritative_decomposition_set(repo_name, issue_number)
+                if family is None:
+                    raise ParentOperationalError("authoritative parent family is unavailable")
+                self._route_issue_family(repo_name, *family)
+                return
+            self.issue_stage_routing.remove_departed_family_children(repo_name, issue_number, ())
+            self._route_standalone_issue(repo_name, current)
+
+    def _refresh_issue_stage_routing(self, repo_name: str, issue_number: int) -> None:
+        """Reclassify after processing from a new strict GitHub snapshot."""
+        with self._issue_routing_lock(repo_name, issue_number):
+            try:
+                snapshot = self.github.get_issue_dispatch_snapshot_strict(repo_name, issue_number)
+            except httpx.HTTPStatusError as error:
+                if error.response.status_code == 404:
+                    self.issue_stage_routing.remove_target(repo_name, issue_number)
+                    return
+                raise
+            if not isinstance(snapshot, dict) or snapshot.get("number") != issue_number or "pull_request" in snapshot:
+                raise ParentOperationalError(f"cannot refresh Issue #{issue_number} routing from ambiguous authority")
+            self._route_issue_stages_authoritatively(repo_name, issue_number, snapshot)
+
+    def _create_and_prepare_closed_issue_candidate(self, repo_name: str, issue_number: int) -> tuple[Optional[Candidate], bool]:
+        """Bind a worker's strict closed read to all closure/family effects."""
+        with self._issue_routing_lock(repo_name, issue_number):
+            factory = self._create_candidate_from_single
+            # Candidate sources can implement the established four-argument
+            # protocol. The production factory additionally accepts the
+            # narrowly scoped cancellation flag; detect that capability rather
+            # than breaking alternate sources with a fifth positional value.
+            if "cancel_initial_refusal" in inspect.signature(factory).parameters:
+                candidate = factory(repo_name, "issue", issue_number, True, cancel_initial_refusal=True)
+            else:
+                candidate = factory(repo_name, "issue", issue_number, True)
+            if candidate is None or candidate.data.get("state") != "closed":
+                return candidate, False
+            self.issue_admission_cache.observe(repo_name, candidate.data, authoritative=True)
+            self._route_issue_stages_authoritatively(repo_name, issue_number, candidate.data)
+            if self._get_authoritative_parent_number(repo_name, issue_number, candidate.data) is not None:
+                try:
+                    self._validate_submitted_parent_generation_for_child(repo_name, issue_number, candidate.data)
+                finally:
+                    self._route_issue_stages_authoritatively(repo_name, issue_number, candidate.data)
+            return candidate, True
+
+    def _get_review_service(self, repo_name: str) -> IssueReviewService:
+        """Build the Review-lane execution owner for one repository.
+
+        Semantic Issue review runs only inside this service on the
+        independent review scheduler. Implementation-start paths observe
+        durable decisions through ``_review_individual_via_lane`` instead
+        of submitting new validation jobs themselves (REQ-010).
+        """
+        return IssueReviewService(
+            routing=self.issue_stage_routing,
+            scheduler=self.review_scheduler,
+            repository=repo_name,
+            specification_factory=lambda: self._get_specification_validator(repo_name),
+            decomposition_factory=lambda: self._get_decomposition_validator(repo_name),
+            reconcile=lambda number, snapshot=None: self._reconcile_review_target(repo_name, number, snapshot),
+            describe=lambda number: self._describe_current_review_identities(repo_name, number),
+            github_provider=lambda: self.github,
+            fetch_set=lambda number: self._fetch_authoritative_decomposition_set(repo_name, number),
+            trace_job=self._traced_validation_job,
+        )
+
+    def pump_issue_review_lane(self, repo_name: str, origin: str = "review-lane-pump", max_items: int = 8) -> list[LaneItemOutcome]:
+        """Execute pending Review-lane work; startup, webhook, and recovery origins use this.
+
+        This is the production execution owner for semantic Issue review.
+        It never acquires implementation slots or dispatches implementation.
+        """
+        return self._get_review_service(repo_name).pump(origin, max_items)
+
+    def pump_issue_implementation_lane(
+        self,
+        repo_name: str,
+        origin: str = "implementation-lane-pump",
+        max_items: int = 8,
+    ) -> list[ImplementationLaneOutcome]:
+        """Consume durable implementation work in priority/FIFO order.
+
+        Routing refresh is deliberately the worker's only review-facing
+        operation: it reads durable decisions while semantic execution remains
+        exclusively owned by :meth:`pump_issue_review_lane`.
+        """
+        worker = IssueImplementationWorker(self.issue_stage_routing)
+        outcomes: list[ImplementationLaneOutcome] = []
+
+        def refresh(item: PendingLaneItem) -> Optional[PendingLaneItem]:
+            self._refresh_issue_stage_routing(repo_name, item.target_number)
+            return self.issue_stage_routing.get(repo_name, IMPLEMENTATION_STAGE, item.target_number)
+
+        def dispatch(item: PendingLaneItem) -> str:
+            snapshot = self.github.get_issue_dispatch_snapshot_strict(repo_name, item.target_number)
+            if not isinstance(snapshot, dict) or snapshot.get("number") != item.target_number:
+                return "stale"
+            self._lane_context.implementation = True
+            try:
+                result = self._process_single_candidate_unified(
+                    repo_name,
+                    Candidate("issue", snapshot, item.priority),
+                    self.config,
+                    origin=origin,
+                )
+            finally:
+                self._lane_context.implementation = False
+            if self.issue_stage_routing.is_implementation_owned(repo_name, item.target_number, item.generation) and not self.issue_stage_routing.implementation_not_started(repo_name, item.target_number, item.generation):
+                return "owned"
+            if result.target_outcome in {ExplicitTargetOutcome.SKIPPED, ExplicitTargetOutcome.BLOCKED}:
+                return "stale"
+            return "deferred"
+
+        for _ in range(max(0, max_items)):
+            outcome = worker.run_one(repo_name, refresh=refresh, dispatch=dispatch)
+            if outcome is None:
+                break
+            outcomes.append(outcome)
+        return outcomes
+
+    def accept_issue_review_rerun(self, request_id: str, subjects: Sequence[ReviewSubject]) -> tuple[SubjectRerunStatus, ...]:
+        """Accept a rerun and materialize its current Review-lane admission.
+
+        Acceptance itself is one durable transaction and never waits for a
+        reviewer invocation.  The following current-state pass either creates
+        durable Review-lane work or records why the subject is deferred.
+        """
+        if not subjects:
+            raise ValueError("at least one review subject is required")
+        repositories = {subject.repository.strip().lower() for subject in subjects}
+        if len(repositories) != 1:
+            raise ValueError("one rerun request must target exactly one repository")
+        repository = next(iter(repositories))
+        operation = IssueReviewRerunOperation(self._get_specification_validator(repository).reruns)
+        return operation.accept(request_id, subjects, lambda subject: self._admit_issue_review_rerun(subject))
+
+    def _admit_issue_review_rerun(self, subject: ReviewSubject) -> Optional[str]:
+        """Create reconstructible review-only work or explain its deferral."""
+        snapshot = self.github.get_issue_dispatch_snapshot_strict(subject.repository, subject.issue_number)
+        if not isinstance(snapshot, dict) or snapshot.get("number") != subject.issue_number or "pull_request" in snapshot:
+            return f"authoritative Issue #{subject.issue_number} snapshot is unavailable"
+        if subject.kind == "individual" and not self._is_authoritatively_open_issue(snapshot):
+            if isinstance(snapshot.get("state"), str) and str(snapshot["state"]).lower() == "closed":
+                return f"individual review for Issue #{subject.issue_number} is deferred because the subject is closed"
+            return f"individual review for Issue #{subject.issue_number} is deferred because authoritative open-state evidence is unavailable"
+        self._route_issue_stages_authoritatively(subject.repository, subject.issue_number, snapshot)
+        target_number = subject.issue_number
+        parent_number = self._get_authoritative_parent_number(subject.repository, subject.issue_number, snapshot)
+        if parent_number is not None:
+            target_number = parent_number
+        item = self.issue_stage_routing.get(subject.repository, REVIEW_STAGE, target_number)
+        if item is None:
+            return f"current authoritative admission deferred {subject.kind} review for Issue #{subject.issue_number}"
+        return None
+
+    def _recover_issue_review_reruns(self, repo_name: str) -> tuple[SubjectRerunStatus, ...]:
+        """Reconstruct accepted work after a crash between accept and wake."""
+        operation = IssueReviewRerunOperation(self._get_specification_validator(repo_name).reruns)
+        return operation.recover(repo_name, lambda subject: self._admit_issue_review_rerun(subject))
+
+    def _reconcile_review_target(self, repo_name: str, issue_number: int, snapshot: Optional[Dict[str, Any]] = None) -> Optional[ReconciledReviewTarget]:
+        """Refresh one Review target from authoritative state for one lane attempt."""
+        if snapshot is None:
+            snapshot = self.github.get_issue_dispatch_snapshot_strict(repo_name, issue_number)
+        if not isinstance(snapshot, dict):
+            return None
+        try:
+            self._route_issue_stages_authoritatively(repo_name, issue_number, snapshot)
+        except (ParentSpecificationError, ParentOperationalError):
+            return None
+        item = self.issue_stage_routing.get(repo_name, REVIEW_STAGE, issue_number)
+        if item is None:
+            try:
+                parent_number = self._get_authoritative_parent_number(repo_name, issue_number, snapshot)
+            except (ParentSpecificationError, ParentOperationalError):
+                return None
+            if parent_number is not None and parent_number != issue_number:
+                return self._reconcile_review_target(repo_name, parent_number)
+            return self._terminal_recovery_target(repo_name, issue_number, snapshot)
+        try:
+            descriptors = self._review_target_descriptors(repo_name, issue_number, snapshot)
+        except (ParentSpecificationError, ParentOperationalError):
+            return None
+        if descriptors is None or not set(item.remaining_identity_keys).issubset({descriptor.identity_key for descriptor in descriptors}):
+            return None
+
+        def reevaluate() -> None:
+            try:
+                self._refresh_issue_stage_routing(repo_name, issue_number)
+            except Exception:
+                logger.opt(exception=True).debug("Review handoff reevaluation failed for issue#{}; leaving durable state", issue_number)
+
+        return ReconciledReviewTarget(issue_number, item.generation, descriptors, reevaluate)
+
+    def _terminal_recovery_target(self, repo_name: str, issue_number: int, snapshot: Dict[str, Any]) -> Optional[ReconciledReviewTarget]:
+        """Rebuild a completed generation from durable terminal decisions.
+
+        After a crash between decision persistence and the routing wake, the
+        pending item is gone but every enabled exact-current identity is
+        durably terminal. The generation is recomputed from the same
+        contracts and stored verdicts the routing classification uses, so
+        recovery re-issues effects and the wake without a new review.
+        """
+        try:
+            descriptors = self._review_target_descriptors(repo_name, issue_number, snapshot)
+        except (ParentSpecificationError, ParentOperationalError):
+            return None
+        if not descriptors:
+            return None
+        validator = self._get_specification_validator(repo_name)
+        decomposition_validator = self._get_decomposition_validator(repo_name)
+        requirements: list[ReviewRequirement] = []
+        for descriptor in descriptors:
+            if descriptor.kind == "decomposition":
+                if descriptor.identity is None:
+                    return None
+                decomposition_stored = decomposition_validator.store.get(descriptor.identity)
+                if decomposition_stored is None or decomposition_stored.verdict not in {"READY", "BLOCKED"}:
+                    return None
+                requirements.append(ReviewRequirement("decomposition", issue_number, descriptor.identity_key, decomposition_stored.verdict))
+            else:
+                individual_identity = validator.identity(descriptor.number, descriptor.title, descriptor.body, descriptor.relationship)
+                if individual_identity.key != descriptor.identity_key:
+                    return None
+                individual_stored = validator.store.get(individual_identity)
+                if individual_stored is None or individual_stored.verdict not in {"READY", "BLOCKED"}:
+                    return None
+                requirements.append(ReviewRequirement(descriptor.kind, descriptor.number, descriptor.identity_key, individual_stored.verdict))
+        parent_number = self._get_authoritative_parent_number(repo_name, issue_number, snapshot)
+        if parent_number is not None:
+            return None
+        members = self._native_direct_children(repo_name, issue_number)
+        if members is None:
+            members = []
+        if not isinstance(members, list):
+            members = []
+        if members:
+            family = self._fetch_authoritative_decomposition_set(repo_name, issue_number)
+            if family is None:
+                return None
+            parent_contract = self._routing_contract(repo_name, family[0], "parent")
+            child_contracts = [self._routing_contract(repo_name, child, "child") for child in family[1]]
+            generation = family_review_generation(repo_name, parent_contract, child_contracts, requirements)
+        else:
+            contract = self._routing_contract(repo_name, snapshot, "standalone")
+            generation = standalone_review_generation(contract, requirements)
+
+        def reevaluate() -> None:
+            try:
+                self._refresh_issue_stage_routing(repo_name, issue_number)
+            except Exception:
+                logger.opt(exception=True).debug("Review recovery reevaluation failed for issue#{}; leaving durable state", issue_number)
+
+        return ReconciledReviewTarget(issue_number, generation, descriptors, reevaluate)
+
+    def _describe_current_review_identities(self, repo_name: str, issue_number: int) -> Optional[tuple[Any, ...]]:
+        """Describe enabled exact-current identities without requiring a pending item.
+
+        Effect-authority checks use this so a persisted terminal decision can
+        authorize its publication effects even after routing removed the
+        completed pending item.
+        """
+        try:
+            snapshot = self.github.get_issue_dispatch_snapshot_strict(repo_name, issue_number)
+        except Exception:
+            return None
+        if not isinstance(snapshot, dict):
+            return None
+        try:
+            return self._review_target_descriptors(repo_name, issue_number, snapshot)
+        except (ParentSpecificationError, ParentOperationalError):
+            return None
+        except Exception:
+            logger.opt(exception=True).debug("Review identity refresh failed for issue#{}; deferring", issue_number)
+            return None
+
+    def _review_target_descriptors(self, repo_name: str, issue_number: int, snapshot: Dict[str, Any]) -> Optional[tuple[Any, ...]]:
+        """Describe every enabled exact-current validation identity for one lane target."""
+        parent_number = self._get_authoritative_parent_number(repo_name, issue_number, snapshot)
+        if parent_number is not None:
+            family = self._fetch_authoritative_decomposition_set(repo_name, parent_number)
+            if family is None:
+                return None
+            member_numbers = {int(parent_number)}
+            member_numbers.update(int(child["number"]) for child in family[1] if isinstance(child.get("number"), int))
+            if issue_number not in member_numbers:
+                return None
+            return self._family_review_descriptors(repo_name, family)
+        members = self._native_direct_children(repo_name, issue_number)
+        if members is None:
+            members = []
+        if not isinstance(members, list):
+            if isinstance(self.github, GitHubClient):
+                return None
+            members = []
+        if members:
+            family = self._fetch_authoritative_decomposition_set(repo_name, issue_number)
+            if family is None:
+                return None
+            return self._family_review_descriptors(repo_name, family)
+        if not self._is_authoritatively_open_issue(snapshot) or not self._is_issue_specification_validation_enabled(repo_name):
+            return ()
+        validator = self._get_specification_validator(repo_name)
+        title = str(snapshot.get("title") or "")
+        body = str(snapshot.get("body") or "")
+        manifest = build_normative_issue_manifest(issue_number, title, body)
+        return (build_individual_descriptor(validator, issue_number, title, body, manifest),)
+
+    def _family_review_descriptors(self, repo_name: str, authoritative_set: tuple[Dict[str, Any], List[Dict[str, Any]]]) -> tuple[Any, ...]:
+        """Describe the decomposition identity plus every enabled child identity."""
+        parent, children = authoritative_set
+        parent_number = int(parent["number"])
+        descriptors: list[Any] = []
+        if self._is_issue_decomposition_validation_enabled(repo_name):
+            decomposition = self._get_decomposition_validator(repo_name)
+            parent_manifest = build_normative_issue_manifest(parent_number, str(parent.get("title") or ""), str(parent.get("body") or ""))
+            child_inputs = [
+                DecompositionIssue(
+                    build_normative_issue_manifest(int(child["number"]), str(child.get("title") or ""), str(child.get("body") or "")),
+                    str(child.get("body") or ""),
+                )
+                for child in children
+            ]
+            descriptors.append(
+                build_decomposition_descriptor(
+                    decomposition,
+                    parent_number,
+                    parent,
+                    children,
+                    DecompositionIssue(parent_manifest, str(parent.get("body") or "")),
+                    child_inputs,
+                )
+            )
+        if self._is_authoritatively_open_issue(parent) and self._is_issue_specification_validation_enabled(repo_name):
+            individual = self._get_specification_validator(repo_name)
+            for child in children:
+                if not self._is_authoritatively_open_issue(child):
+                    continue
+                number = int(child["number"])
+                title = str(child.get("title") or "")
+                body = str(child.get("body") or "")
+                manifest = build_normative_issue_manifest(number, title, body)
+                relationship = self._child_review_context(parent, children, number)
+                descriptors.append(build_individual_descriptor(individual, number, title, body, manifest, relationship, "child", parent_number))
+        return tuple(descriptors)
+
+    def _review_individual_via_lane(
+        self,
+        repo_name: str,
+        issue_number: int,
+        title: str,
+        body: str,
+        relationship_context: Optional[IndividualRelationshipContext],
+        origin: str,
+        snapshot: Optional[Dict[str, Any]] = None,
+    ) -> tuple[Optional[ValidationDecision], bool]:
+        """Observe a durable individual decision; the Review lane owns execution.
+
+        Implementation-start paths call this instead of submitting a new
+        validation job. A reusable terminal decision is returned without a
+        new reviewer-backend invocation; otherwise the lane reviews the
+        exact-current identity and the caller observes the durable outcome.
+        The flag reports whether this pass already applied the decision's
+        BLOCKED effects, so gates never publish twice for one observation.
+        """
+        validator = self._get_specification_validator(repo_name)
+        identity = validator.identity(issue_number, title, body, relationship_context)
+        if getattr(self._lane_context, "implementation", False):
+            # This lane only consumes previously persisted authority. Missing
+            # evidence remains routed to Review by the authoritative refresh.
+            return validator.store.get(identity), False
+        outcome = self._get_review_service(repo_name).pump_target(issue_number, origin, snapshot)
+        if outcome is not None:
+            decision = outcome.decisions.get(identity.key)
+            if isinstance(decision, ValidationDecision):
+                return decision, identity.key in outcome.applied_identity_keys
+        return self._verify_stored_individual_decision(validator, issue_number, title, body, relationship_context, identity), False
+
+    @staticmethod
+    def _verify_stored_individual_decision(
+        validator: SpecificationValidationLifecycle,
+        issue_number: int,
+        title: str,
+        body: str,
+        relationship_context: Optional[IndividualRelationshipContext],
+        identity: Any,
+    ) -> Optional[ValidationDecision]:
+        """Re-establish terminal-reuse authority for an already-persisted identity.
+
+        This re-validation never invokes the reviewer backend for an
+        authorized terminal: the lifecycle returns the stored decision after
+        checking evidence, baselines, and Objective anchors, and unavailable
+        or inconsistent authority becomes retryable ERROR (REQ-019).
+        """
+        stored = validator.store.get(identity)
+        if stored is None or stored.verdict not in {"READY", "BLOCKED"}:
+            return None
+        manifest = build_normative_issue_manifest(issue_number, title, body)
+        verified = validator.decide(manifest, title, body, relationship_context)
+        if verified.verdict in {"READY", "BLOCKED"} and verified.identity == identity:
+            return verified
+        return None
+
+    async def _refill_normal_implementation_slots(self, repo_name: str) -> bool:
+        """Evaluate one level-triggered refill obligation from fresh GitHub state.
+
+        Returning false keeps the obligation pending. Candidate rejection is a
+        completed evaluation, while an incomplete enumeration is not.
+        """
+        async with self._refill_lock:
+            slots = self._get_implementation_slots(repo_name)
+            entry_capacity = await self._observe_refill_capacity(repo_name, slots, "refill_entry_capacity_observation")
+            if entry_capacity is None:
+                return False
+            if entry_capacity[0] == 0:
+                return True
+            blocked_issue_numbers: set[int] = set()
+            reconciliation_retry_required = False
+            try:
+                entities = await asyncio.to_thread(self.github.get_open_entities_strict, repo_name)
+                candidates: List[Candidate] = []
+                open_issue_snapshots: List[Dict[str, Any]] = []
+                for observed in entities.issues:
+                    if self._future_issue_admission_deferral(repo_name, observed.number) is not None:
+                        blocked_issue_numbers.add(observed.number)
+                        continue
+                    try:
+                        snapshot = await asyncio.to_thread(
+                            self.github.get_issue_dispatch_snapshot_strict,
+                            repo_name,
+                            observed.number,
+                        )
+                    except GitHubRequestDeferred as exc:
+                        deferred = _reconciliation_admission_deferral(exc)
+                        if deferred is None:
+                            raise
+                        self._defer_issue_evaluation(
+                            repo_name,
+                            observed.number,
+                            {"number": observed.number},
+                            deferred,
+                            CandidateProcessingResult(type="issue", number=observed.number),
+                            revision_known=False,
+                        )
+                        blocked_issue_numbers.add(observed.number)
+                        continue
+                    if not isinstance(snapshot, dict) or snapshot.get("number") != observed.number:
+                        raise RuntimeError(f"GitHub returned an ambiguous Issue snapshot for #{observed.number}")
+                    if "pull_request" in snapshot or not self._is_open_issue(snapshot):
+                        continue
+                    pending_identity = WorkIdentity(repo_name, f"issue:{observed.number}", ISSUE_PROCESSING_STAGE, _issue_content_revision(snapshot))
+                    pending_reconciliation = get_pending_work_store(repo_name).get(pending_identity)
+                    if pending_reconciliation is not None and pending_reconciliation.reason is PendingReason.ADMISSION_DEFERRED:
+                        blocked_issue_numbers.add(observed.number)
+                        continue
+                    if isinstance(self.github, GitHubClient) and isinstance(snapshot.get("id"), int) and parse_parent_declaration(snapshot.get("body")).status is not ParentDeclarationStatus.ABSENT:
+                        declaration = parse_parent_declaration(snapshot.get("body"))
+                        try:
+                            snapshot = await asyncio.to_thread(self._reconcile_parent_issue, repo_name, observed.number, snapshot)
+                        except ParentSpecificationError as exc:
+                            blocked_issue_numbers.add(observed.number)
+                            if declaration.parent_number is not None:
+                                blocked_issue_numbers.add(declaration.parent_number)
+                            logger.warning("Blocked relationship reconciliation for {}/#{} during refill: {}", repo_name, observed.number, exc)
+                            continue
+                        except ParentOperationalError as exc:
+                            blocked_issue_numbers.add(observed.number)
+                            if declaration.parent_number is not None:
+                                blocked_issue_numbers.add(declaration.parent_number)
+                            deferred_result = self._defer_wrapped_reconciliation(
+                                repo_name,
+                                observed.number,
+                                snapshot,
+                                exc,
+                                CandidateProcessingResult(type="issue", number=observed.number, title=str(snapshot.get("title") or "")),
+                            )
+                            if deferred_result is not None:
+                                continue
+                            reconciliation_retry_required = True
+                            logger.warning("Deferred relationship reconciliation for {}/#{} during refill: {}", repo_name, observed.number, exc)
+                            continue
+                    issue_data = self.github.get_issue_details(snapshot)
+                    if not isinstance(issue_data, dict) or issue_data.get("number") != observed.number:
+                        raise RuntimeError(f"GitHub returned invalid Issue details for #{observed.number}")
+                    open_issue_snapshots.append(issue_data)
+                metadata_children: Dict[int, List[int]] = {}
+                for issue_data in open_issue_snapshots:
+                    if issue_data["number"] in blocked_issue_numbers:
+                        continue
+                    number = issue_data["number"]
+                    native_parent = await asyncio.to_thread(self.github.get_parent_issue_number_strict, repo_name, number) if isinstance(self.github, GitHubClient) else issue_data.get("parent_issue_number")
+                    parent = native_parent if isinstance(native_parent, int) else None
+                    # Minimal adapters and legacy synthetic fixtures do not
+                    # expose the database ID needed by GitHub's mutation API.
+                    # Production snapshots always do and were reconciled above.
+                    if parent is None and not isinstance(issue_data.get("id"), int):
+                        parent = parse_parent_issue_number(str(issue_data.get("body") or ""), current_issue_number=number)
+                    if parent is not None:
+                        metadata_children.setdefault(parent, []).append(number)
+                for issue_data in open_issue_snapshots:
+                    if issue_data["number"] in blocked_issue_numbers:
+                        continue
+                    if not self._is_issue_author_allowed(issue_data):
+                        continue
+                    candidate = Candidate(type="issue", data=issue_data, priority=self._issue_refill_priority(issue_data), issue_number=issue_data["number"])
+                    candidate.data["refill_metadata_open_children"] = metadata_children
+                    candidates.append(candidate)
+                candidates.sort(key=lambda value: (-value.priority, value.data.get("created_at", ""), value.issue_number or 0))
+            except PendingWorkPersistenceError as exc:
+                self._record_refill_fault(
+                    repo_name,
+                    None,
+                    "refill_enumeration_persistence",
+                    exc,
+                    "intervention_required",
+                )
+                return True
+            except Exception as exc:
+                logger.warning(f"Authoritative Issue refill enumeration failed for {repo_name}; obligation remains pending: {exc}")
+                return False
+
+            retry_required = reconciliation_retry_required
+            for candidate in candidates:
+                if self._refill_admission_paused(repo_name, candidate.issue_number, "issue"):
+                    continue
+                candidate_capacity = await self._observe_refill_capacity(repo_name, slots, "candidate_capacity_observation")
+                if candidate_capacity is None:
+                    return False
+                if candidate_capacity[0] == 0:
+                    break
+                # The common dispatch path repeats strict readiness, contract,
+                # hierarchy, ownership, authorization, duplicate and atomic
+                # capacity admission checks immediately before implementation.
+                if self.is_draining:
+                    return True
+                try:
+                    result = await self._run_local_critical(
+                        f"capacity refill issue #{candidate.issue_number}",
+                        partial(self._process_single_candidate, origin="capacity-refill-intake"),
+                        repo_name,
+                        candidate,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self._record_candidate_refill_exception(repo_name, candidate.issue_number, exc)
+                    # A target-scoped fault must not prevent an independent
+                    # candidate from using remaining capacity in this pass.
+                    continue
+                retry_required = retry_required or result.refill_retry_required
+            return not retry_required
+
+    def _record_candidate_refill_exception(self, repo_name: str, candidate_number: Optional[int], exc: Exception) -> None:
+        """Classify an escaped refill dispatch from authoritative failure scope."""
+        persistence_failure = isinstance(exc, PendingWorkPersistenceError)
+        target = None if persistence_failure else getattr(exc, "_auto_coder_fault_issue", candidate_number)
+        phase = "pending_work_persistence" if persistence_failure else "candidate_dispatch"
+        self._record_refill_fault(repo_name, target, phase, exc, "intervention_required")
+
+    def _record_refill_fault(
+        self,
+        repo_name: str,
+        target: Optional[int],
+        phase: str,
+        exc: Exception,
+        disposition: str,
+        retry_not_before: Optional[float] = None,
+    ) -> None:
+        fault = RefillFault(repo_name, target, phase, type(exc).__name__, disposition, retry_not_before)
+        key = (repo_name, target, disposition)
+        with self._refill_faults_lock:
+            previous = self._refill_faults.get(key)
+            self._refill_faults[key] = fault
+        if previous != fault:
+            logger.opt(exception=exc).error(
+                "Capacity refill fault repository={} target={} phase={} disposition={} retry_not_before={}",
+                repo_name,
+                target,
+                phase,
+                disposition,
+                retry_not_before,
+            )
+
+    def _clear_capacity_fault(self, repo_name: str) -> None:
+        with self._refill_faults_lock:
+            self._refill_faults = {key: fault for key, fault in self._refill_faults.items() if not (fault.repository == repo_name and fault.disposition == "capacity_unavailable")}
+
+    def _refill_admission_paused(self, repo_name: str, target: Optional[int], item_type: str = "issue") -> bool:
+        with self._refill_faults_lock:
+            return any(fault.repository == repo_name and (fault.disposition == "capacity_unavailable" or (fault.disposition == "intervention_required" and (fault.target is None or (item_type == "issue" and fault.target == target)))) for fault in self._refill_faults.values())
+
+    def _refill_fault_snapshot(self) -> tuple[RefillFault, ...]:
+        with self._refill_faults_lock:
+            return tuple(self._refill_faults.values())
+
+    async def _observe_refill_capacity(self, repo_name: str, slots: ImplementationSlotRepository, phase: str) -> Optional[tuple[int, tuple[int, int]]]:
+        try:
+            observation = await asyncio.to_thread(slots.normal_capacity_snapshot)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            retry_at = time.time() + max(1.0, min(60.0, REFILL_RETRY_INTERVAL_SECONDS))
+            self._record_refill_fault(repo_name, None, phase, exc, "capacity_unavailable", retry_at)
+            return None
+        self._clear_capacity_fault(repo_name)
+        return observation
+
+    async def _run_due_reclamation_checks(self, repo_name: str, slots: ImplementationSlotRepository) -> int:
+        """Service due terminal-PR-backed reclamation obligations for *repo_name* once.
+
+        Issue #2148 REQ-003/REQ-006: piggybacks on the existing capacity-refill
+        loop tick rather than adding a new global poller. On any release, the
+        capacity-refill path for the same daemon run is invoked directly so a
+        freed slot can admit a new Issue without waiting for an unrelated
+        webhook or the next scheduled tick.
+        """
+        jules_client: Optional[Any] = None
+        try:
+            from .jules_client import JulesClient
+
+            jules_client = JulesClient()
+        except Exception as exc:
+            logger.debug(f"Jules client unavailable for reclamation checks on {repo_name}: {exc}")
+
+        cloud_manager: Optional[Any] = None
+        cloud_run_store: Optional[Any] = None
+        cloud_provider_stores_available = True
+        codex_wham_client: Optional[Any] = None
+        try:
+            from .cloud_manager import CloudManager
+            from .cloud_run import CloudRunRepository
+            from .codex_wham_client import CodexWhamClient
+
+            cloud_manager = CloudManager(repo_name)
+            cloud_run_store = CloudRunRepository(repo_name)
+            codex_wham_client = CodexWhamClient()
+        except Exception as exc:
+            cloud_provider_stores_available = False
+            logger.debug(f"Cloud provider stores unavailable for reclamation checks on {repo_name}: {exc}")
+
+        def _on_capacity_freed() -> None:
+            self._refill_wake_requested = True
+
+        try:
+            return await asyncio.to_thread(
+                run_due_reclamation_checks,
+                slots,
+                None,
+                github_client=self.github,
+                jules_client=jules_client,
+                cloud_manager=cloud_manager,
+                cloud_run_store=cloud_run_store,
+                cloud_provider_stores_available=cloud_provider_stores_available,
+                codex_wham_client=codex_wham_client,
+                routing=self.issue_stage_routing,
+                on_capacity_freed=_on_capacity_freed,
+            )
+        except Exception as exc:
+            logger.error(f"Reclamation due-check pass failed for {repo_name}: {exc}")
+            return 0
+
+    async def _capacity_refill_loop(self, repo_name: str) -> None:
+        """Observe shared slot state and service capacity transitions without GitHub polling."""
+        try:
+            slots = self._get_implementation_slots(repo_name)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Shared-state initialization cannot be classified as a safe read
+            # retry. Keep the service alive but repository-paused until the
+            # engine is intentionally stopped.
+            self._record_refill_fault(repo_name, None, "service_initialization", exc, "intervention_required")
+            while True:
+                await asyncio.sleep(CAPACITY_STATE_CHECK_INTERVAL_SECONDS)
+        previous_count = 0
+        previous_identity: Optional[tuple[int, int]] = None
+        refill_pending = False
+        capacity_initialized = False
+        while True:
+            try:
+                self._refill_wake_requested = False
+                await self._run_due_reclamation_checks(repo_name, slots)
+                if self._refill_wake_requested:
+                    refill_pending = True
+                observed = await self._observe_refill_capacity(repo_name, slots, "capacity_observation")
+                if observed is None:
+                    # A successful recovery must service the opportunity even
+                    # when no later slot transition or webhook occurs.
+                    refill_pending = True
+                    await asyncio.sleep(max(1.0, min(60.0, REFILL_RETRY_INTERVAL_SECONDS)))
+                    continue
+                available_count, identity = observed
+                if available_count > 0 and (refill_pending or (capacity_initialized and (previous_count == 0 or identity != previous_identity))):
+                    refill_pending = True
+                    logger.info("Normal implementation capacity became available; requesting fresh Issue refill")
+                previous_count, previous_identity = available_count, identity
+                capacity_initialized = True
+                if refill_pending and available_count > 0 and not self._refill_admission_paused(repo_name, None):
+                    refill_pending = not await self._refill_normal_implementation_slots(repo_name)
+                    current = await self._observe_refill_capacity(repo_name, slots, "post_dispatch_capacity_observation")
+                    if current is None:
+                        refill_pending = True
+                        await asyncio.sleep(max(1.0, min(60.0, REFILL_RETRY_INTERVAL_SECONDS)))
+                        continue
+                    current_count, current_identity = current
+                    if current_count > 0 and current_identity != previous_identity:
+                        refill_pending = True
+                    previous_count, previous_identity = current_count, current_identity
+                delay = REFILL_RETRY_INTERVAL_SECONDS if refill_pending else CAPACITY_STATE_CHECK_INTERVAL_SECONDS
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._record_refill_fault(repo_name, None, "service_control", exc, "intervention_required")
+                delay = CAPACITY_STATE_CHECK_INTERVAL_SECONDS
+            await asyncio.sleep(delay)
+
+    async def _worker_loop(self, repo_name: str, worker_id: int, item_type: Optional[str] = None) -> None:
+        """Process candidates from the selected queue lane."""
+        with active_repo_context(repo_name):
+            logger.info(f"Worker {worker_id} started")
+            get_trace_logger().log("System", f"Worker {worker_id} started")
+
+            while True:
+                heartbeat(f"worker-{worker_id}:idle", f"queue={self.queue.qsize()}")
+                candidate = await self.queue.get_for_type(item_type)
+                if self.is_draining:
+                    # Durable queued ownership remains recoverable by recover()
+                    # on the next run; shutdown never executes it merely to
+                    # empty this process's in-memory queue.
+                    self.queue.task_done()
+                    return
+                item_number = candidate.data.get("number", "N/A")
+                decision_completed = False
+                deferral_committed = False
+                stop_after_persistence_failure = False
+                retry_failed_processing = False
+                definitive_refusal_reason: Optional[str] = None
+                unfinished_processing_disposition = False
+                invalidation_claim: Optional[ClaimedInvalidation] = None
+                repo_job_scope: Optional[RepoJobExecutionScope] = None
+                closed_issue_prepared = False
+
+                # Ownership starts at dequeue, including authoritative refresh
+                # and submitted-parent validation before ordinary dispatch.
+                self.active_workers[worker_id] = candidate
+                heartbeat(f"worker-{worker_id}:processing", f"{candidate.type} #{item_number}")
+                try:
+                    if candidate.invalidation_generation is not None:
+                        invalidation_claim = ClaimedInvalidation(
+                            EntityIdentity(repo_name, candidate.type, int(item_number)),
+                            candidate.invalidation_generation,
+                            candidate.urgent_admission,
+                        )
+                        if not await asyncio.to_thread(self.invalidations.begin_processing, invalidation_claim):
+                            continue
+                        if candidate.type == "issue":
+                            pending_admission = await asyncio.to_thread(
+                                self._future_issue_admission_deferral,
+                                repo_name,
+                                int(item_number),
+                            )
+                            if pending_admission is not None:
+                                await asyncio.to_thread(
+                                    self.invalidations.defer,
+                                    invalidation_claim,
+                                    pending_admission.reason.value,
+                                    pending_admission.not_before,
+                                    "pending-work-admission-deadline",
+                                )
+                                deferral_committed = True
+                                logger.info(
+                                    "Worker {} retained issue #{} until pending admission deadline {}",
+                                    worker_id,
+                                    item_number,
+                                    pending_admission.not_before,
+                                )
+                                continue
+                        if candidate.type == "dependency":
+                            repo_job_scope = await self._expand_dependency_obligation(repo_name)
+                            decision_completed = True
+                            continue
+                        if candidate.type == "issue":
+                            refusal = await asyncio.to_thread(self._cached_issue_refusal, repo_name, int(item_number), self.config)
+                            if refusal is not None:
+                                self._record_cached_issue_refusal(repo_name, refusal, "durable-invalidation-worker")
+                                decision_completed = True
+                                continue
+                            if await asyncio.to_thread(self._defer_observed_dependency_wait, repo_name, int(item_number), invalidation_claim):
+                                deferral_committed = True
+                                if self._invalidation_wake_event is not None:
+                                    self._invalidation_wake_event.set()
+                                continue
+                        if candidate.type == "issue":
+                            try:
+                                authoritative_candidate, closed_issue_prepared = await self._run_local_critical(
+                                    f"worker {worker_id} strict closed preparation for issue #{item_number}",
+                                    self._create_and_prepare_closed_issue_candidate,
+                                    repo_name,
+                                    int(item_number),
+                                )
+                            except GitHubReadCancelled:
+                                refusal = await asyncio.to_thread(self._cached_issue_refusal, repo_name, int(item_number), self.config)
+                                if refusal is not None:
+                                    self._record_cached_issue_refusal(repo_name, refusal, "durable-invalidation-worker")
+                                    decision_completed = True
+                                # If newer evidence removed the refusal, release
+                                # this claim for reevaluation rather than authorize
+                                # work from the superseded webhook observation.
+                                continue
+                        else:
+                            authoritative_candidate = await asyncio.to_thread(
+                                self._create_candidate_from_single,
+                                repo_name,
+                                candidate.type,
+                                int(item_number),
+                                True,
+                            )
+                        if authoritative_candidate is None:
+                            # A successful authoritative read can decide that an
+                            # absent or ineligible entity needs no processing.
+                            if candidate.type == "issue":
+                                self.issue_stage_routing.remove_target(repo_name, int(item_number))
+                            decision_completed = True
+                            continue
+                        authoritative_candidate.invalidation_generation = candidate.invalidation_generation
+                        authoritative_candidate.urgent_admission = candidate.urgent_admission
+                        candidate = authoritative_candidate
+                        self.active_workers[worker_id] = candidate
+
+                        if candidate.type == "issue" and not closed_issue_prepared:
+                            self.issue_admission_cache.observe(repo_name, candidate.data, authoritative=True)
+                            refusal = await asyncio.to_thread(self._cached_issue_refusal, repo_name, int(item_number), self.config)
+                            if refusal is not None:
+                                self._record_cached_issue_refusal(repo_name, refusal, "durable-invalidation-worker")
+                                decision_completed = True
+                                continue
+                            await self._run_local_critical(
+                                f"worker {worker_id} stage routing for issue #{item_number}",
+                                self._route_issue_stages_authoritatively,
+                                repo_name,
+                                int(item_number),
+                                candidate.data,
+                            )
+                            # Persist review-needed work before the legacy
+                            # inline validator runs. Missing/ERROR/in-flight
+                            # identities therefore remain recoverable even if
+                            # validation raises or the process stops.
+                            validation_error: Optional[BaseException] = None
+                            try:
+                                await self._run_local_critical(
+                                    f"worker {worker_id} submitted-parent validation for issue #{item_number}",
+                                    self._validate_submitted_parent_generation_for_child,
+                                    repo_name,
+                                    int(item_number),
+                                    candidate.data,
+                                )
+                            except (Exception, asyncio.CancelledError) as exc:
+                                # Post-validation reconciliation must not
+                                # replace an already unfinished validation (or
+                                # cancellation) with a terminal metadata
+                                # refusal. Preserve the earlier disposition as
+                                # the authority for this claimed generation.
+                                validation_error = exc
+                            try:
+                                # Validation may have persisted only a subset
+                                # before ERROR. Re-read durable decisions so the
+                                # lane retains exactly the retryable identities.
+                                await self._run_local_critical(
+                                    f"worker {worker_id} post-validation stage routing for issue #{item_number}",
+                                    self._route_issue_stages_authoritatively,
+                                    repo_name,
+                                    int(item_number),
+                                    candidate.data,
+                                )
+                            except (Exception, asyncio.CancelledError):
+                                if validation_error is not None:
+                                    raise validation_error
+                                raise
+                            if validation_error is not None:
+                                raise validation_error
+                            if self.is_draining:
+                                return
+
+                    logger.info(f"Worker {worker_id} processing {candidate.type} #{item_number}")
+                    heartbeat(f"worker-{worker_id}:processing", f"{candidate.type} #{item_number}")
+
+                    # An invalidation candidate was fetched strictly above. Do
+                    # not overwrite that authority with the cached closed-state
+                    # helper: a reopened entity may still have a cached closed
+                    # representation. Direct/operator candidates retain their
+                    # existing explicit closed-state check.
+                    is_closed = candidate.data.get("state") == "closed" if invalidation_claim is not None else is_item_closed_on_github(repo_name, candidate.type, item_number, self.github)
+                    if is_closed:
+                        logger.info(f"Worker {worker_id} skipping closed {candidate.type} #{item_number}")
+                        if candidate.type == "pr":
+                            # This state came from the validated HTTP snapshot above.
+                            # A retirement failure leaves completion false, so
+                            # the generation remains durable and retryable.
+                            await asyncio.to_thread(self.invalidations.retire_ci_watches, repo_name, int(item_number))
+                            # Issue #2148 REQ-001: this terminal early-return path
+                            # (a closed PR observed via invalidation/refresh, not
+                            # ordinary mutating PR work) must still make the old
+                            # owner eligible for reclamation.
+                            await asyncio.to_thread(self._schedule_pr_owner_reclamation, repo_name, candidate.data)
+                            self.notify_pr_merged_or_closed()
+                        decision_completed = True
+                        continue
+
+                    get_trace_logger().log("Worker", f"Worker {worker_id} started processing {candidate.type} #{item_number}", item_type=candidate.type, item_number=item_number, details={"worker_id": worker_id})
+
+                    # Process candidate
+                    if candidate.type == "issue" and invalidation_claim is not None:
+                        try:
+                            result = await self._run_local_critical(
+                                f"worker {worker_id} {candidate.type} #{item_number}",
+                                partial(self._process_single_candidate, origin="durable-invalidation-worker"),
+                                repo_name,
+                                candidate,
+                            )
+                            unfinished_processing_disposition = bool(result.error) and not result.definitive_parent_refusal
+                        finally:
+                            # Ordinary standalone validation occurs inside the
+                            # processing path. Consume any newly durable READY
+                            # or BLOCKED decision before acknowledging the
+                            # invalidation, including when later admission
+                            # raises after decision persistence.
+                            await self._run_local_critical(
+                                f"worker {worker_id} final stage routing for issue #{item_number}",
+                                self._refresh_issue_stage_routing,
+                                repo_name,
+                                int(item_number),
+                            )
+                    else:
+                        result = await self._run_local_critical(
+                            f"worker {worker_id} {candidate.type} #{item_number}",
+                            partial(self._process_single_candidate, origin="durable-invalidation-worker"),
+                            repo_name,
+                            candidate,
+                        )
+                    if result.definitive_parent_refusal and result.error:
+                        # A relationship refusal completes the evaluation only
+                        # after all obsolete target-owned lane work is durably
+                        # retired.  This cleanup is independent of repairing or
+                        # even parsing the rejected declaration.
+                        await asyncio.to_thread(
+                            self.issue_stage_routing.retire_refused_target,
+                            repo_name,
+                            int(item_number),
+                        )
+                        definitive_refusal_reason = result.error
+                    decision_completed = (not bool(result.error) or result.blocked_cacheable or result.definitive_parent_refusal) and not (candidate.urgent_admission and result.capacity_deferred)
+                    retry_failed_processing = bool(result.error) and not decision_completed
+
+                    if invalidation_claim is not None and candidate.type == "pr" and result.outcome is PRProcessingOutcome.DEFERRED and result.retry_not_before is not None:
+                        # Pending review is never completion, even if persisting
+                        # its wake fails. Retain this claim rather than allowing
+                        # the generic finalizer to acknowledge or release it.
+                        decision_completed = False
+                        try:
+                            retained = await asyncio.to_thread(
+                                self.invalidations.defer,
+                                invalidation_claim,
+                                "two-tier review work remains pending",
+                                result.retry_not_before,
+                                "pr-review-cycle",
+                            )
+                        except Exception as persistence_error:
+                            stop_after_persistence_failure = True
+                            self._record_worker_failure_backoff(invalidation_claim, Outcome.FAILED, None)
+                            raise RuntimeError("Pending PR review retry persistence failed") from persistence_error
+                        deferral_committed = True
+                        logger.info(
+                            "Retained two-tier PR review wake repository={} pr={} retry_at={}",
+                            repo_name,
+                            item_number,
+                            retained.retry_not_before,
+                        )
+                        if self._invalidation_wake_event is not None:
+                            self._invalidation_wake_event.set()
+
+                    if candidate.type == "issue" and result.target_outcome is ExplicitTargetOutcome.DEFERRED:
+                        diagnostic = result.target_reason or "; ".join(result.actions) or result.error or "pending evaluation"
+                        logger.info("Worker {} deferred issue #{}: {}", worker_id, item_number, diagnostic)
+                        get_trace_logger().log(
+                            "Worker",
+                            f"Worker {worker_id} deferred issue #{item_number}",
+                            item_type="issue",
+                            item_number=item_number,
+                            details={"worker_id": worker_id, "outcome": ExplicitTargetOutcome.DEFERRED.value, "actions": result.actions},
+                        )
+                    elif candidate.type == "issue" and result.target_outcome is ExplicitTargetOutcome.SKIPPED:
+                        diagnostic = result.target_reason or "; ".join(result.actions) or "evaluation skipped"
+                        logger.info("Worker {} evaluated/skipped issue #{}: {}", worker_id, item_number, diagnostic)
+                        get_trace_logger().log(
+                            "Worker",
+                            f"Worker {worker_id} evaluated/skipped issue #{item_number}",
+                            item_type="issue",
+                            item_number=item_number,
+                            details={"worker_id": worker_id, "outcome": ExplicitTargetOutcome.SKIPPED.value, "actions": result.actions},
+                        )
+                    elif result.error:
+                        logger.error(f"Worker {worker_id} failed to process {candidate.type} #{item_number}: {result.error}")
+                        get_trace_logger().log("Worker", f"Worker {worker_id} failed to process {candidate.type} #{item_number}", item_type=candidate.type, item_number=item_number, details={"worker_id": worker_id, "error": result.error})
+                    elif candidate.type == "pr" and result.outcome is PRProcessingOutcome.DEFERRED:
+                        diagnostic = "; ".join(result.actions)
+                        logger.info(f"Worker {worker_id} deferred pr #{item_number}: {diagnostic}")
+                        get_trace_logger().log("Worker", f"Worker {worker_id} deferred pr #{item_number}", item_type="pr", item_number=item_number, details={"worker_id": worker_id, "outcome": result.outcome.value, "actions": result.actions})
+                    else:
+                        logger.info(f"Worker {worker_id} successfully processed {candidate.type} #{item_number}")
+                        get_trace_logger().log("Worker", f"Worker {worker_id} successfully processed {candidate.type} #{item_number}", item_type=candidate.type, item_number=item_number, details={"worker_id": worker_id})
+
+                    # Check if PR was merged or closed during candidate processing
+                    if self._check_if_pr_merged_or_closed(candidate, result):
+                        self.notify_pr_merged_or_closed()
+
+                except asyncio.CancelledError:
+                    logger.info(f"Worker {worker_id} cancelled")
+                    get_health_monitor().record_event("worker_exit", f"worker {worker_id} cancelled", f"{candidate.type} #{item_number}")
+                    raise
+                except Exception as e:
+                    deferred = e if isinstance(e, GitHubRequestDeferred) else _reconciliation_admission_deferral(e)
+                    if deferred is not None:
+                        if invalidation_claim is None:
+                            raise
+                        context = deferred.outcome.context
+                        try:
+                            retained = await asyncio.to_thread(
+                                self.invalidations.defer,
+                                invalidation_claim,
+                                deferred.reason,
+                                deferred.retry_at,
+                                context.api_origin,
+                            )
+                        except Exception as persistence_error:
+                            stop_after_persistence_failure = True
+                            logger.opt(exception=True).error("Failed to persist authoritative-refresh deferral " f"repository={repo_name} entity={candidate.type}#{item_number} " f"reason={deferred.reason} api_origin={context.api_origin}: {persistence_error}")
+                            get_health_monitor().record_event(
+                                "worker_error",
+                                f"worker {worker_id}: deferral persistence failed: {type(persistence_error).__name__}",
+                                f"{candidate.type} #{item_number}",
+                            )
+                        else:
+                            deferral_committed = True
+                            log = logger.error if deferred.reason == "governor_state_unavailable" else logger.warning
+                            log("Authoritative refresh safely deferred " f"repository={repo_name} entity={candidate.type}#{item_number} " f"reason={retained.reason} retry_at={retained.retry_not_before} " f"api_origin={retained.api_origin or 'unknown'}")
+                            if self._invalidation_wake_event is not None:
+                                self._invalidation_wake_event.set()
+                    elif isinstance(e, ParentSpecificationError) and invalidation_claim is not None and candidate.type == "issue" and not unfinished_processing_disposition:
+                        # Typed production reconciliation failures are
+                        # definitive.  Arbitrary BLOCKED results and exception
+                        # message text never enter this path.
+                        try:
+                            await asyncio.to_thread(
+                                self.issue_stage_routing.retire_refused_target,
+                                repo_name,
+                                int(item_number),
+                            )
+                        except Exception:
+                            retry_failed_processing = True
+                            logger.opt(exception=True).error(
+                                "Failed to retire refused Issue work repository={} issue={} generation={}",
+                                repo_name,
+                                item_number,
+                                invalidation_claim.generation,
+                            )
+                        else:
+                            definitive_refusal_reason = str(e)
+                            decision_completed = True
+                    else:
+                        logger.opt(exception=True).error(f"Worker {worker_id} error processing candidate: {e}")
+                        get_health_monitor().record_event("worker_error", f"worker {worker_id}: {type(e).__name__}: {e}", f"{candidate.type} #{item_number}")
+                        retry_failed_processing = True
+                finally:
+                    completion_transition = None
+                    if invalidation_claim is not None:
+                        if decision_completed:
+                            completion_transition = self.invalidations.complete_with_outcome(invalidation_claim)
+                        elif not deferral_committed and not stop_after_persistence_failure and retry_failed_processing:
+                            try:
+                                retained = await asyncio.to_thread(
+                                    self.invalidations.defer,
+                                    invalidation_claim,
+                                    "operational_processing_failure",
+                                    time.time() + 60,
+                                )
+                            except Exception as persistence_error:
+                                stop_after_persistence_failure = True
+                                logger.opt(exception=True).error("Failed to persist worker failure backoff repository={} entity={}#{}: {}", repo_name, candidate.type, item_number, persistence_error)
+                                self._record_worker_failure_backoff(invalidation_claim, Outcome.FAILED, None)
+                            else:
+                                deferral_committed = True
+                                self._record_worker_failure_backoff(invalidation_claim, Outcome.DEFERRED, retained.retry_not_before)
+                                if self._invalidation_wake_event is not None:
+                                    self._invalidation_wake_event.set()
+                        elif not deferral_committed and not stop_after_persistence_failure:
+                            self.invalidations.release(invalidation_claim)
+                            # Uncommitted/cancelled work remains recoverable;
+                            # caught operational failures retain their own
+                            # durable deadline before reaching this branch.
+                            if self._invalidation_wake_event is not None:
+                                asyncio.get_running_loop().call_later(60, self._invalidation_wake_event.set)
+                    if repo_job_scope is not None:
+                        self._record_dependency_claim_acknowledgement(repo_name, repo_job_scope, invalidation_claim, decision_completed, completion_transition)
+                    if definitive_refusal_reason is not None and invalidation_claim is not None:
+                        acknowledgement = completion_transition.outcome.value if completion_transition is not None else "not-attempted"
+                        logger.warning(
+                            "Completed BLOCKED Parent-Issue evaluation repository={} issue={} generation={} reason={} acknowledgement={}",
+                            repo_name,
+                            item_number,
+                            invalidation_claim.generation,
+                            definitive_refusal_reason,
+                            acknowledgement,
+                        )
+                        get_trace_logger().log(
+                            "Worker",
+                            f"Issue #{item_number} Parent-Issue evaluation blocked",
+                            item_type="issue",
+                            item_number=item_number,
+                            details={
+                                "worker_id": worker_id,
+                                "repository": repo_name,
+                                "generation": invalidation_claim.generation,
+                                "reason": definitive_refusal_reason,
+                                "acknowledgement": acknowledgement,
+                                "outcome": "blocked",
+                            },
+                        )
+                    self.active_workers[worker_id] = None
+                    self.queue.task_done()
+                    if decision_completed:
+                        await self._enqueue_pending_invalidations(repo_name)
+                if self.is_draining:
+                    logger.info(f"Worker {worker_id} reached its graceful drain checkpoint")
+                    return
+                if stop_after_persistence_failure:
+                    logger.error(f"Worker {worker_id} stopped after deferral persistence failure")
+                    return
+
+    @staticmethod
+    def _record_worker_failure_backoff(claim: ClaimedInvalidation, outcome: Outcome, retry_at: Optional[float]) -> None:
+        """Observe the committed retry transition without governing its outcome."""
+        try:
+            identity = claim.identity
+            collector = get_trace_collector()
+            facts = {"reason": "retry_state_persistence_failed" if outcome is Outcome.FAILED else "operational_processing_failure", "retry_at": retry_at, "generation": claim.generation}
+            with collector.start_execution(
+                repository=identity.repository,
+                item_type=identity.entity_type,
+                item_number=identity.number,
+                origin="durable-invalidation-worker",
+                stage_id="worker.failure-backoff",
+                label=f"{identity.entity_type}#{identity.number} failed reevaluation retry",
+            ) as handle:
+                collector.record_event(EventKind.STAGE_RESULT, stage_id="worker.failure-backoff", origin="durable-invalidation-worker", outcome=outcome, facts=facts)
+                handle.set_outcome(outcome)
+        except Exception:
+            logger.opt(exception=True).debug("Worker failure-backoff diagnostic recording failed; preserving durable outcome")
+
+    def _record_recovered_dependency_work(self, repo_name: str, recovered_identities: list[EntityIdentity]) -> None:
+        """Record startup-recovered dependency-rescan work (REQ-001, REQ-004).
+
+        Documents "known pending work exists as of now" only -- it never
+        reconstructs a lost original trigger, delivery, or execution.
+        Diagnostic-recorder failures are caught and never affect startup.
+        """
+        target = resolve_repo_job_target(repo_name, RepoJobKind.DEPENDENCY_RESCAN.value)
+        if target is None:
+            return
+        for identity in recovered_identities:
+            if identity.entity_type != "dependency":
+                continue
+            try:
+                get_repo_job_trace_collector().record_recovered(
+                    target,
+                    origin="startup-recovery",
+                    label=f"{repo_name} dependency-rescan work recovered at startup",
+                    facts=RepoJobFacts(queue_phase="dirty"),
+                )
+            except Exception:
+                logger.opt(exception=True).debug("Diagnostic trace recording failed for recovered dependency-rescan work; continuing")
+
+    def _record_dependency_claim_acknowledgement(
+        self,
+        repo_name: str,
+        scope: RepoJobExecutionScope,
+        invalidation_claim: Optional[ClaimedInvalidation],
+        decision_completed: bool,
+        completion_transition: Optional[CompletionTransition],
+    ) -> None:
+        """Record the dependency-rescan job's own claim-acknowledgement outcome (REQ-007, REQ-008).
+
+        Recorded against the execution `scope` captured while the scan ran,
+        even though that execution's own `execution-finished` observation
+        was already emitted before the outer worker loop reaches its claim
+        completion/release -- this call attaches a late stage-reached fact to
+        the same execution id rather than reopening or duplicating it.
+        Never raises: a diagnostic failure here must never mask, or be
+        confused with, the real claim outcome it describes.
+        """
+        try:
+            collector = get_repo_job_trace_collector()
+            if completion_transition is not None:
+                if completion_transition.outcome is CompletionOutcome.CLEARED:
+                    outcome, disposition = Outcome.COMPLETED, completion_transition.outcome.value
+                elif completion_transition.outcome is CompletionOutcome.FOLLOWUP_PENDING:
+                    outcome, disposition = Outcome.DEFERRED, completion_transition.outcome.value
+                else:
+                    outcome, disposition = Outcome.FAILED, completion_transition.outcome.value
+                facts = RepoJobFacts(handoff_disposition=disposition, observed_invalidation_generation=completion_transition.latest_generation)
+            elif invalidation_claim is not None and not decision_completed:
+                outcome = Outcome.FAILED
+                facts = RepoJobFacts(failure_reason="dependency_claim_released_without_completion")
+            else:
+                outcome = Outcome.UNKNOWN
+                facts = None
+            collector.record_stage_reached(
+                "dependency-rescan.claim-acknowledged",
+                origin="durable-invalidation-worker",
+                label=f"{repo_name} dependency-rescan claim acknowledgement",
+                outcome=outcome,
+                facts=facts,
+                scope=scope,
+            )
+        except Exception:
+            logger.opt(exception=True).debug("Diagnostic trace recording failed for dependency-rescan claim acknowledgement; continuing")
+
+    async def _expand_dependency_obligation(self, repo_name: str) -> Optional[RepoJobExecutionScope]:
+        """Discover affected Issues from a complete, current open-Issue scan.
+
+        Discovery deliberately precedes candidate filtering and does not rely
+        on native reverse edges.  Each discovered identity becomes its own
+        durable generation before the scoped obligation is acknowledged.
+
+        Opens its own `RepoJobExecutionScope` (Issue #2001) covering
+        enumeration and every handoff; returns that scope (or None when
+        diagnostics are unavailable) so the caller can attach the later
+        claim-acknowledgement observation to the same execution id. A
+        diagnostic failure here never blocks or changes the real scan.
+        """
+        target = resolve_repo_job_target(repo_name, RepoJobKind.DEPENDENCY_RESCAN.value)
+        collector = get_repo_job_trace_collector()
+        handle = None
+        if target is not None:
+            try:
+                prior_refs = tuple(observation.observation_id for observation in unassociated_observations_for_target(collector.get_snapshot(target), target))
+                handle = collector.start_execution(
+                    target,
+                    origin="durable-invalidation-worker",
+                    stage_id="dependency-rescan.execution",
+                    label=f"{repo_name} dependency-rescan execution",
+                    facts=RepoJobFacts(source_observation_refs=prior_refs),
+                )
+            except Exception:
+                logger.opt(exception=True).debug("Diagnostic trace recording failed opening dependency-rescan execution scope; continuing untraced")
+                handle = None
+        if handle is None:
+            await self._expand_dependency_obligation_impl(repo_name, collector, None)
+            return None
+        with handle:
+            await self._expand_dependency_obligation_impl(repo_name, collector, handle)
+            return handle.scope
+
+    async def _expand_dependency_obligation_impl(self, repo_name: str, collector: RepoJobTraceCollector, handle: Optional[RepoJobExecutionHandle]) -> None:
+        def record_stage(stage_id: str, label: str, outcome: Optional[Outcome] = None, facts: Optional[RepoJobFacts] = None) -> None:
+            if handle is None:
+                return
+            try:
+                collector.record_stage_reached(stage_id, origin="durable-invalidation-worker", label=label, outcome=outcome, facts=facts)
+            except Exception:
+                logger.opt(exception=True).debug("Diagnostic trace recording failed for dependency-rescan stage {}; continuing", stage_id)
+
+        record_stage("dependency-rescan.enumeration-started", f"{repo_name} dependency-rescan enumeration started")
+        try:
+            entities = await asyncio.to_thread(self.github.get_open_entities_strict, repo_name)
+        except Exception:
+            record_stage("dependency-rescan.enumeration-failed", f"{repo_name} dependency-rescan enumeration failed", outcome=Outcome.FAILED, facts=RepoJobFacts(scan_available=False))
+            raise
+        issues = getattr(entities, "issues", None)
+        if not isinstance(issues, list):
+            record_stage("dependency-rescan.enumeration-failed", f"{repo_name} dependency-rescan enumeration malformed", outcome=Outcome.FAILED, facts=RepoJobFacts(scan_available=False))
+            raise RuntimeError("authoritative dependency discovery returned malformed Issues")
+        record_stage(
+            "dependency-rescan.enumeration-completed",
+            f"{repo_name} dependency-rescan enumeration completed",
+            outcome=Outcome.COMPLETED,
+            facts=RepoJobFacts(scan_available=True, discovered_issue_count=len(issues)),
+        )
+
+        for issue in issues:
+            number = getattr(issue, "number", None)
+            if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+                record_stage(
+                    "dependency-rescan.enumeration-failed",
+                    f"{repo_name} dependency-rescan enumeration returned an invalid Issue",
+                    outcome=Outcome.FAILED,
+                    facts=RepoJobFacts(scan_available=False, discovered_issue_count=len(issues)),
+                )
+                raise RuntimeError("authoritative dependency discovery returned an invalid Issue")
+            deadline = issue_stabilization_deadline(issue.created_at) if issue.created_at is not None else None
+            try:
+                await self.invalidate_entity(repo_name, "issue", number, not_before=deadline)
+            except Exception:
+                self._record_dependency_rescan_completion(collector, handle, record_stage, repo_name, len(issues), outcome=Outcome.FAILED)
+                raise
+
+        self._record_dependency_rescan_completion(collector, handle, record_stage, repo_name, len(issues), outcome=Outcome.COMPLETED)
+        if handle is not None:
+            handle.set_outcome(Outcome.COMPLETED)
+
+    def _record_dependency_rescan_completion(
+        self,
+        collector: RepoJobTraceCollector,
+        handle: Optional[RepoJobExecutionHandle],
+        record_stage,
+        repo_name: str,
+        discovered_issue_count: int,
+        outcome: Outcome,
+    ) -> None:
+        """Derive REQ-006's per-attempt handoff totals from this execution's own recorded handoffs.
+
+        Reading the totals back from the observations this same attempt just
+        published (rather than a separately maintained counter) keeps one
+        source of truth: the totals can never drift from what a reader would
+        independently recompute from the retained evidence.
+        """
+        attempted = confirmed = failed_or_unconfirmed = new_pending = coalesced = followup_required = 0
+        if handle is not None:
+            try:
+                snapshot = collector.get_snapshot(resolve_repo_job_target(repo_name, RepoJobKind.DEPENDENCY_RESCAN.value))
+                handoffs = [o for o in observations_for_execution(snapshot, handle.scope.execution_id) if o.stage_id == "dependency-rescan.handoff"]
+                attempted = len(handoffs)
+                for observation in handoffs:
+                    if observation.outcome == Outcome.COMPLETED.value:
+                        confirmed += 1
+                    else:
+                        failed_or_unconfirmed += 1
+                    disposition = observation.facts.handoff_disposition if observation.facts is not None else None
+                    if disposition == InvalidationDisposition.NEW_PENDING.value:
+                        new_pending += 1
+                    elif disposition == InvalidationDisposition.COALESCED.value:
+                        coalesced += 1
+                    elif disposition == InvalidationDisposition.FOLLOWUP_REQUIRED.value:
+                        followup_required += 1
+            except Exception:
+                logger.opt(exception=True).debug("Diagnostic trace recording failed tallying dependency-rescan handoffs; continuing")
+        record_stage(
+            "dependency-rescan.completed",
+            f"{repo_name} dependency-rescan {'completed' if outcome is Outcome.COMPLETED else 'incomplete'}",
+            outcome=outcome,
+            facts=RepoJobFacts(
+                discovered_issue_count=discovered_issue_count,
+                attempted_handoff_count=attempted,
+                confirmed_handoff_count=confirmed,
+                failed_or_unconfirmed_handoff_count=failed_or_unconfirmed,
+                new_pending_handoff_count=new_pending,
+                coalesced_handoff_count=coalesced,
+                followup_required_handoff_count=followup_required,
+            ),
+        )
+
+    async def invalidate_entity(
+        self,
+        repo_name: str,
+        entity_type: str,
+        number: int,
+        delivery_id: Optional[str] = None,
+        event_type: Optional[str] = None,
+        action: Optional[str] = None,
+        not_before: Optional[float] = None,
+        urgent_admission: bool = False,
+        issue_snapshot: Optional[dict[str, object]] = None,
+        dependency_trigger_issue_refs: Optional[Sequence[int]] = None,
+    ) -> bool:
+        """Durably mark an entity dirty and arrange an authoritative reevaluation.
+
+        `dependency_trigger_issue_refs` is diagnostic-only (Issue #2001): the
+        positively identified source Issue reference(s) that produced this
+        call, used solely to record dependency-rescan intake/handoff
+        evidence. It never changes admission, coalescing, or scheduling.
+        """
+        # Fence in-flight negative decisions before yielding to queue I/O. These
+        # observations may stop work, but never replace authoritative admission.
+        self.issue_admission_cache.invalidate(repo_name)
+        if entity_type == "issue" and event_type is not None:
+            if event_type == "issues" and action not in {"deleted", "transferred"} and issue_snapshot is not None and issue_snapshot.get("number") == number:
+                self.dependency_observations.observe(repo_name, issue_snapshot)
+            elif event_type != "issue_comment":
+                self.dependency_observations.invalidate(repo_name, number)
+        if issue_snapshot is not None:
+            self.issue_admission_cache.observe(repo_name, issue_snapshot)
+        self.github_request_governor.wake_admission_waiters()
+
+        dependency_job_target = resolve_repo_job_target(repo_name, RepoJobKind.DEPENDENCY_RESCAN.value) if entity_type == "dependency" else None
+        ambient_scope = current_repo_job_scope()
+        handoff_scope = ambient_scope if (entity_type == "issue" and ambient_scope is not None and ambient_scope.repository == repo_name and ambient_scope.job_kind == RepoJobKind.DEPENDENCY_RESCAN.value) else None
+
+        try:
+            transition = await asyncio.to_thread(
+                self.invalidations.invalidate_with_transition,
+                EntityIdentity(repo_name, entity_type, number),
+                delivery_id,
+                event_type,
+                action,
+                not_before,
+                urgent_admission,
+            )
+        except Exception:
+            self._record_dependency_invalidation_failure(dependency_job_target, handoff_scope, number, event_type, action, delivery_id, dependency_trigger_issue_refs)
+            raise
+        accepted = transition.accepted
+        if dependency_job_target is not None:
+            self._record_dependency_intake(dependency_job_target, transition, event_type, action, delivery_id, dependency_trigger_issue_refs)
+        if handoff_scope is not None:
+            self._record_dependency_handoff(handoff_scope, number, transition, not_before)
+        associated_pr_invalidated = False
+        if entity_type == "issue":
+            # Contract edits invalidate every associated same-head PR. This
+            # reverse relationship is established from the last complete
+            # authoritative manifest set, never from a webhook body.
+            for pr_number in self.review_adjudications.store.affected_prs(repo_name, number):
+                associated_pr_invalidated = await asyncio.to_thread(self.invalidations.invalidate, EntityIdentity(repo_name, "pr", pr_number)) or associated_pr_invalidated
+                self.review_adjudications.mark_unavailable(repo_name, pr_number, "contributing Issue invalidated")
+        elif entity_type == "pr":
+            self.review_adjudications.mark_unavailable(repo_name, number, "PR evidence invalidated")
+        if accepted and entity_type == "issue" and event_type is not None:
+            await asyncio.to_thread(self.invalidations.wake_dependency_waiters, repo_name)
+        if (accepted or associated_pr_invalidated) and not self.is_draining:
+            await self._enqueue_pending_invalidations(repo_name)
+            if self._invalidation_wake_event is not None:
+                self._invalidation_wake_event.set()
+        return accepted
+
+    async def accept_private_reevaluation(
+        self,
+        *,
+        operation_id: str,
+        repository: str,
+        channel: str,
+        target_type: str,
+        target_number: int,
+        expected_process_run_id: str,
+        expected_deployment_generation: str,
+        current_process_run_id: str,
+        current_deployment_generation: str,
+    ) -> tuple[ReevaluationReceipt, bool]:
+        """Admit one incarnation-bound command through the ordinary durable queue."""
+        target = EntityIdentity(repository, target_type, target_number)
+        # Historical receipts are immutable observations. They deliberately do
+        # not depend on the accepting worker still being alive.
+        existing = await asyncio.to_thread(self.invalidations.get_reevaluation_receipt, operation_id)
+        if existing is not None:
+            matches = (
+                existing.repository == repository
+                and existing.channel == channel
+                and existing.target_type == target_type
+                and existing.target_number == target_number
+                and existing.requested_process_run_id == expected_process_run_id
+                and existing.requested_deployment_generation == expected_deployment_generation
+            )
+            if not matches:
+                raise ReevaluationOperationConflict(operation_id)
+            logger.info("Private reevaluation replay operation_id={} target={}#{} accepting_process_run_id={}", operation_id, target_type, target_number, existing.accepting_process_run_id)
+            return existing, True
+
+        receipt, replay = await asyncio.to_thread(
+            self._commit_private_reevaluation,
+            operation_id,
+            repository,
+            channel,
+            target,
+            expected_process_run_id,
+            expected_deployment_generation,
+            current_process_run_id,
+            current_deployment_generation,
+        )
+
+        if not replay:
+            self.github_request_governor.wake_admission_waiters()
+            await self._enqueue_pending_invalidations(repository)
+            if self._invalidation_wake_event is not None:
+                self._invalidation_wake_event.set()
+        logger.info("Private reevaluation {} operation_id={} target={}#{} process_run_id={} disposition={}", "replayed" if replay else "accepted", operation_id, target_type, target_number, current_process_run_id, receipt.disposition.value)
+        return receipt, replay
+
+    def _commit_private_reevaluation(
+        self,
+        operation_id: str,
+        repository: str,
+        channel: str,
+        target: EntityIdentity,
+        expected_process_run_id: str,
+        expected_deployment_generation: str,
+        current_process_run_id: str,
+        current_deployment_generation: str,
+    ) -> tuple[ReevaluationReceipt, bool]:
+        """Own lifecycle ordering and the blocking durable acceptance boundary."""
+        # This is the same lock used to close daemon admission. Running the
+        # entire boundary in a worker thread keeps competing socket requests
+        # reachable while preserving one order with synchronous shutdown.
+        with self._lifecycle_lock:
+            raced = self.invalidations.get_reevaluation_receipt(operation_id)
+            if raced is not None:
+                matches = (
+                    raced.repository == repository
+                    and raced.channel == channel
+                    and raced.target_type == target.entity_type
+                    and raced.target_number == target.number
+                    and raced.requested_process_run_id == expected_process_run_id
+                    and raced.requested_deployment_generation == expected_deployment_generation
+                )
+                if not matches:
+                    raise ReevaluationOperationConflict(operation_id)
+                return raced, True
+            if self._lifecycle is not EngineLifecycle.RUNNING or not self.startup_reconciled or not self.daemon_serving:
+                raise RuntimeError("worker_not_ready")
+            if expected_process_run_id != current_process_run_id or expected_deployment_generation != current_deployment_generation:
+                raise RuntimeError("wrong_incarnation")
+            self.issue_admission_cache.invalidate(repository)
+            associated: tuple[int, ...] = ()
+            if target.entity_type == "issue":
+                self.dependency_observations.invalidate(repository, target.number)
+                associated = tuple(self.review_adjudications.store.affected_prs(repository, target.number))
+                for pr_number in associated:
+                    self.review_adjudications.mark_unavailable(repository, pr_number, "contributing Issue invalidated")
+            else:
+                self.review_adjudications.mark_unavailable(repository, target.number, "PR evidence invalidated")
+            return self.invalidations.accept_management_reevaluation(
+                operation_id=operation_id,
+                repository=repository,
+                channel=channel,
+                target=target,
+                requested_process_run_id=expected_process_run_id,
+                requested_deployment_generation=expected_deployment_generation,
+                accepting_process_run_id=current_process_run_id,
+                accepting_deployment_generation=current_deployment_generation,
+                associated_prs=associated,
+            )
+
+    @staticmethod
+    def _dependency_trigger_facts(
+        event_type: Optional[str],
+        action: Optional[str],
+        delivery_id: Optional[str],
+        source_issue_refs: Optional[Sequence[int]],
+        **extra: Any,
+    ) -> RepoJobFacts:
+        collector = get_repo_job_trace_collector()
+        return RepoJobFacts(
+            trigger_event=event_type,
+            trigger_action=action,
+            trigger_delivery_refs=collector.clip_trigger_delivery_refs((delivery_id,) if delivery_id else ()),
+            source_issue_refs=collector.clip_source_issue_refs(tuple(source_issue_refs) if source_issue_refs else ()),
+            **extra,
+        )
+
+    def _record_dependency_intake(
+        self,
+        target: RepoJobTarget,
+        transition: InvalidationTransition,
+        event_type: Optional[str],
+        action: Optional[str],
+        delivery_id: Optional[str],
+        source_issue_refs: Optional[Sequence[int]],
+    ) -> None:
+        """Record REQ-003 dependency-triggering intake evidence.
+
+        Records every call -- accepted, duplicate, or (via the caller's
+        except-clause counterpart) failed -- as its own retained intake
+        observation, never collapsing multiple retained triggers into only
+        the last one. Diagnostic failures are caught and never affect the
+        real intake outcome they describe.
+        """
+        try:
+            queue_phase = transition.disposition.value if transition.accepted and transition.disposition is not None else ("duplicate_delivery" if not transition.accepted else None)
+            get_repo_job_trace_collector().record_intake(
+                target,
+                origin="github-webhook" if event_type != "sentry" else "sentry-webhook",
+                label=f"{target.repository} dependency-rescan intake",
+                facts=self._dependency_trigger_facts(event_type, action, delivery_id, source_issue_refs, queue_phase=queue_phase),
+            )
+        except Exception:
+            logger.opt(exception=True).debug("Diagnostic trace recording failed for dependency-rescan intake; continuing")
+
+    def _record_dependency_handoff(
+        self,
+        scope: RepoJobExecutionScope,
+        number: int,
+        transition: InvalidationTransition,
+        not_before: Optional[float],
+    ) -> None:
+        """Record one REQ-006 Issue invalidation handoff reached during an active dependency-rescan execution."""
+        try:
+            collector = get_repo_job_trace_collector()
+            collector.record_stage_reached(
+                "dependency-rescan.handoff",
+                origin="durable-invalidation-worker",
+                label=f"{scope.repository} dependency-rescan handoff to issue #{number}",
+                outcome=Outcome.COMPLETED if transition.accepted else Outcome.FAILED,
+                facts=RepoJobFacts(
+                    target_issue_refs=collector.clip_target_issue_refs((number,)),
+                    handoff_disposition=transition.disposition.value if transition.disposition is not None else None,
+                    scheduled_retry_not_before=not_before,
+                ),
+                scope=scope,
+            )
+        except Exception:
+            logger.opt(exception=True).debug("Diagnostic trace recording failed for dependency-rescan handoff to issue #{}; continuing", number)
+
+    def _record_dependency_invalidation_failure(
+        self,
+        dependency_job_target: Optional[RepoJobTarget],
+        handoff_scope: Optional[RepoJobExecutionScope],
+        number: int,
+        event_type: Optional[str],
+        action: Optional[str],
+        delivery_id: Optional[str],
+        source_issue_refs: Optional[Sequence[int]],
+    ) -> None:
+        """Record a durable-persistence failure reaching REQ-003/REQ-006's intake or handoff boundary (AS-004, AS-006)."""
+        try:
+            collector = get_repo_job_trace_collector()
+            if dependency_job_target is not None:
+                collector.record_intake(
+                    dependency_job_target,
+                    origin="github-webhook" if event_type != "sentry" else "sentry-webhook",
+                    label=f"{dependency_job_target.repository} dependency-rescan intake persistence failed",
+                    facts=self._dependency_trigger_facts(event_type, action, delivery_id, source_issue_refs, failure_reason="persistence_failed"),
+                )
+            if handoff_scope is not None:
+                collector.record_stage_reached(
+                    "dependency-rescan.handoff",
+                    origin="durable-invalidation-worker",
+                    label=f"{handoff_scope.repository} dependency-rescan handoff to issue #{number} persistence failed",
+                    outcome=Outcome.FAILED,
+                    facts=RepoJobFacts(target_issue_refs=collector.clip_target_issue_refs((number,)), failure_reason="persistence_failed"),
+                    scope=handoff_scope,
+                )
+        except Exception:
+            logger.opt(exception=True).debug("Diagnostic trace recording failed for dependency-rescan persistence failure; continuing")
+
+    def refresh_review_adjudications(self, repo_name: str, pr_data: Dict[str, Any]) -> tuple[AdjudicationSnapshot, ...]:
+        """Refresh the production adjudication snapshot for a targeted PR."""
+        number = pr_data.get("number")
+        if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+            raise ValueError("PR adjudication refresh requires a positive PR number")
+        # Suspend first: strict configuration lookup itself can fail and must
+        # never leave a previously positive snapshot consumable.
+        self.review_adjudications.mark_unavailable(repo_name, number, "authorization policy refresh is pending")
+        reviewer_ids = get_pr_review_allowlist_from_config(repo_name=repo_name)
+        adjudicator_ids = get_review_adjudicator_allowlist_from_config(repo_name=repo_name)
+        self.review_adjudications.apply_authorization_policy(repo_name, number, reviewer_ids or (), adjudicator_ids or ())
+        if (not reviewer_ids or not adjudicator_ids) and not self.review_adjudications.store.ledgers_for_pr(repo_name, number):
+            return ()
+        authoritative = self.github.get_pull_request_metadata_strict(repo_name, number)
+        if not isinstance(authoritative, dict):
+            raise RuntimeError(f"GitHub did not return authoritative PR metadata for PR #{number}")
+        issue_numbers = extract_associated_issue_numbers(pr_data=authoritative)
+        if not issue_numbers:
+            raise ValueError("PR adjudication context requires complete explicit contributing Issue references")
+        return self.review_adjudications.refresh(repo_name, number, authoritative, issue_numbers, reviewer_ids or (), adjudicator_ids or ())
+
+    def get_review_adjudication_snapshots(self, repo_name: str, pr_number: int) -> tuple[AdjudicationSnapshot, ...]:
+        """Expose persisted-before-publication observations to read-only consumers."""
+        return self.review_adjudications.snapshots(repo_name, pr_number)
+
+    def _defer_observed_dependency_wait(self, repo_name: str, number: int, claim: ClaimedInvalidation) -> bool:
+        """Avoid family validation for known waiting Issues, never authorize work."""
+        cache = self.dependency_observations
+
+        def observe_missing(target: int) -> None:
+            while cache.get(repo_name, target) is None:
+                version = cache.version(repo_name, target)
+                try:
+                    with cancel_github_reads_when(lambda context: is_issue_resource_read(context, repo_name, target) and cache.get(repo_name, target) is not None):
+                        snapshot = self.github.get_issue_dispatch_snapshot_strict(repo_name, target)
+                except GitHubReadCancelled:
+                    # Recheck TTL, ambiguity, and notification fencing before
+                    # using the observation; otherwise retry the ordinary read.
+                    continue
+                except httpx.HTTPStatusError as error:
+                    if error.response.status_code != 404:
+                        raise
+                    # Absence is not waiting evidence. Let normal admission
+                    # classify deleted targets and invalid prerequisite refs.
+                    cache.invalidate(repo_name, target)
+                    return
+                if isinstance(snapshot, dict) and snapshot.get("number") == target:
+                    cache.observe(repo_name, snapshot, version=version)
+                return
+
+        observe_missing(number)
+        for dependency in sorted(cache.dependencies(repo_name, number)):
+            observe_missing(dependency)
+        waiting = cache.waiting_on(repo_name, number)
+        if not waiting:
+            return False
+        # Dependency waiting is operational Implementation state. It cannot
+        # conceal a contract/family edit from semantic Review routing.
+        routing_snapshot = self.github.get_issue_dispatch_snapshot_strict(repo_name, number)
+        if not isinstance(routing_snapshot, dict) or routing_snapshot.get("number") != number or "pull_request" in routing_snapshot:
+            raise ParentOperationalError(f"cannot route dependency-waiting Issue #{number} from ambiguous authority")
+        self._route_issue_stages_authoritatively(repo_name, number, routing_snapshot)
+        retry_at = time.time() + DEPENDENCY_OBSERVATION_TTL
+        self.invalidations.defer(claim, "cached_dependency_wait", retry_at)
+        # A webhook may have woken waiters just before this wait was persisted.
+        # Recheck the negative evidence to avoid hiding that notification.
+        if cache.waiting_on(repo_name, number) != waiting:
+            self.invalidations.wake_dependency_waiters(repo_name)
+        logger.info(f"Deferring Issue #{number}: observed open dependencies {waiting}; recheck by {retry_at}")
+        with get_trace_collector().start_execution(repository=repo_name, item_type="issue", item_number=number, origin="durable-invalidation-worker", stage_id="issue.execution", label=f"issue#{number} execution") as handle:
+            _record_issue_stage_result(number, "issue.cached-dependency-wait", f"issue#{number} cached dependency wait", Outcome.DEFERRED, {"waiting_on": list(waiting), "retry_at": retry_at, "evidence_source": "local-issue-observation", "authorizes_execution": False})
+            handle.set_outcome(Outcome.DEFERRED)
+        return True
+
+    async def _enqueue_pending_invalidations(self, repo_name: str) -> None:
+        """Claim durable identities, fetch authoritative state, and queue decisions."""
+        if self.is_draining:
+            return
+        async with self._invalidation_drain_lock:
+            while not self.is_draining and (claim := await asyncio.to_thread(self.invalidations.claim, repo_name)):
+                # Only stable identity crosses the durable-to-memory boundary.
+                # Authoritative state is fetched after a worker marks this claim
+                # processing, so notifications received before that point coalesce.
+                candidate = Candidate(
+                    type=claim.identity.entity_type,
+                    data={"number": claim.identity.number},
+                    priority=1 if claim.identity.entity_type == "pr" else 0,
+                    issue_number=claim.identity.number if claim.identity.entity_type == "issue" else None,
+                    invalidation_generation=claim.generation,
+                    urgent_admission=claim.urgent_admission,
+                )
+                await self.queue.put(candidate)
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get the current status of the automation engine."""
+        queue_items = list(self.queue._queue) if hasattr(self.queue, "_queue") else []
+
+        # Helper to check if item is in queue or processing
+        processing_map = {}  # (type, number) -> worker_id
+        for wid, c in self.active_workers.items():
+            if c:
+                processing_map[(c.type, c.data.get("number"))] = wid
+
+        queued_map = {}  # (type, number) -> priority
+        for c in queue_items:
+            queued_map[(c.type, c.data.get("number"))] = c.priority
+
+        open_items_status = []
+        observed_targets, open_target_observation = self.open_target_observations.snapshot()
+        observed_prs = [{"number": item.number, "title": item.title, "created_at": item.created_at} for item in observed_targets if item.kind == "pr"]
+        observed_issues = [{"number": item.number, "title": item.title, "created_at": item.created_at} for item in observed_targets if item.kind == "issue"]
+
+        # Legacy callers may still supply advisory polling snapshots. They do
+        # not turn an unobserved event-driven enumeration into a known empty.
+        if open_target_observation["availability"] == "unavailable" and not observed_targets:
+            observed_prs = self.open_prs_snapshot
+            observed_issues = self.open_issues_snapshot
+
+        # Process PRs
+        for pr in observed_prs:
+            number = pr.get("number")
+            status_str = "Open"
+            worker_id = processing_map.get(("pr", number))
+            if worker_id is not None:
+                status_str = f"Processing (Worker {worker_id})"
+            elif ("pr", number) in queued_map:
+                status_str = f"Queued (Priority {queued_map[('pr', number)]})"
+
+            open_items_status.append(
+                {
+                    "type": "pr",
+                    "number": number,
+                    "title": pr.get("title"),
+                    "status": status_str,
+                    "created_at": pr.get("created_at"),
+                }
+            )
+
+        # Process Issues
+        for issue in observed_issues:
+            number = issue.get("number")
+            status_str = "Open"
+            worker_id = processing_map.get(("issue", number))
+            if worker_id is not None:
+                status_str = f"Processing (Worker {worker_id})"
+            elif ("issue", number) in queued_map:
+                status_str = f"Queued (Priority {queued_map[('issue', number)]})"
+
+            open_items_status.append(
+                {
+                    "type": "issue",
+                    "number": number,
+                    "title": issue.get("title"),
+                    "status": status_str,
+                    "created_at": issue.get("created_at"),
+                }
+            )
+
+        status = {
+            "lifecycle": self.lifecycle.value,
+            # Diagnostic only: coarse worker/maintenance thread-ownership
+            # descriptions, interrupted (not awaited) during graceful
+            # draining. Never paid critical work by itself -- see
+            # "protected_invocations" for what draining actually waits on
+            # (Issue #2010 REQ-007).
+            "local_critical_operations": list(self._critical_operations.values()),
+            "protected_invocations": [
+                {
+                    "repository": u.repository,
+                    "target": u.target,
+                    "stage": u.stage,
+                    "state": u.state.value,
+                }
+                for u in self.invocation_gate.unsettled_snapshot()
+            ],
+            "startup_reconciliation": {
+                "complete": self.startup_reconciled,
+                "error": self.startup_reconciliation_error,
+            },
+            "queue_length": self.queue.qsize(),
+            "queue_items": [
+                {
+                    "type": c.type,
+                    "number": c.data.get("number"),
+                    "priority": c.priority,
+                    "title": c.data.get("title"),
+                }
+                for c in queue_items
+            ],
+            "active_workers": {
+                wid: (
+                    {
+                        "type": c.type,
+                        "number": c.data.get("number"),
+                        "title": c.data.get("title"),
+                    }
+                    if c
+                    else None
+                )
+                for wid, c in self.active_workers.items()
+            },
+            "open_items": open_items_status,
+            "open_target_observation": open_target_observation,
+            "pending_work": self.pending_work_scheduler.snapshot() if self.pending_work_scheduler is not None else [],
+            "merge_operations": self.merge_operation_scheduler.snapshot(),
+            "refill_faults": [dataclasses.asdict(fault) for fault in self._refill_fault_snapshot()],
+        }
+        return status
+
+    def _check_and_handle_closed_branch(self, repo_name: str) -> bool:
+        """
+        Check if the current branch corresponds to a closed PR or Issue and handle it.
+
+        This method:
+        1. Identifies the current branch
+        2. Determines if it corresponds to a PR or Issue (by extracting number from branch name)
+        3. Checks if that PR/Issue is closed on GitHub
+        4. If closed, checkout main and call check_and_handle_closed_state
+
+        Args:
+            repo_name: Repository name in format 'owner/repo'
+
+        Returns:
+            True if processing should continue (item is not closed), False otherwise (will exit)
+        """
+        try:
+            # Get current branch name
+            current_branch = get_current_branch()
+            if not current_branch:
+                logger.debug("Could not get current branch, skipping closed branch check")
+                return True
+
+            logger.debug(f"Current branch: {current_branch}")
+
+            # Extract issue/PR number from branch name
+            # Branch naming convention: issue-<number> (not pr-<number>)
+            item_number = extract_number_from_branch(current_branch)
+            if item_number is None:
+                logger.debug(f"Branch '{current_branch}' does not match issue/PR pattern, skipping closed branch check")
+                return True
+
+            # Determine item type based on branch name pattern
+            # According to AGENTS.md, only 'issue-<number>' pattern is used
+            # (pr-<number> pattern is prohibited)
+            item_type = "issue"
+            if "issue-" not in current_branch.lower():
+                # If somehow we have a pr-<number> branch (shouldn't happen per AGENTS.md)
+                # treat it as a PR
+                item_type = "pr"
+
+            logger.info(f"Found {item_type} #{item_number} in branch '{current_branch}', checking if closed...")
+
+            # Get current item state from GitHub
+            if item_type == "issue":
+                # Use GitHubClient directly instead of repo object
+                issue = self.github.get_issue(repo_name, item_number)
+                current_item = self.github.get_issue_details(issue)
+            else:
+                # Use GitHubClient directly instead of repo object
+                pr = self.github.get_pull_request(repo_name, item_number)
+                current_item = self.github.get_pr_details(pr)
+
+            # Check if item is closed
+            if current_item.get("state") == "closed":
+                logger.info(f"{item_type.capitalize()} #{item_number} is closed, switching to main branch and calling check_and_handle_closed_state")
+
+                # Call check_and_handle_closed_state which will:
+                # 1. Switch to main branch
+                # 2. Return True if the item was closed and handled
+                handled = check_and_handle_closed_state(
+                    repo_name,
+                    item_type,
+                    item_number,
+                    self.config,
+                    self.github,
+                    current_item=current_item,
+                )
+                # If it was handled (closed), return False to indicate we should stop
+                # processing this item/branch and move on (e.g. return to main loop)
+                return not handled
+
+            # Item is not closed, continue processing
+            logger.debug(f"{item_type.capitalize()} #{item_number} is open, continuing processing")
+            return True
+
+        except Exception as e:
+            logger.warning(f"Failed to check/handle closed branch state: {e}")
+            # Continue processing on error
+            return True
+
+    @ci_read_phase_method
+    def _get_candidates(self, repo_name: str, max_items: Optional[int] = None) -> List[Candidate]:
+        """Collect PR/Issue candidates with priority.
+
+        Priority definitions:
+        - 7: Breaking-change PR (breaking-change, breaking, api-change, deprecation, version-major)
+        - 4: Urgent + unmergeable PR (highest priority after breaking-change)
+        - 3: Urgent + mergeable PR or urgent issue
+        - 2: Unmergeable PR needing conflict resolution
+        - 1: PR requiring fixes (GH Actions failed but mergeable), or mergeable
+             with passing checks but blocked awaiting corrective changes on the
+             current HEAD per Auto-Coder's own adversarial review (issue #1731)
+        - 0: Regular issues
+
+        Sort order:
+        - Priority descending (7 -> 0)
+        - Creation time ascending (oldest first)
+        """
+        from .issue_context import extract_linked_issues_from_pr_body
+        from .pr_processor import (
+            _close_empty_pr,
+            _close_stale_jules_pr,
+            _dependency_bot_flag_decision,
+            _dependency_bot_readiness_decision,
+            _is_dependabot_pr,
+            _is_jules_pr,
+            _reject_unsafe_codex_cloud_pr,
+            is_current_head_adversarial_review_blocked,
+        )
+        from .pr_progress_policy import ProgressPhase, ProgressRoute, PRProgressInputs, PRProgressScope, select_pr_progress
+        from .util.github_action import (
+            _check_github_actions_status,
+            check_github_actions_and_exit_if_in_progress,
+        )
+
+        candidates: List[Candidate] = []
+        # Issues queued from the stale-Jules-PR path, to avoid queueing them twice
+        requeued_issue_numbers: set[int] = set()
+
+        try:
+
+            # Preload PR data and GitHub Actions statuses to avoid N+1 API calls
+            # Optimized to use get_open_prs_json to batch fetch details
+            # This replaces the need for get_open_pull_requests which triggers separate API calls
+            pr_data_list = self.github.get_open_prs_json(repo_name)
+
+            # Update snapshot
+            self.open_prs_snapshot = pr_data_list
+
+            # Sort by creation date ascending (oldest first) to match processing order expectation
+            pr_data_list.sort(key=lambda x: x.get("created_at", ""))
+
+            safe_pr_data_list = []
+            for pr_data in pr_data_list:
+                pr_number = pr_data.get("number")
+                if not isinstance(pr_number, int):
+                    logger.warning(f"Skipping PR missing/invalid number in data: {pr_data}")
+                    continue
+
+                # Branch identity is a safety invariant, not a normal PR
+                # processing decision. Reject unsafe Codex Cloud heads before
+                # even preloading CI, or author/label/CI gates can defer them
+                # indefinitely.
+                unsafe_branch_result = _reject_unsafe_codex_cloud_pr(self.github, repo_name, pr_data, self.config)
+                if unsafe_branch_result.closed or unsafe_branch_result.metadata_error:
+                    for action in unsafe_branch_result.actions:
+                        logger.info(f"PR #{pr_number}: {action}")
+                    continue
+                safe_pr_data_list.append(unsafe_branch_result.authoritative_pr_data or pr_data)
+
+            pr_data_list = safe_pr_data_list
+
+            # Lazy-load repository object if needed for Jules PRs
+            repo = None
+
+            for pr_data in pr_data_list:
+                labels = pr_data.get("labels", []) or []
+
+                pr_number = pr_data.get("number")
+                if not isinstance(pr_number, int):
+                    logger.warning(f"Skipping PR missing/invalid number in data: {pr_data}")
+                    continue
+
+                # Check PR author allowlist before any processing
+                if not self._is_pr_author_allowed(pr_data):
+                    logger.debug(f"Skipping PR #{pr_number} - author not in PR allowlist")
+                    continue
+
+                # Check if Jules PR is a draft and mark as ready if so
+                # This must be done BEFORE checking GitHub Actions status, as some actions only run on ready PRs
+                if _is_jules_pr(pr_data) and pr_data.get("draft"):
+                    logger.info(f"Jules PR #{pr_number} is a draft, marking as ready for review")
+                    try:
+                        token = self.github.token
+                        api = get_ghapi_client(token)
+                        node_id = pr_data.get("node_id")
+
+                        if not node_id:
+                            logger.info(f"Node ID missing for PR #{pr_number}, fetching details...")
+                            try:
+                                # Fallback: Fetch PR details to get node_id
+                                owner, repo = repo_name.split("/")
+                                pr_details = api.pulls.get(owner, repo, pr_number)
+                                node_id = pr_details.get("node_id")
+                                if node_id:
+                                    # Update local data
+                                    pr_data["node_id"] = node_id
+                            except Exception as e:
+                                logger.warning(f"Failed to fetch details for PR #{pr_number}: {e}")
+
+                        if node_id:
+                            end_ci_read_phase("mark-pr-ready")
+                            # GraphQL mutation to mark as ready
+                            mutation = """
+                            mutation($id: ID!) {
+                              markPullRequestReadyForReview(input: {pullRequestId: $id}) {
+                                pullRequest {
+                                  isDraft
+                                }
+                              }
+                            }
+                            """
+                            self.github.graphql_query(query=mutation, variables={"id": node_id})
+                            logger.info(f"Successfully marked Jules PR #{pr_number} as ready for review (via GraphQL)")
+                            # Update local data
+                            pr_data["draft"] = False
+                        else:
+                            logger.warning(f"Could not mark Jules PR #{pr_number} as ready: missing node_id after fetch attempt")
+                    except Exception as e:
+                        logger.error(f"Failed to mark Jules PR #{pr_number} as ready: {e}")
+
+                # Close PRs that have zero effective diff.
+                # Runs before label and stale checks so empty PRs are cleaned up and retried immediately.
+                end_ci_read_phase("empty-pr-policy")
+                empty_pr_result = _close_empty_pr(self.github, repo_name, pr_data, self.config)
+                if empty_pr_result.closed:
+                    for action in empty_pr_result.actions:
+                        logger.info(f"PR #{pr_number}: {action}")
+                    # Queue the unlocked issue(s) right away so the new attempt starts in
+                    # this cycle instead of waiting for the next poll.
+                    for issue_number in empty_pr_result.issue_numbers:
+                        issue_candidate = self._create_candidate_from_single(repo_name, "issue", issue_number)
+                        if issue_candidate:
+                            issue_candidate.priority = 3
+                            candidates.append(issue_candidate)
+                            requeued_issue_numbers.add(issue_number)
+                            logger.info(f"Queued issue #{issue_number} for a new attempt after closing empty PR #{pr_number}")
+                    continue
+
+                # Close Jules PRs that could not get CI green within the configured timeout.
+                # This runs before the label and "waiting for Jules" skips below, because a
+                # stale Jules PR normally still carries the @auto-coder label from an earlier
+                # run and would otherwise never be looked at again.
+                end_ci_read_phase("stale-jules-policy")
+                stale_jules_result = _close_stale_jules_pr(self.github, repo_name, pr_data, self.config)
+                if stale_jules_result.closed:
+                    for action in stale_jules_result.actions:
+                        logger.info(f"PR #{pr_number}: {action}")
+                    # Queue the unlocked issue(s) right away so the new attempt starts in
+                    # this cycle instead of waiting for the next poll.
+                    for issue_number in stale_jules_result.issue_numbers:
+                        issue_candidate = self._create_candidate_from_single(repo_name, "issue", issue_number)
+                        if issue_candidate:
+                            issue_candidate.priority = 3
+                            candidates.append(issue_candidate)
+                            requeued_issue_numbers.add(issue_number)
+                            logger.info(f"Queued issue #{issue_number} for a new attempt after closing stale Jules PR #{pr_number}")
+                    continue
+
+                # Skip if another instance is processing (@auto-coder label present) using LabelManager check
+                with LabelManager(
+                    self.github,
+                    repo_name,
+                    pr_number,
+                    item_type="pr",
+                    skip_label_add=True,
+                    known_labels=pr_data.get("labels"),
+                ) as should_process:
+                    if not should_process:
+                        continue
+
+                # Observe once for this immutable head. The policy owns route
+                # selection; the helper below retains only its deployment-
+                # approval effect and receives this same evidence.
+                checks = _check_github_actions_status(repo_name, pr_data, self.config, self.github)
+                should_continue = check_github_actions_and_exit_if_in_progress(
+                    repo_name,
+                    pr_data,
+                    self.config,
+                    self.github,
+                    switch_branch_on_in_progress=False,
+                    item_type="pr",
+                    github_checks=checks,
+                )
+
+                # Do not use the helper's aggregate Boolean as route authority.
+                head_sha = str(pr_data.get("head", {}).get("sha") or "")
+                if not head_sha:
+                    logger.debug(f"Skipping PR #{pr_number} - current head is unavailable")
+                    continue
+                progress = select_pr_progress(
+                    PRProgressInputs(
+                        scope=PRProgressScope(repo_name, pr_number, head_sha),
+                        phase=ProgressPhase.CANDIDATE_COLLECTION,
+                        ci=checks.observation,
+                        mergeable=pr_data.get("mergeable") if isinstance(pr_data.get("mergeable"), bool) else None,
+                        remediation_enabled=self.config.ENABLE_MERGEABILITY_REMEDIATION,
+                        ci_success=checks.success,
+                        ci_pending=checks.in_progress,
+                    )
+                )
+                if progress.route is ProgressRoute.EXCLUDE_CANDIDATE:
+                    logger.debug(f"Skipping PR #{pr_number} at progress policy: {progress.reason} ({progress.ci_state.value})")
+                    continue
+                if not should_continue:
+                    logger.info(f"PR #{pr_number} retained by candidate progress policy ({progress.reason})")
+
+                # Check if we should skip this PR because it's waiting for Jules.
+                # ``checks`` is this same current-head CI observation, so a
+                # recovered CI never gets excluded here only for the processor
+                # to release the same wait moments later (Issue #2275, REQ-007).
+                if _should_skip_waiting_for_jules(self.github, repo_name, pr_data, github_checks=checks):
+                    logger.info(f"Skipping PR #{pr_number} - waiting for Jules to fix CI failures")
+                    continue
+
+                mergeable = pr_data.get("mergeable", True)
+
+                # Handle dependency-bot PRs based on configuration, using the
+                # same flag/readiness decisions as the mandatory common
+                # admission gate in `_process_single_candidate_unified_impl`
+                # (Issue #1995, REQ-008). This is an optional, non-authoritative
+                # prefilter over facts already collected in this loop (this
+                # PR is already known-open from `get_open_prs_json`, and
+                # `checks` was already computed above): it can never
+                # substitute for that mandatory boundary's own fresh,
+                # same-HEAD confirmation (REQ-005).
+                dependency_bot_flag_decision = _dependency_bot_flag_decision(_is_dependabot_pr(pr_data), self.config.IGNORE_DEPENDABOT_PRS, self.config.AUTO_MERGE_DEPENDABOT_PRS)
+                if dependency_bot_flag_decision is None:
+                    dependency_bot_decision = _dependency_bot_readiness_decision(
+                        is_open=True,
+                        mergeable=mergeable,
+                        ci_error=checks.error if (not checks.success and not checks.in_progress) else None,
+                        ci_pending=checks.in_progress,
+                        ci_success=checks.success,
+                    )
+                else:
+                    dependency_bot_decision = dependency_bot_flag_decision
+                if not dependency_bot_decision.allowed:
+                    logger.debug(f"Skipping dependency-bot PR #{pr_number} at collector prefilter: {dependency_bot_decision.reason}")
+                    continue
+
+                # Check if PR is created by Jules and waiting for Jules update
+                if pr_data.get("author") == "jules":
+                    try:
+                        # Fetch PR reviews and comments to check for interaction
+                        last_interaction_time = None
+                        last_interaction_type = None
+
+                        # Check reviews
+                        reviews = self.github.get_pr_reviews(repo_name, pr_number)
+                        for review in reviews:
+                            user = review.get("user")
+                            if user and user.get("login") != "jules":
+                                submitted_at = review.get("submitted_at")
+                                if submitted_at:
+                                    dt = datetime.fromisoformat(submitted_at.replace("Z", "+00:00"))
+                                    if last_interaction_time is None or dt > last_interaction_time:
+                                        last_interaction_time = dt
+                                        last_interaction_type = review.get("state")
+
+                        # Check comments
+                        comments = self.github.get_pr_comments(repo_name, pr_number)
+                        from .util.github_action import is_verified_prompt_regression_advisory_comment
+
+                        pr_head_sha = str(pr_data.get("head", {}).get("sha") or "")
+                        for comment in comments:
+                            if is_verified_prompt_regression_advisory_comment(repo_name, pr_number, pr_head_sha, comment):
+                                continue
+                            user = comment.get("user")
+                            if user and user.get("login") != "jules":
+                                created_at = comment.get("created_at")
+                                if created_at:
+                                    dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                                    if last_interaction_time is None or dt > last_interaction_time:
+                                        last_interaction_time = dt
+                                        last_interaction_type = "COMMENT"
+
+                        if last_interaction_time and last_interaction_type != "APPROVED":
+                            # Check for Jules commits after interaction
+                            commits = self.github.get_pr_commits(repo_name, pr_number)
+                            jules_responded = False
+                            if commits:
+                                for commit_data in reversed(commits):
+                                    # Check commit date
+                                    committer = commit_data.get("commit", {}).get("committer", {})
+                                    commit_date_str = committer.get("date")
+                                    if commit_date_str:
+                                        commit_date = datetime.fromisoformat(commit_date_str.replace("Z", "+00:00"))
+                                        if commit_date > last_interaction_time:
+                                            author = commit_data.get("author")
+                                            if author and author.get("login") == "jules":
+                                                jules_responded = True
+                                                break
+                                        else:
+                                            # Commits are ordered, so if we hit an older one, we can stop
+                                            break
+
+                            if not jules_responded:
+                                logger.info(f"Skipping PR #{pr_number} - Waiting for Jules to update (requested at {last_interaction_time})")
+                                continue
+
+                    except Exception as e:
+                        logger.warning(f"Failed to check Jules PR status for #{pr_number}: {e}")
+
+                # Calculate priority
+                # Enhanced priority logic to distinguish unmergeable PRs
+                if any(
+                    label in labels
+                    for label in [
+                        "breaking-change",
+                        "breaking",
+                        "api-change",
+                        "deprecation",
+                        "version-major",
+                    ]
+                ):
+                    # Breaking-change PRs get highest priority (7)
+                    pr_priority = 7
+                elif "urgent" in labels:
+                    # Urgent items get high priority
+                    if not mergeable:
+                        pr_priority = 4  # Urgent + unmergeable (highest urgent priority)
+                    else:
+                        pr_priority = 3  # Urgent + mergeable
+                elif not mergeable:
+                    pr_priority = 2  # Unmergeable PRs (elevated from priority 1)
+                elif not checks.success:
+                    pr_priority = 1  # Fix-required but mergeable PRs
+                elif self._is_pr_adversarial_validation_enabled(repo_name, self.config) and is_current_head_adversarial_review_blocked(self.github, repo_name, pr_data, self.config):
+                    # Auto-Coder's own adversarial review already found material
+                    # violations at this exact HEAD and has no further normal
+                    # action until the PR author/backend supplies a new commit
+                    # (issue #1731). Deprioritize like any other fix-required PR
+                    # instead of competing at the auto-merge-candidate priority.
+                    pr_priority = 1
+                else:
+                    pr_priority = 2  # Mergeable with successful checks (auto-merge candidate)
+
+                candidates.append(
+                    Candidate(
+                        type="pr",
+                        data=pr_data,
+                        priority=pr_priority,
+                        branch_name=pr_data.get("head", {}).get("ref"),
+                        related_issues=extract_linked_issues_from_pr_body(pr_data.get("body", "")),
+                    )
+                )
+
+            # Discovery is independent of implementation concurrency and result
+            # limits. Always scan ordinary Issues here; priority sorting and max_items
+            # are applied afterward, while durable slots authorize implementation.
+            all_issues = self.github.get_open_issues_json(repo_name)
+
+            # Update snapshot
+            self.open_issues_snapshot = all_issues
+
+            # Build map for fast lookup of open issues
+            issue_map = {i["number"]: i for i in all_issues}
+
+            # Numbers of the PRs that are currently open, used to tell a live PR apart
+            # from a closed one still listed in an issue timeline
+            open_pr_numbers = {pr.get("number") for pr in pr_data_list if isinstance(pr.get("number"), int)}
+
+            for issue_data in all_issues:
+                number = issue_data.get("number")
+                if not isinstance(number, int):
+                    logger.warning(f"Issue data missing or invalid number: {issue_data}")
+                    continue
+
+                # Check Issue author allowlist before any processing
+                if not self._is_issue_author_allowed(issue_data):
+                    logger.debug(f"Skipping Issue #{number} - author not in Issue allowlist")
+                    continue
+
+                labels = issue_data.get("labels", []) or []
+
+                # Filter out issues created within the last 10 minutes
+                created_at_str = issue_data.get("created_at")
+                if created_at_str:
+                    # Parse the timestamp string
+                    # Example: "2024-07-15T12:34:56Z"
+                    created_at = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
+
+                    # Ensure it's timezone-aware (UTC)
+                    if created_at.tzinfo is None:
+                        created_at = created_at.replace(tzinfo=timezone.utc)
+
+                    # Get current time in UTC
+                    now_utc = datetime.now(timezone.utc)
+
+                    # If created within the last 5 minutes, skip
+                    if now_utc - created_at < timedelta(minutes=5):
+                        logger.debug(f"Skipping issue #{issue_data.get('number')} - created less than 5 minutes ago")
+                        continue
+
+                # Dependency declarations are production intake, not candidate
+                # decoration.  Observe them even without a child readiness label.
+                blocked_by = parse_blocked_by_declaration(issue_data.get("body"), parse_parent_declaration(issue_data.get("body")).status)
+                if isinstance(self.github, GitHubClient) and hasattr(self.github, "token") and blocked_by.status is not BlockedByDeclarationStatus.ABSENT:
+                    try:
+                        dependency_snapshot = self.github.get_issue_dispatch_snapshot_strict(repo_name, number)
+                        dependency_result = self._reconcile_sibling_dependencies(repo_name, number, dependency_snapshot)
+                    except Exception as exc:
+                        logger.warning(f"Deferring Issue #{number}; sibling dependency reconciliation is unresolved: {exc}")
+                        continue
+                    if dependency_result is DependencySatisfaction.INVALID:
+                        continue
+
+                # Skip if has sub-issues or linked PR
+                # Already queued by the stale-Jules-PR path above
+                if number in requeued_issue_numbers:
+                    continue
+
+                # Skip if another instance is processing (@auto-coder label present) using LabelManager check
+                with LabelManager(
+                    self.github,
+                    repo_name,
+                    number,
+                    item_type="issue",
+                    skip_label_add=True,
+                    known_labels=labels,
+                ) as should_process:
+                    if not should_process:
+                        continue
+
+                # Skip if issue has open sub-issues (it should be processed after sub-issues are resolved)
+                # Use pre-fetched data
+                if issue_data.get("has_open_sub_issues"):
+                    continue
+
+                # Skip only while an *open* PR covers the issue; the work happens on that
+                # PR. Closed or merged PRs stay in the issue timeline forever, so counting
+                # them here would permanently hide any issue that once had a PR - including
+                # issues whose stale Jules PR was just closed for a new attempt.
+                linked_pr_numbers = set(issue_data.get("linked_pr_numbers") or [])
+                open_linked_prs = linked_pr_numbers & open_pr_numbers
+                if open_linked_prs:
+                    logger.debug(f"Skipping issue #{number} - open PR(s) {sorted(open_linked_prs)} already cover it")
+                    continue
+
+                # Calculate priority
+                # Priority levels:
+                # - 7: Breaking-change (breaking-change, breaking, api-change, deprecation, version-major)
+                # - 3: Urgent
+                # - 0: Regular issues
+                issue_priority = self._issue_refill_priority(issue_data)
+
+                candidates.append(
+                    Candidate(
+                        type="issue",
+                        data=issue_data,
+                        priority=issue_priority,
+                        issue_number=number,
+                    )
+                )
+
+            # Sort by priority descending, type (issue first), creation time ascending
+            def _type_order(t: str) -> int:
+                return 0 if t == "issue" else 1
+
+            candidates.sort(
+                key=lambda x: (
+                    -x.priority,
+                    _type_order(x.type),
+                    x.data.get("created_at", ""),
+                )
+            )
+
+            # Trim if max items specified
+            if isinstance(max_items, int) and max_items > 0:
+                candidates = candidates[:max_items]
+
+            return candidates
+        finally:
+            # Clear the sub-issue cache when candidate acquisition is finished
+            self.github.clear_sub_issue_cache()
+
+    def _is_issue_author_allowed(self, issue_data: Optional[Dict[str, Any]]) -> bool:
+        """Check if the author of the issue is present in the issue allowlist."""
+        from .automation_config import get_author_id, is_author_allowlisted
+
+        allowlist = getattr(self.config, "ISSUE_ALLOWLIST", None)
+        if allowlist is None:
+            allowlist = getattr(self.config, "issue_allowlist", None)
+        author_id = get_author_id(issue_data)
+        return is_author_allowlisted(author_id, allowlist)
+
+    def _is_pr_author_allowed(self, pr_data: Optional[Dict[str, Any]]) -> bool:
+        """Check if the author of the PR is present in the PR allowlist."""
+        from .automation_config import get_author_id, is_author_allowlisted
+
+        allowlist = getattr(self.config, "PR_ALLOWLIST", None)
+        if allowlist is None:
+            allowlist = getattr(self.config, "pr_allowlist", None)
+        author_id = get_author_id(pr_data)
+        return is_author_allowlisted(author_id, allowlist)
+
+    def _has_open_sub_issues(self, repo_name: str, candidate: Candidate) -> bool:
+        """Check if target issue has unresolved sub-issues.
+        - candidate is expected to be an element from _get_candidates (type: issue)
+        Lookup failures propagate so dispatch fails closed.
+        """
+        try:
+            if candidate.type != "issue":
+                return False
+            issue_data = candidate.data or {}
+            issue_number = candidate.issue_number or issue_data.get("number")
+            if not issue_number:
+                return False
+            if issue_data.get("has_open_sub_issues"):
+                return True
+            metadata_children = issue_data.get("refill_metadata_open_children", {})
+            if isinstance(metadata_children, dict) and metadata_children.get(issue_number):
+                return True
+            if isinstance(self.github, GitHubClient):
+                sub_issues = self.github.get_open_sub_issues_strict(repo_name, issue_number)
+            else:
+                lookup = getattr(self.github, "get_open_sub_issues", None)
+                sub_issues = lookup(repo_name, issue_number) if callable(lookup) else []
+            if isinstance(sub_issues, list) and sub_issues:
+                return True
+            if self.open_issues_snapshot:
+                fallback_children = [other["number"] for other in self.open_issues_snapshot if isinstance(other.get("number"), int) and other.get("parent_issue_number") == issue_number and other.get("number") != issue_number]
+                if fallback_children:
+                    return True
+            return False
+        except Exception as e:
+            logger.warning(f"Failed to check open sub-issues for issue #{candidate.issue_number or issue_data.get('number', 'N/A')}: {e}")
+            raise
+
+    def _issue_refusal_policy(self, repo_name: str, config: AutomationConfig) -> str:
+        return repr((config, self._is_issue_specification_validation_enabled(repo_name, config), self._is_issue_decomposition_validation_enabled(repo_name, config)))
+
+    def _cached_issue_refusal(self, repo_name: str, number: int, config: AutomationConfig) -> Optional[CandidateProcessingResult]:
+        """Return only a refusal; missing or positive evidence always falls through."""
+        cached = self.issue_admission_cache.get(repo_name, number, self._issue_refusal_policy(repo_name, config))
+        if cached is not None:
+            return cached
+        specification_enabled = self._is_issue_specification_validation_enabled(repo_name, config)
+        decomposition_enabled = self._is_issue_decomposition_validation_enabled(repo_name, config)
+        reason: Optional[str] = None
+        # The stores share terminal Issue identities. With a disabled gate,
+        # defer role classification to the normal authoritative path.
+        specification = self._specification_validators.get(repo_name)
+        decomposition = self._decomposition_validators.get(repo_name)
+        specification_store = specification.reissue_store if specification is not None else ReissueRequiredStore(repo_name)
+        decomposition_store = decomposition.reissue_store if decomposition is not None else ReissueRequiredStore(repo_name)
+        if specification_enabled and decomposition_enabled and specification_store.contains(number) is True:
+            reason = "Specification requires a replacement Issue number"
+        observed = self.issue_admission_cache.snapshot(repo_name, number)
+        if reason is None and decomposition_enabled and observed is not None:
+            declaration = parse_parent_declaration(observed.get("body"))
+            parent_number = declaration.parent_number if declaration.status is ParentDeclarationStatus.SUPPORTED else observed.get("parent_issue_number")
+            if isinstance(parent_number, int) and not isinstance(parent_number, bool) and decomposition_store.contains(parent_number) is True:
+                reason = "Parent specification set requires a replacement Issue number"
+        if reason is None:
+            return None
+        return CandidateProcessingResult(type="issue", number=number, error=reason, actions=["Rejected - Issue or parent is durably reissue-required"], target_outcome=ExplicitTargetOutcome.BLOCKED, target_reason=reason, blocked_cacheable=True)
+
+    def _record_cached_issue_refusal(self, repo_name: str, result: CandidateProcessingResult, origin: str) -> None:
+        """Expose the negative-only boundary even when a worker skips refresh."""
+        number = result.number
+        if number is None:
+            return
+
+        def record() -> None:
+            _record_issue_stage_result(number, "issue.cached-blocked-admission", f"issue#{number} cached blocked admission", Outcome.BLOCKED, {"reason": result.error or result.target_reason or "cached refusal", "evidence_source": "local-negative-cache", "authorizes_execution": False})
+
+        ambient = current_scope()
+        if ambient is not None and ambient.repository == repo_name and ambient.item_type == "issue" and ambient.item_number == number:
+            record()
+        else:
+            try:
+                with get_trace_collector().start_execution(repository=repo_name, item_type="issue", item_number=number, origin=origin, stage_id="issue.execution", label=f"issue#{number} execution") as handle:
+                    record()
+                    handle.set_outcome(Outcome.BLOCKED)
+            except Exception:
+                logger.opt(exception=True).debug("Could not record cached Issue refusal")
+
+    def _process_single_candidate_unified(
+        self,
+        repo_name: str,
+        candidate: Candidate,
+        config: AutomationConfig,
+        jules_mode: bool = False,
+        explicit_only: bool = False,
+        force: bool = False,
+        continue_execution: bool = False,
+        advance_issue_attempt: bool = False,
+        generation_serialized: bool = False,
+        authoritative_parent_number: Optional[int] = None,
+        origin: str = "worker",
+        retry: bool = False,
+        retry_request_id: Optional[str] = None,
+    ) -> CandidateProcessingResult:
+        """Open (or continue) an execution-scoped trace, then dispatch to the real implementation.
+
+        A fresh top-level execution is opened whenever this call is not
+        already nested inside a matching (repository, item_type, item_number)
+        scope -- covering every origin listed in REQ-001 as well as a
+        recursive dispatch into a *different* Issue (e.g. a container
+        parent's open child, REQ-002: separate items always have separate
+        execution scopes). A call that is already inside a matching scope
+        (e.g. the ``generation_serialized`` re-entry for the same owner, or
+        a validation-triggered continuation) is nested work that keeps
+        participating in the caller's execution instead (REQ-002).
+        """
+        item_number = candidate.data.get("number")
+        ambient = current_scope()
+        already_scoped = ambient is not None and ambient.repository == repo_name and ambient.item_type == candidate.type and ambient.item_number == item_number
+        impl_args = (
+            repo_name,
+            candidate,
+            config,
+            jules_mode,
+            explicit_only,
+            force,
+            continue_execution,
+            advance_issue_attempt,
+            generation_serialized,
+            authoritative_parent_number,
+            origin,
+            retry,
+            retry_request_id,
+        )
+
+        def dispatch() -> CandidateProcessingResult:
+            if self._refill_admission_paused(repo_name, cast(Optional[int], item_number), candidate.type):
+                reason = f"Automatic evaluation paused after an unexpected refill fault for {repo_name}"
+                return CandidateProcessingResult(
+                    type=candidate.type,
+                    number=item_number if isinstance(item_number, int) else None,
+                    title=candidate.data.get("title"),
+                    error=reason,
+                    target_outcome=ExplicitTargetOutcome.DEFERRED,
+                    target_reason=reason,
+                    actions=[reason],
+                    refill_retry_required=False,
+                )
+            cache_issue = candidate.type == "issue" and isinstance(item_number, int) and not isinstance(item_number, bool) and not continue_execution and not retry
+            if cache_issue:
+                retained = self._future_issue_admission_deferral(repo_name, cast(int, item_number))
+                if retained is not None:
+                    reason = f"Deferred evaluation for {repo_name} issue #{item_number}: " f"stage={ISSUE_PROCESSING_STAGE}; reason={retained.reason.value}; " f"retry_at={retained.not_before}"
+                    logger.info(reason)
+                    return CandidateProcessingResult(
+                        type="issue",
+                        number=cast(int, item_number),
+                        title=candidate.data.get("title"),
+                        error=reason,
+                        target_outcome=ExplicitTargetOutcome.DEFERRED,
+                        target_reason=reason,
+                        actions=[reason],
+                        refill_retry_required=True,
+                    )
+                observed = self.issue_admission_cache.observe(repo_name, candidate.data)
+                epoch = self.issue_admission_cache.epoch(repo_name)
+                policy = self._issue_refusal_policy(repo_name, config)
+                refusal = self._cached_issue_refusal(repo_name, cast(int, item_number), config)
+                if refusal is not None:
+                    self._record_cached_issue_refusal(repo_name, refusal, origin)
+                    return refusal
+            try:
+                result = self._process_single_candidate_unified_impl(*impl_args)
+            except GitHubRequestDeferred as exc:
+                # Strict Issue snapshots are repeated after owner/generation
+                # serialization and immediately before final dispatch. Keep
+                # every supported, definitely-unsent refusal on the same
+                # durable boundary as the initial admission read instead of
+                # allowing a later read to escape or become a plain error.
+                deferred = _reconciliation_admission_deferral(exc)
+                if candidate.type != "issue" or not isinstance(item_number, int) or isinstance(item_number, bool) or deferred is None:
+                    raise
+                result = self._defer_issue_evaluation(
+                    repo_name,
+                    item_number,
+                    candidate.data,
+                    deferred,
+                    CandidateProcessingResult(
+                        type="issue",
+                        number=item_number,
+                        title=candidate.data.get("title"),
+                    ),
+                )
+            except ParentOperationalError as exc:
+                # Hierarchy rechecks can run before or after the inner admission
+                # handlers. Never let an unavailable relationship stop the worker.
+                if candidate.type != "issue" or not isinstance(item_number, int) or isinstance(item_number, bool):
+                    raise
+                reason = f"Parent-Issue reconciliation is temporarily unavailable: {exc}"
+                result = CandidateProcessingResult(
+                    type="issue",
+                    number=item_number,
+                    title=candidate.data.get("title"),
+                    error=reason,
+                    target_outcome=ExplicitTargetOutcome.DEFERRED,
+                    actions=["Deferred - Parent-Issue reconciliation requires retry"],
+                    refill_retry_required=True,
+                )
+                deferred_result = self._defer_wrapped_reconciliation(repo_name, item_number, candidate.data, exc, result)
+                if deferred_result is not None:
+                    result = deferred_result
+                logger.warning("Deferred relationship reconciliation for {}/#{}: {}", repo_name, item_number, exc)
+                if deferred_result is None:
+                    _record_issue_stage_result(item_number, "issue.parent-reconciliation", f"issue#{item_number} parent reconciliation", Outcome.DEFERRED, {"reason": result.error})
+            except ImplementationSlotUnavailable as exc:
+                # Owner serialization and durable-state reads precede the
+                # admission handler below. Their failure must defer this item
+                # rather than terminate the daemon's capacity-refill task.
+                reason = f"Implementation ownership is temporarily unavailable: {exc}"
+                logger.warning("Deferred {}/{}#{}: {}", repo_name, candidate.type, item_number, reason)
+                result = CandidateProcessingResult(
+                    type=candidate.type,
+                    number=item_number,
+                    title=candidate.data.get("title"),
+                    error=reason,
+                    target_outcome=ExplicitTargetOutcome.DEFERRED,
+                    actions=["Deferred - implementation ownership requires retry"],
+                    refill_retry_required=True,
+                )
+                if isinstance(item_number, int) and not isinstance(item_number, bool):
+                    record_stage = _record_issue_stage_result if candidate.type == "issue" else _record_pr_stage_result
+                    record_stage(item_number, f"{candidate.type}.implementation-admission", f"{candidate.type}#{item_number} implementation admission", Outcome.DEFERRED, {"reason": reason})
+            except Exception as exc:
+                # Preserve the innermost real target while recursive child
+                # dispatch unwinds to the refill containment boundary.
+                if candidate.type == "issue" and isinstance(item_number, int) and not isinstance(item_number, bool):
+                    if not hasattr(exc, "_auto_coder_fault_issue"):
+                        setattr(exc, "_auto_coder_fault_issue", item_number)
+                raise
+            if cache_issue and observed:
+                self.issue_admission_cache.remember(repo_name, cast(int, item_number), policy, epoch, result)
+            return result
+
+        if not isinstance(item_number, int) or isinstance(item_number, bool) or already_scoped:
+            return dispatch()
+        try:
+            handle_cm = get_trace_collector().start_execution(
+                repository=repo_name,
+                item_type=candidate.type,
+                item_number=item_number,
+                origin=origin,
+                stage_id=f"{candidate.type}.execution",
+                label=f"{candidate.type}#{item_number} execution",
+            )
+        except Exception:
+            logger.opt(exception=True).debug("Diagnostic trace recording failed opening execution scope for {}#{}; continuing untraced", candidate.type, item_number)
+            return dispatch()
+        with handle_cm as handle:
+            result = dispatch()
+            try:
+                handle.set_outcome(_map_candidate_result_outcome(result))
+            except Exception:
+                logger.opt(exception=True).debug("Diagnostic trace recording failed finishing execution scope for {}#{}; continuing", candidate.type, item_number)
+            return result
+
+    def _process_single_candidate_unified_impl(
+        self,
+        repo_name: str,
+        candidate: Candidate,
+        config: AutomationConfig,
+        jules_mode: bool = False,
+        explicit_only: bool = False,
+        force: bool = False,
+        continue_execution: bool = False,
+        advance_issue_attempt: bool = False,
+        generation_serialized: bool = False,
+        authoritative_parent_number: Optional[int] = None,
+        origin: str = "worker",
+        retry: bool = False,
+        retry_request_id: Optional[str] = None,
+    ) -> CandidateProcessingResult:
+        """Unified function for processing single issue or PR candidate.
+
+        Handles all common logic: LabelManager, branch_context, error handling.
+        This consolidates the logic from both batch processing (_process_single_candidate)
+        and single processing (process_single).
+
+        Args:
+            repo_name: Repository name
+            candidate: Target candidate to process
+            config: AutomationConfig instance
+            jules_mode: Whether to use Jules mode for processing (default: False)
+            continue_execution: Whether this is an internal lifecycle transition that
+                must continue the caller's execution for the same logical owner.
+            origin: Diagnostic label propagated to a recursive dispatch into a
+                different Issue (e.g. a container parent's open child); does
+                not affect processing behavior.
+
+        Returns:
+            Processing result
+        """
+        from .label_manager import LabelManager
+
+        manual_retry = explicit_only and force and retry and candidate.type == "issue"
+        if manual_retry and not retry_request_id:
+            retry_request_id = f"implementation-retry-{uuid.uuid4().hex}"
+        result = CandidateProcessingResult(
+            type=candidate.type,
+            number=candidate.data.get("number"),
+            title=candidate.data.get("title"),
+            success=False,
+            actions=[],
+            error=None,
+        )
+
+        # Reject candidates that cannot enter an implementation lifecycle before
+        # persisting ownership.  Otherwise an open but ineligible item can leak a
+        # slot indefinitely because reconciliation correctly sees it as nonterminal.
+        item_number = candidate.data.get("number")
+        if not isinstance(item_number, int) or isinstance(item_number, bool):
+            result.error = f"Item number is missing for {candidate.type} #{candidate.data.get('number', 'N/A')}"
+            return result
+        if candidate.type == "pr":
+            try:
+                self.refresh_review_adjudications(repo_name, candidate.data)
+            except Exception as exc:
+                # Configured adjudication is fail-closed: processing must not
+                # consume a stale positive decision after an incomplete read.
+                result.error = f"Review adjudication refresh failed: {exc}"
+                return result
+        if candidate.type == "pr" and not self._is_pr_author_allowed(candidate.data):
+            logger.info(f"Skipping PR #{item_number} - author not in PR allowlist")
+            result.target_outcome = ExplicitTargetOutcome.SKIPPED
+            result.target_reason = "PR author is not in the allowlist"
+            _record_pr_stage_result(item_number, "pr.author-admission", f"pr#{item_number} author admission", Outcome.SKIPPED, {"reason": result.target_reason})
+            return result
+        if candidate.type == "pr":
+            # Common dependency-bot processing-policy gate (Issue #1995):
+            # every PR-processing origin funnels through this impl before any
+            # implementation reservation, execution, or admission-related PR
+            # membership is created, so a startup/webhook-discovered candidate
+            # cannot bypass the policy that `_get_candidates()` also applies.
+            from .pr_processor import evaluate_dependency_bot_admission
+
+            dependency_bot_decision = evaluate_dependency_bot_admission(self.github, repo_name, candidate.data, config)
+            if not dependency_bot_decision.allowed:
+                logger.info(f"Refusing PR #{item_number} at dependency-bot admission gate: {dependency_bot_decision.reason}")
+                result.target_outcome = dependency_bot_decision.outcome
+                result.target_reason = dependency_bot_decision.reason
+                _record_pr_stage_result(
+                    item_number,
+                    "pr.dependency-bot-admission",
+                    f"pr#{item_number} dependency-bot admission",
+                    Outcome(dependency_bot_decision.outcome.value) if dependency_bot_decision.outcome else Outcome.SKIPPED,
+                    {"reason": dependency_bot_decision.reason},
+                )
+                if dependency_bot_decision.outcome is ExplicitTargetOutcome.DEFERRED:
+                    result.refill_retry_required = True
+                return result
+        if candidate.type == "issue":
+            collected_candidate = candidate
+            if not self._is_issue_author_allowed(candidate.data):
+                logger.info(f"Skipping Issue #{item_number} - author not in Issue allowlist")
+                result.target_outcome = ExplicitTargetOutcome.SKIPPED
+                result.target_reason = "Issue author is not in the allowlist"
+                _record_issue_stage_result(item_number, "issue.author-admission", f"issue#{item_number} author admission", Outcome.SKIPPED, {"reason": result.target_reason})
+                return result
+            if isinstance(self.github, GitHubClient):
+                try:
+                    observed = self.github.get_issue_dispatch_snapshot_strict(repo_name, item_number)
+                    if not isinstance(observed, dict) or observed.get("number") != item_number or "pull_request" in observed:
+                        result.error = f"Refusing Issue dispatch for {repo_name}#{item_number}: GitHub returned an ambiguous item snapshot"
+                        return result
+                    if not continue_execution:
+                        self.issue_admission_cache.observe(repo_name, observed, authoritative=True)
+                        refusal = self._cached_issue_refusal(repo_name, item_number, config)
+                        if refusal is not None:
+                            self._record_cached_issue_refusal(repo_name, refusal, origin)
+                            return refusal
+                    refreshed = self._reconcile_parent_issue(repo_name, item_number, observed) if parse_parent_declaration(observed.get("body")).status is not ParentDeclarationStatus.ABSENT else observed
+                    refreshed_manifest = build_normative_issue_manifest(item_number, str(refreshed.get("title") or ""), str(refreshed.get("body") or ""))
+                    if refreshed_manifest.error is None:
+                        collected_candidate.data.update(refreshed)
+                    candidate = Candidate(
+                        type=candidate.type,
+                        data={**candidate.data, **refreshed},
+                        priority=candidate.priority,
+                        issue_number=candidate.issue_number,
+                        branch_name=candidate.branch_name,
+                        related_issues=candidate.related_issues,
+                        invalidation_generation=candidate.invalidation_generation,
+                        urgent_admission=candidate.urgent_admission,
+                    )
+                except GitHubRequestDeferred as exc:
+                    # This first current-state read is also used by refill and
+                    # pending-work dispatch.  A governor refusal is ordinary
+                    # scheduling pressure, not a worker/daemon failure, but
+                    # only the explicitly supported, definitely-unsent typed
+                    # outcomes are safe to retain for automatic resumption.
+                    deferred = _reconciliation_admission_deferral(exc)
+                    if deferred is not None:
+                        return self._defer_issue_evaluation(
+                            repo_name,
+                            item_number,
+                            candidate.data,
+                            deferred,
+                            result,
+                        )
+                    raise
+                except ParentSpecificationError as exc:
+                    result.error = f"Parent-Issue reconciliation blocked processing: {exc}"
+                    result.target_outcome = ExplicitTargetOutcome.BLOCKED
+                    result.definitive_parent_refusal = True
+                    result.actions = ["Blocked - invalid Parent-Issue relationship metadata"]
+                    _record_issue_stage_result(item_number, "issue.parent-reconciliation", f"issue#{item_number} parent reconciliation", Outcome.BLOCKED, {"reason": str(exc)})
+                    return result
+                except ParentOperationalError as exc:
+                    deferred_result = self._defer_wrapped_reconciliation(repo_name, item_number, candidate.data, exc, result)
+                    if deferred_result is not None:
+                        return deferred_result
+                    result.error = f"Parent-Issue reconciliation is temporarily unavailable: {exc}"
+                    result.target_outcome = ExplicitTargetOutcome.DEFERRED
+                    result.actions = ["Deferred - Parent-Issue reconciliation requires retry"]
+                    result.refill_retry_required = True
+                    _record_issue_stage_result(item_number, "issue.parent-reconciliation", f"issue#{item_number} parent reconciliation", Outcome.DEFERRED, {"reason": str(exc)})
+                    return result
+            # A submitted parent represents its whole direct-child contract, not
+            # a standalone coding target. Numeric order is only a deterministic
+            # tie-breaker: dependency refusal must not strand another root.
+            try:
+                direct_child_reader = getattr(self.github, "get_direct_sub_issues_strict", None)
+                # Candidate hints can be stale and daemon normalization only
+                # describes open children. Complete authoritative membership is
+                # therefore consulted before any Issue can be treated standalone.
+                direct_children = direct_child_reader(repo_name, item_number) if callable(direct_child_reader) else []
+            except GitHubRequestError as exc:
+                return self._defer_issue_evaluation(repo_name, item_number, candidate.data, exc, result)
+            except Exception as exc:
+                result.error = f"Cannot determine authoritative direct-child membership: {exc}"
+                return result
+            if isinstance(direct_children, list) and direct_children:
+                if manual_retry:
+                    result.target_outcome = ExplicitTargetOutcome.BLOCKED
+                    result.actions = ["Rejected - retry target is a container Issue; select a direct child"]
+                    return result
+                try:
+                    parent_snapshot = self.github.get_issue_dispatch_snapshot_strict(repo_name, item_number)
+                except GitHubRequestError as exc:
+                    return self._defer_issue_evaluation(repo_name, item_number, candidate.data, exc, result)
+                except Exception as exc:
+                    result.error = f"Cannot confirm parent readiness submission: {exc}"
+                    return result
+                if not self._is_open_issue(parent_snapshot):
+                    result.target_outcome = ExplicitTargetOutcome.SKIPPED
+                    result.actions = ["Skipped - parent issue is closed"]
+                    return result
+                if is_implementation_ready(parent_snapshot):
+                    if self._defer_initial_issue_stabilization(repo_name, parent_snapshot):
+                        result.target_outcome = ExplicitTargetOutcome.DEFERRED
+                        result.actions = ["Deferred - readiness submission is in its initial stabilization window"]
+                        return result
+                    try:
+                        parent_submission_set = self._fetch_authoritative_decomposition_set(repo_name, item_number)
+                    except ParentSpecificationError as exc:
+                        result.error = f"Parent-Issue reconciliation blocked processing: {exc}"
+                        result.target_outcome = ExplicitTargetOutcome.BLOCKED
+                        result.definitive_parent_refusal = True
+                        result.actions = ["Blocked - invalid Parent-Issue relationship metadata"]
+                        return result
+                    except ParentOperationalError as exc:
+                        deferred_result = self._defer_wrapped_reconciliation(repo_name, item_number, candidate.data, exc, result)
+                        if deferred_result is not None:
+                            return deferred_result
+                        result.error = f"Parent-Issue reconciliation is temporarily unavailable: {exc}"
+                        result.target_outcome = ExplicitTargetOutcome.DEFERRED
+                        result.actions = ["Deferred - Parent-Issue reconciliation requires retry"]
+                        result.refill_retry_required = True
+                        return result
+                    if parent_submission_set is None:
+                        result.error = "Cannot fetch authoritative parent/child specification set"
+                        return result
+                    # Validation eligibility belongs to the submitted generation,
+                    # not to implementation eligibility. Submit the complete set
+                    # before closed-child filtering or retained-owner routing.
+                    decomposition_job, child_jobs = self._schedule_parent_validations(repo_name, parent_submission_set, config, scheduler=self.review_scheduler)
+                    parent_decision, child_decisions = self._join_parent_validations(decomposition_job, child_jobs)
+                    _, authoritative_children = parent_submission_set
+                    open_children = sorted(
+                        (child for child in authoritative_children if child.get("state") == "open" and isinstance(child.get("number"), int)),
+                        key=lambda child: int(child["number"]),
+                    )
+                    if not open_children:
+                        parent_decomposition_validator = self._get_decomposition_validator(repo_name)
+                        decomposition_enabled = self._is_issue_decomposition_validation_enabled(repo_name, config)
+                        if decomposition_enabled and parent_decision is not None and parent_decision.verdict == "BLOCKED":
+                            side_effect_error = self._authorize_and_apply_decomposition_blocked(
+                                parent_decomposition_validator,
+                                self.github,
+                                parent_decision,
+                                lambda number: self._fetch_authoritative_decomposition_set(repo_name, number),
+                            )
+                            result.error = "Parent/child decomposition validation found material defects"
+                            if side_effect_error:
+                                result.error += f"; GitHub side effect failed: {side_effect_error}"
+                            result.target_outcome = ExplicitTargetOutcome.BLOCKED
+                            result.actions = ["Rejected - blocked parent/child decomposition"]
+                            result.blocked_cacheable = not side_effect_error
+                            _record_issue_stage_result(item_number, "issue.decomposition-validation", f"issue#{item_number} decomposition validation", Outcome.BLOCKED, {"member_issue_numbers": sorted(child_decisions)})
+                        elif decomposition_enabled and parent_decision is not None and parent_decision.verdict == "ERROR":
+                            result.error = "Decomposition validation failed; parent readiness was preserved for retry"
+                            result.target_outcome = ExplicitTargetOutcome.DEFERRED
+                            result.actions = ["Deferred - decomposition validation error"]
+                            _record_issue_stage_result(item_number, "issue.decomposition-validation", f"issue#{item_number} decomposition validation", Outcome.FAILED, {"member_issue_numbers": sorted(child_decisions)})
+                        elif any(decision.verdict == "ERROR" for decision in child_decisions.values()):
+                            failed_children = [f"#{num}: {decision.remediation_reason}" if decision.remediation_reason else f"#{num}" for num, decision in sorted(child_decisions.items()) if decision.verdict == "ERROR"]
+                            result.error = f"Individual validation failed for {', '.join(failed_children)}; parent readiness was preserved for retry"
+                            result.target_outcome = ExplicitTargetOutcome.DEFERRED
+                            result.actions = ["Deferred - child specification validation error"]
+                            _record_issue_stage_result(item_number, "issue.individual-validation", f"issue#{item_number} individual validation", Outcome.FAILED, {"member_issue_numbers": sorted(child_decisions)})
+                        elif any(decision.verdict == "BLOCKED" for decision in child_decisions.values()):
+                            blocked = next(decision for decision in child_decisions.values() if decision.verdict == "BLOCKED")
+                            validator = self._get_specification_validator(repo_name)
+
+                            def set_is_current() -> bool:
+                                latest = self._fetch_authoritative_decomposition_set(repo_name, item_number)
+                                return latest is not None and self._is_open_issue(latest[0]) and is_implementation_ready(latest[0]) and parent_decision is not None and parent_decomposition_validator.identity(*latest) == parent_decision.identity
+
+                            side_effect_error = self._authorize_and_apply_inherited_blocked(validator, self.github, blocked, set_is_current)
+                            result.error = "Child specification validation found material defects"
+                            if side_effect_error:
+                                result.error += f"; GitHub side effect failed: {side_effect_error}"
+                            result.target_outcome = ExplicitTargetOutcome.BLOCKED
+                            result.actions = ["Rejected - blocked child specification"]
+                            result.blocked_cacheable = not side_effect_error
+                            _record_issue_stage_result(item_number, "issue.individual-validation", f"issue#{item_number} individual validation", Outcome.BLOCKED, {"member_issue_numbers": sorted(child_decisions)})
+                        elif decomposition_enabled and parent_decision is not None:
+                            complete, message = self._complete_container_parent(repo_name, item_number, parent_decision, child_decisions)
+                            if complete:
+                                result.success = True
+                                result.target_outcome = ExplicitTargetOutcome.SUCCESS
+                                result.actions = [message]
+                            else:
+                                result.error = message
+                                result.target_outcome = ExplicitTargetOutcome.DEFERRED
+                                result.actions = ["Deferred - container parent completion requires retry"]
+                                result.refill_retry_required = True
+                        else:
+                            result.target_outcome = ExplicitTargetOutcome.DEFERRED
+                            result.actions = ["Deferred - container parent requires decomposition validation"]
+                        return result
+                    if not explicit_only and origin in {"durable-invalidation-worker", "capacity-refill-intake", "issue-pending-work-resumption"}:
+                        if self.is_draining:
+                            result.error = "Parent child handoff deferred during graceful shutdown"
+                            result.target_outcome = ExplicitTargetOutcome.DEFERRED
+                            result.refill_retry_required = True
+                            _record_issue_stage_result(item_number, "issue.hierarchy-admission", f"issue#{item_number} hierarchy admission", Outcome.DEFERRED, {"reason": result.error, "authorizes_execution": False})
+                            return result
+                        # A tracking parent coordinates work; running its first
+                        # child inline occupies this worker (or refill pass) for
+                        # the child's entire implementation. Persist every child
+                        # independently so unrelated families can make progress.
+                        child_numbers = [int(child["number"]) for child in open_children]
+                        for child_number in child_numbers:
+                            self.invalidations.invalidate(EntityIdentity(repo_name, "issue", child_number))
+                        if self._invalidation_wake_event is not None and self._loop is not None:
+                            self._loop.call_soon_threadsafe(self._invalidation_wake_event.set)
+                        result.target_outcome = ExplicitTargetOutcome.DEFERRED
+                        result.actions = ["Deferred - submitted children queued for independent evaluation"]
+                        _record_issue_stage_result(item_number, "issue.hierarchy-admission", f"issue#{item_number} hierarchy admission", Outcome.DEFERRED, {"child_issue_numbers": child_numbers, "reason": result.actions[0], "authorizes_execution": False})
+                        return result
+                    last_refusal: Optional[CandidateProcessingResult] = None
+                    for open_child in open_children:
+                        child_number = int(open_child["number"])
+                        child = self.github.get_issue_dispatch_snapshot_strict(repo_name, child_number)
+                        child["parent_issue_number"] = item_number
+                        child_result = self._process_single_candidate_unified(
+                            repo_name,
+                            Candidate(type="issue", data=child, priority=candidate.priority, issue_number=child_number),
+                            config,
+                            jules_mode,
+                            explicit_only,
+                            force,
+                            continue_execution,
+                            advance_issue_attempt,
+                            authoritative_parent_number=item_number,
+                            origin=origin,
+                        )
+                        if child_result.success:
+                            return child_result
+                        last_refusal = child_result
+                        if child_result.target_outcome is ExplicitTargetOutcome.BLOCKED:
+                            return child_result
+                    if last_refusal is not None:
+                        return last_refusal
+                result.target_outcome = ExplicitTargetOutcome.SKIPPED
+                result.actions = [f"Skipped - parent submission is missing {IMPLEMENTATION_READY_LABEL} label"]
+                _record_issue_stage_result(item_number, "issue.hierarchy-admission", f"issue#{item_number} hierarchy admission", Outcome.SKIPPED, {"reason": result.actions[0]})
+                return result
+
+            live_parent_number = authoritative_parent_number
+            if not live_parent_number:
+                live_parent_number, deferred_result = self._get_authoritative_parent_or_defer(repo_name, item_number, candidate.data, result)
+                if deferred_result is not None:
+                    return deferred_result
+            if isinstance(self.github, GitHubClient) and isinstance(live_parent_number, int):
+                try:
+                    live_parent_set = self._fetch_authoritative_decomposition_set(repo_name, live_parent_number)
+                except ParentSpecificationError as exc:
+                    result.error = f"Parent-Issue reconciliation blocked processing: {exc}"
+                    result.target_outcome = ExplicitTargetOutcome.BLOCKED
+                    result.definitive_parent_refusal = True
+                    result.actions = ["Blocked - invalid Parent-Issue relationship metadata"]
+                    _record_issue_stage_result(
+                        item_number,
+                        "issue.parent-reconciliation",
+                        f"issue#{item_number} parent reconciliation",
+                        Outcome.BLOCKED,
+                        {"reason": str(exc)},
+                    )
+                    return result
+                except Exception as exc:
+                    deferred_result = self._defer_wrapped_reconciliation(repo_name, item_number, candidate.data, exc, result)
+                    if deferred_result is not None:
+                        return deferred_result
+                    result.error = f"Cannot fetch authoritative parent/child specification set: {exc}"
+                    return result
+                if live_parent_set is None or item_number not in {child.get("number") for child in live_parent_set[1]}:
+                    result.target_outcome = ExplicitTargetOutcome.SKIPPED
+                    result.actions = ["Skipped - child is no longer in the authoritative parent set"]
+                    return result
+                if not self._is_open_issue(live_parent_set[0]):
+                    result.target_outcome = ExplicitTargetOutcome.SKIPPED
+                    result.actions = ["Skipped - authoritative parent is closed"]
+                    return result
+                if not is_implementation_ready(live_parent_set[0]):
+                    result.target_outcome = ExplicitTargetOutcome.SKIPPED
+                    result.actions = [f"Skipped - authoritative parent is missing {IMPLEMENTATION_READY_LABEL} label"]
+                    return result
+                if self._defer_initial_issue_stabilization(repo_name, live_parent_set[0]):
+                    result.target_outcome = ExplicitTargetOutcome.DEFERRED
+                    result.actions = ["Deferred - readiness submission is in its initial stabilization window"]
+                    return result
+            elif is_implementation_ready(candidate.data) and self._defer_initial_issue_stabilization(repo_name, candidate.data):
+                result.target_outcome = ExplicitTargetOutcome.DEFERRED
+                result.actions = ["Deferred - readiness submission is in its initial stabilization window"]
+                return result
+            if not generation_serialized:
+                # One owner lock spans validation, final verification, admission,
+                # and implementation. A changed generation therefore waits for
+                # the preceding implementation to actually finish; validation
+                # never deletes or overlaps its capacity ownership.
+                owner = ImplementationOwner("issue", item_number)
+                slots = self._get_implementation_slots(repo_name)
+                retained_async_owner = slots.has_provider_sessions(owner)
+                if (slots.active_execution_ids(owner) or retained_async_owner) and not manual_retry and not continue_execution:
+                    try:
+                        owned_snapshot = self._reconcile_validation_snapshot(
+                            repo_name,
+                            item_number,
+                            self.github.get_issue_dispatch_snapshot_strict(repo_name, item_number),
+                        )
+                    except ParentSpecificationError as exc:
+                        result.error = f"Parent-Issue reconciliation blocked processing: {exc}"
+                        result.target_outcome = ExplicitTargetOutcome.BLOCKED
+                        result.definitive_parent_refusal = True
+                        result.actions = ["Blocked - invalid Parent-Issue relationship metadata"]
+                        return result
+                    except ParentOperationalError as exc:
+                        deferred_result = self._defer_wrapped_reconciliation(repo_name, item_number, candidate.data, exc, result)
+                        if deferred_result is not None:
+                            return deferred_result
+                        result.error = f"Parent-Issue reconciliation is temporarily unavailable: {exc}"
+                        result.target_outcome = ExplicitTargetOutcome.DEFERRED
+                        result.actions = ["Deferred - Parent-Issue reconciliation requires retry"]
+                        result.refill_retry_required = True
+                        return result
+                    owned_parent, deferred_result = self._get_authoritative_parent_or_defer(repo_name, item_number, owned_snapshot, result)
+                    if deferred_result is not None:
+                        return deferred_result
+                    if owned_parent is not None:
+                        try:
+                            self._validate_submitted_parent_generation_for_child(repo_name, item_number, owned_snapshot)
+                        except Exception as exc:
+                            deferred_result = self._defer_wrapped_reconciliation(repo_name, item_number, candidate.data, exc, result)
+                            if deferred_result is not None:
+                                return deferred_result
+                            raise
+                    owned_child_reader = getattr(self.github, "get_direct_sub_issues_strict", None)
+                    owned_children = owned_child_reader(repo_name, item_number) if callable(owned_child_reader) else []
+                    if is_implementation_ready(owned_snapshot) and owned_parent is None and isinstance(owned_children, list) and not owned_children:
+                        owned_title = str(owned_snapshot.get("title") or "")
+                        owned_body = str(owned_snapshot.get("body") or "")
+                        owned_manifest = build_normative_issue_manifest(item_number, owned_title, owned_body)
+                        if owned_manifest.error is None and self._is_issue_specification_validation_enabled(repo_name, config):
+                            owned_validator = self._get_specification_validator(repo_name)
+                            owned_identity = owned_validator.identity(item_number, owned_title, owned_body)
+                            # The Review lane owns semantic execution; this
+                            # retained-owner gate observes the durable decision
+                            # instead of submitting a new validation job (REQ-010).
+                            owned_decision, owned_lane_applied = self._review_individual_via_lane(repo_name, item_number, owned_title, owned_body, None, "retained-owner-reevaluation", owned_snapshot)
+                            if owned_decision is None or owned_decision.verdict == "ERROR":
+                                result.error = "Specification validation failed; implementation-ready was preserved for retry"
+                                result.refill_retry_required = True
+                                return result
+                            if owned_decision.verdict == "BLOCKED":
+                                if not owned_lane_applied:
+                                    self._authorize_and_apply_blocked(
+                                        owned_validator,
+                                        self.github,
+                                        owned_decision,
+                                        lambda: self._standalone_validation_is_current(repo_name, owned_decision),
+                                    )
+                                result.error = "Specification validation found material defects"
+                                result.target_outcome = ExplicitTargetOutcome.BLOCKED
+                                result.actions = ["Rejected - blocked specification"]
+                                return result
+                    result.target_outcome = ExplicitTargetOutcome.DEFERRED
+                    result.actions = [f"Deferred - implementation ownership already exists ({owner.key})"]
+                    return result
+                with slots.serialize(owner):
+                    if owner in slots.active_owners() and not continue_execution and not manual_retry:
+                        # A completed local launch can leave a bare owner while
+                        # its Issue stays open. It has no actual implementation
+                        # work to coordinate, so retire it before validation.
+                        # Owners with PR/provider/execution membership remain
+                        # protected and cannot be silently discarded.
+                        snapshot = self.github.get_issue_dispatch_snapshot_strict(repo_name, item_number)
+                        validator = self._get_specification_validator(repo_name)
+                        current_identity = validator.identity(
+                            item_number,
+                            str(snapshot.get("title") or ""),
+                            str(snapshot.get("body") or ""),
+                        ).key
+                        generation = slots.implementation_generation(owner)
+                        retryable_preparation = generation is not None and self.issue_stage_routing.implementation_not_started(repo_name, item_number, generation)
+                        if (not retryable_preparation and is_implementation_ready(snapshot) and slots.validation_identity(owner) == current_identity) or not slots.release_unbound_idle_owner(owner):
+                            result.target_outcome = ExplicitTargetOutcome.DEFERRED
+                            result.actions = [f"Deferred - implementation ownership already exists ({owner.key})"]
+                            return result
+                    return self._process_single_candidate_unified(
+                        repo_name,
+                        candidate,
+                        config,
+                        jules_mode,
+                        explicit_only,
+                        force,
+                        continue_execution,
+                        advance_issue_attempt,
+                        generation_serialized=True,
+                        authoritative_parent_number=authoritative_parent_number,
+                        origin=origin,
+                        retry=retry,
+                        retry_request_id=retry_request_id,
+                    )
+            try:
+                current_issue = self._reconcile_validation_snapshot(
+                    repo_name,
+                    item_number,
+                    self.github.get_issue_dispatch_snapshot_strict(repo_name, item_number),
+                )
+            except GitHubRequestDeferred as exc:
+                deferred = _reconciliation_admission_deferral(exc)
+                if deferred is None:
+                    raise
+                return self._defer_issue_evaluation(repo_name, item_number, candidate.data, deferred, result)
+            except ParentSpecificationError as exc:
+                result.error = f"Parent-Issue reconciliation blocked processing: {exc}"
+                result.target_outcome = ExplicitTargetOutcome.BLOCKED
+                result.definitive_parent_refusal = True
+                result.actions = ["Blocked - invalid Parent-Issue relationship metadata"]
+                return result
+            except ParentOperationalError as exc:
+                deferred_result = self._defer_wrapped_reconciliation(repo_name, item_number, candidate.data, exc, result)
+                if deferred_result is not None:
+                    return deferred_result
+                result.error = f"Parent-Issue reconciliation is temporarily unavailable: {exc}"
+                result.target_outcome = ExplicitTargetOutcome.DEFERRED
+                result.actions = ["Deferred - Parent-Issue reconciliation requires retry"]
+                result.refill_retry_required = True
+                return result
+            except Exception as exc:
+                result.error = str(exc)
+                result.failure = exc
+                result.refill_retry_required = True
+                return result
+            if not isinstance(current_issue, dict) or current_issue.get("number") != item_number:
+                result.error = f"Refusing Issue dispatch for {repo_name}#{item_number}: GitHub returned an ambiguous item snapshot"
+                return result
+            if "pull_request" in current_issue:
+                result.error = f"Refusing Issue dispatch for {repo_name}#{item_number}: GitHub identifies the target as pr"
+                return result
+
+            inherited_parent_number: Optional[int] = None
+            decomposition_decision: Optional[DecompositionDecision] = None
+            decomposition_validator: Optional[DecompositionValidationLifecycle] = None
+            authoritative_set: Optional[tuple[Dict[str, Any], List[Dict[str, Any]]]] = None
+            independently_ready = is_implementation_ready(current_issue)
+            live_parent_number = authoritative_parent_number
+            if not live_parent_number:
+                live_parent_number, deferred_result = self._get_authoritative_parent_or_defer(repo_name, item_number, current_issue, result)
+                if deferred_result is not None:
+                    return deferred_result
+            # Current authoritative relationship data, never the collected
+            # candidate hint, decides whether set authorization is mandatory.
+            parent_details: Optional[Dict[str, Any]]
+            if isinstance(live_parent_number, int):
+                parent_details = {"number": live_parent_number}
+            else:
+                parent_details = None
+            if isinstance(parent_details, dict) and isinstance(parent_details.get("number"), int):
+                inherited_parent_number = int(parent_details["number"])
+                try:
+                    authoritative_set = self._fetch_authoritative_decomposition_set(repo_name, inherited_parent_number)
+                except ParentSpecificationError as exc:
+                    result.error = f"Parent-Issue reconciliation blocked processing: {exc}"
+                    result.target_outcome = ExplicitTargetOutcome.BLOCKED
+                    result.definitive_parent_refusal = True
+                    result.actions = ["Blocked - invalid Parent-Issue relationship metadata"]
+                    _record_issue_stage_result(
+                        item_number,
+                        "issue.parent-reconciliation",
+                        f"issue#{item_number} parent reconciliation",
+                        Outcome.BLOCKED,
+                        {"reason": str(exc)},
+                    )
+                    return result
+                except Exception as exc:
+                    deferred_result = self._defer_wrapped_reconciliation(repo_name, item_number, candidate.data, exc, result)
+                    if deferred_result is not None:
+                        return deferred_result
+                    result.error = f"Cannot fetch authoritative parent/child specification set: {exc}"
+                    return result
+                if authoritative_set is None or item_number not in {child.get("number") for child in authoritative_set[1]}:
+                    result.target_outcome = ExplicitTargetOutcome.SKIPPED
+                    result.actions = ["Skipped - child is no longer in the authoritative parent set"]
+                    return result
+                if not self._is_open_issue(authoritative_set[0]):
+                    result.target_outcome = ExplicitTargetOutcome.SKIPPED
+                    result.actions = ["Skipped - authoritative parent is closed"]
+                    return result
+                if not is_implementation_ready(authoritative_set[0]):
+                    result.target_outcome = ExplicitTargetOutcome.SKIPPED
+                    result.actions = [f"Skipped - authoritative parent is missing {IMPLEMENTATION_READY_LABEL} label"]
+                    return result
+
+            inherited_ready = authoritative_set is not None and self._is_open_issue(authoritative_set[0]) and is_implementation_ready(authoritative_set[0])
+
+            # Readiness is intentionally decided from the same cache-bypassing
+            # snapshot as the dispatch type and requirement contract. Candidate
+            # data may have been collected earlier, so trusting its labels would
+            # allow a subsequently removed readiness label to start work. Keep
+            # this before slot resolution and every implementation ownership side
+            # effect; explicit/forced processing therefore cannot bypass it.
+            if not self._is_open_issue(current_issue) or (not independently_ready and not inherited_ready):
+                logger.info(f"Skipping Issue #{item_number} - missing {IMPLEMENTATION_READY_LABEL} label")
+                result.target_outcome = ExplicitTargetOutcome.SKIPPED
+                result.actions = [f"Skipped - missing {IMPLEMENTATION_READY_LABEL} label"]
+                _record_issue_stage_result(item_number, "issue.readiness-admission", f"issue#{item_number} readiness admission", Outcome.SKIPPED, {"reason": result.actions[0]})
+                return result
+
+            if inherited_ready:
+                assert authoritative_set is not None
+                parent_snapshot, child_snapshots = authoritative_set
+                if self._defer_initial_issue_stabilization(repo_name, parent_snapshot):
+                    result.target_outcome = ExplicitTargetOutcome.DEFERRED
+                    result.actions = ["Deferred - readiness submission is in its initial stabilization window"]
+                    return result
+                decomposition_validator = self._get_decomposition_validator(repo_name)
+                individual_validator = self._get_specification_validator(repo_name)
+                decomposition_enabled = self._is_issue_decomposition_validation_enabled(repo_name, config)
+                if decomposition_validator.is_reissue_required(inherited_parent_number or 0) is True:
+                    result.error = "Parent specification set requires a replacement Issue number"
+                    result.target_outcome = ExplicitTargetOutcome.BLOCKED
+                    result.actions = ["Rejected - parent set is durably reissue-required"]
+                    result.blocked_cacheable = True
+                    return result
+                spec_validation_enabled = self._is_issue_specification_validation_enabled(repo_name, config)
+                if individual_validator.is_reissue_required(item_number) is True:
+                    result.error = "Child specification requires a replacement Issue number"
+                    result.target_outcome = ExplicitTargetOutcome.BLOCKED
+                    result.actions = ["Rejected - child is durably reissue-required"]
+                    result.blocked_cacheable = True
+                    return result
+                if getattr(self._lane_context, "implementation", False):
+                    decomposition_decision = decomposition_validator.store.get(decomposition_validator.identity(*authoritative_set)) if decomposition_enabled else None
+                    eager_child_decisions = {}
+                    if spec_validation_enabled:
+                        for child in authoritative_set[1]:
+                            if not self._is_authoritatively_open_issue(child):
+                                continue
+                            child_number = int(child["number"])
+                            relationship = self._child_review_context(*authoritative_set, child_number)
+                            child_identity = individual_validator.identity(
+                                child_number,
+                                str(child.get("title") or ""),
+                                str(child.get("body") or ""),
+                                relationship,
+                            )
+                            stored = individual_validator.store.get(child_identity)
+                            if stored is not None:
+                                eager_child_decisions[child_number] = stored
+                    open_child_count = sum(self._is_authoritatively_open_issue(child) for child in authoritative_set[1])
+                    if (decomposition_enabled and decomposition_decision is None) or (spec_validation_enabled and len(eager_child_decisions) != open_child_count):
+                        result.target_outcome = ExplicitTargetOutcome.DEFERRED
+                        result.actions = ["Deferred - exact current review evidence is unavailable"]
+                        result.refill_retry_required = True
+                        return result
+                else:
+                    decomposition_job, eager_child_jobs = self._schedule_parent_validations(repo_name, authoritative_set, config, scheduler=self.review_scheduler)
+                    decomposition_decision, eager_child_decisions = self._join_parent_validations(decomposition_job, eager_child_jobs)
+                if decomposition_enabled and decomposition_decision is not None:
+                    if decomposition_decision.verdict == "ERROR":
+                        result.error = "Decomposition validation failed; parent readiness was preserved for retry"
+                        result.target_outcome = ExplicitTargetOutcome.DEFERRED
+                        result.actions = ["Deferred - decomposition validation error"]
+                        # This child observes the parent's decomposition-job gate
+                        # from its own execution scope; it did not run that job.
+                        _record_issue_stage_result(item_number, "issue.decomposition-gate-observed", f"issue#{item_number} decomposition gate observed", Outcome.FAILED, {"parent_number": inherited_parent_number})
+                        return result
+                    if decomposition_decision.verdict == "BLOCKED":
+                        try:
+                            side_effect_error = self._authorize_and_apply_decomposition_blocked(
+                                decomposition_validator,
+                                self.github,
+                                decomposition_decision,
+                                lambda number: self._fetch_authoritative_decomposition_set(repo_name, number),
+                            )
+                        except Exception as exc:
+                            side_effect_error = str(exc)
+                        result.error = "Parent/child decomposition validation found material defects"
+                        result.target_outcome = ExplicitTargetOutcome.BLOCKED
+                        result.actions = ["Rejected - blocked parent/child decomposition"]
+                        if side_effect_error:
+                            result.error += f"; GitHub side effect failed: {side_effect_error}"
+                        _record_issue_stage_result(item_number, "issue.decomposition-gate-observed", f"issue#{item_number} decomposition gate observed", Outcome.BLOCKED, {"parent_number": inherited_parent_number})
+                        result.blocked_cacheable = not side_effect_error
+                        return result
+                if spec_validation_enabled:
+                    failed_eager_children = [f"#{num}: {eager_decision.remediation_reason}" if eager_decision.remediation_reason else f"#{num}" for num, eager_decision in sorted(eager_child_decisions.items()) if eager_decision.verdict == "ERROR"]
+                    if failed_eager_children:
+                        result.error = f"Individual validation failed for {', '.join(failed_eager_children)}; parent readiness was preserved for retry"
+                        result.target_outcome = ExplicitTargetOutcome.DEFERRED
+                        result.actions = ["Deferred - child specification validation error"]
+                        _record_issue_stage_result(item_number, "issue.individual-validation", f"issue#{item_number} individual validation", Outcome.FAILED, {"issue_number": item_number})
+                        return result
+                    blocked_children = [child_decision for child_decision in eager_child_decisions.values() if child_decision.verdict == "BLOCKED"]
+                    if blocked_children:
+                        assert authoritative_set is not None
+
+                        def _family_is_current() -> bool:
+                            latest = self._fetch_authoritative_decomposition_set(repo_name, inherited_parent_number or 0)
+                            return latest is not None and self._is_open_issue(latest[0]) and is_implementation_ready(latest[0]) and self._family_individual_identities_match(individual_validator, latest, eager_child_decisions)
+
+                        failures: list[str] = []
+                        for child_decision in blocked_children:
+                            failure = self._authorize_and_apply_inherited_blocked(individual_validator, self.github, child_decision, _family_is_current)
+                            if failure is not None:
+                                failures.append(failure)
+                        result.error = "A current child specification validation found material defects"
+                        if failures:
+                            result.error += f"; GitHub side effect failed: {'; '.join(failures)}"
+                        result.target_outcome = ExplicitTargetOutcome.BLOCKED
+                        result.actions = ["Rejected - blocked specification" if eager_child_decisions[item_number].verdict == "BLOCKED" else "Rejected - blocked child specification prerequisite"]
+                        result.blocked_cacheable = not failures
+                        return result
+            current_body = str(current_issue.get("body") or "")
+            current_title = str(current_issue.get("title") or "")
+            contract = build_normative_issue_manifest(item_number, current_title, current_body)
+            if contract.error:
+                fingerprint = hashlib.sha256(f"{REQUIREMENT_CONTRACT_PARSER_VERSION}\0{current_body}\0{contract.error}".encode("utf-8")).hexdigest()
+                marker = f"<!-- {INVALID_REQUIREMENT_CONTRACT_MARKER_PREFIX}:{REQUIREMENT_CONTRACT_PARSER_VERSION}:{fingerprint} -->"
+                try:
+                    comments = self.github.get_issue_comments_strict(repo_name, item_number)
+                except Exception as exc:
+                    # An unavailable comment listing is not authoritative evidence
+                    # that the diagnostic is absent. Fail closed so a transient read
+                    # failure can never turn into a duplicate write.
+                    result.error = f"Cannot safely check requirement contract diagnostics: {exc}"
+                    logger.warning(f"Deferred invalid Issue #{item_number} because diagnostic lookup failed: {exc}")
+                    return result
+                already_reported = any(marker in str(comment.get("body") or "") for comment in comments if isinstance(comment, dict))
+                if not already_reported:
+                    diagnostic = (
+                        f"{marker}\n"
+                        "## Auto-Coder requirement contract validation\n\n"
+                        f"Implementation has not started because the Issue requirement contract is invalid: **{contract.error}**.\n\n"
+                        "Edit the `## Requirements` section so every non-empty entry uses a unique `REQ-NNN:` identifier "
+                        "(for example, `- REQ-001: Describe the required observable behavior.`). Auto-Coder will re-evaluate the edited Issue on a later scan."
+                    )
+                    self.github.add_comment_to_issue(repo_name, item_number, diagnostic)
+                logger.warning(f"Rejected Issue #{item_number} before implementation dispatch: {contract.error}")
+                result.target_outcome = ExplicitTargetOutcome.BLOCKED
+                result.actions = [f"Rejected - invalid requirement contract: {contract.error}"]
+                result.error = contract.error
+                result.blocked_cacheable = True
+                _record_issue_stage_result(item_number, "issue.normative-contract-check", f"issue#{item_number} normative contract check", Outcome.BLOCKED, {"reason": contract.error})
+                return result
+
+            # Semantic readiness is a durable authorization for this exact title,
+            # body, repository, Issue and validator policy. It deliberately runs
+            # before implementation ownership/capacity is consulted.
+            validator = self._get_specification_validator(repo_name)
+            spec_validation_enabled = self._is_issue_specification_validation_enabled(repo_name, config)
+            decision: Optional[ValidationDecision] = None
+            relationship_context = self._child_review_context(*authoritative_set, item_number) if inherited_ready and authoritative_set is not None else None
+            individual_identity = validator.identity(item_number, current_title, current_body, relationship_context)
+            if validator.is_reissue_required(item_number) is True:
+                result.error = "Specification requires a replacement Issue number"
+                result.target_outcome = ExplicitTargetOutcome.BLOCKED
+                result.actions = ["Rejected - Issue is durably reissue-required"]
+                result.blocked_cacheable = True
+                return result
+            if spec_validation_enabled:
+                if inherited_ready:
+                    decision = eager_child_decisions[item_number]
+                else:
+                    # The Review lane owns semantic execution; this gate
+                    # observes the durable decision instead of submitting a
+                    # new validation job (REQ-010).
+                    decision, lane_applied = self._review_individual_via_lane(repo_name, item_number, current_title, current_body, relationship_context, "normal-worker-processing", current_issue)
+                    if decision is None:
+                        result.error = "Specification validation failed; implementation-ready was preserved for retry"
+                        result.target_outcome = ExplicitTargetOutcome.DEFERRED
+                        result.actions = ["Deferred - specification validation error"]
+                        result.refill_retry_required = True
+                        return result
+                if decision.verdict == "ERROR":
+                    result.error = "Specification validation failed; implementation-ready was preserved for retry"
+                    result.target_outcome = ExplicitTargetOutcome.DEFERRED
+                    result.actions = ["Deferred - specification validation error"]
+                    result.refill_retry_required = True
+                    return result
+                if decision.verdict == "BLOCKED":
+                    lane_already_applied = inherited_parent_number is None and lane_applied
+                    try:
+                        if lane_already_applied:
+                            side_effect_error = None
+                        elif inherited_parent_number is not None:
+                            decomposition_enabled = self._is_issue_decomposition_validation_enabled(repo_name, config)
+
+                            def _set_is_current() -> bool:
+                                latest = self._fetch_authoritative_decomposition_set(repo_name, inherited_parent_number)
+                                if latest is None or not self._is_open_issue(latest[0]) or not is_implementation_ready(latest[0]) or item_number not in {child.get("number") for child in latest[1]}:
+                                    return False
+                                relationship = self._child_review_context(*latest, item_number)
+                                if validator.identity(item_number, current_title, current_body, relationship) != decision.identity:
+                                    return False
+                                if decomposition_enabled and decomposition_decision is not None and decomposition_validator is not None:
+                                    return decomposition_validator.identity(*latest) == decomposition_decision.identity
+                                return True
+
+                            side_effect_error = self._authorize_and_apply_inherited_blocked(
+                                validator,
+                                self.github,
+                                decision,
+                                _set_is_current,
+                            )
+                        else:
+                            side_effect_error = self._authorize_and_apply_blocked(
+                                validator,
+                                self.github,
+                                decision,
+                                lambda: self._standalone_validation_is_current(repo_name, decision),
+                            )
+                    except GitHubRequestError as exc:
+                        return self._defer_validation_publication(repo_name, item_number, decision, exc, result)
+                    except Exception as exc:
+                        side_effect_error = str(exc)
+                    if side_effect_error:
+                        logger.error(f"Specification BLOCKED side effects failed for Issue #{item_number}: {side_effect_error}")
+                        result.error = f"Specification is blocked; GitHub side effect failed: {side_effect_error}"
+                        result.target_outcome = ExplicitTargetOutcome.BLOCKED
+                        result.actions = ["Rejected - blocked specification (side effects incomplete)"]
+                        return result
+                    result.error = "Specification validation found material defects"
+                    result.target_outcome = ExplicitTargetOutcome.BLOCKED
+                    result.actions = ["Rejected - blocked specification"]
+                    result.blocked_cacheable = True
+                    return result
+
+            # This is the final cache-bypassing check immediately before slot and
+            # ownership handling. READY for an edited or withdrawn submission is
+            # not transferable.
+            try:
+                dispatch_snapshot = self.github.get_issue_dispatch_snapshot_strict(repo_name, item_number)
+            except GitHubRequestDeferred as exc:
+                deferred = _reconciliation_admission_deferral(exc)
+                if deferred is None:
+                    raise
+                return self._defer_issue_evaluation(repo_name, item_number, candidate.data, deferred, result)
+            except Exception as exc:
+                result.error = f"Cannot confirm validated Issue generation before dispatch: {exc}"
+                result.failure = exc
+                result.refill_retry_required = True
+                return result
+            # Reconcile from the same cache-bypassing generation used for final
+            # admission, after all awaited validation. No earlier graph result
+            # or force/urgent path is authorization.
+            if isinstance(self.github, GitHubClient) and hasattr(self.github, "token"):
+                try:
+                    dependency_satisfaction = self._reconcile_sibling_dependencies(repo_name, item_number, dispatch_snapshot)
+                except Exception as exc:
+                    deferred_result = self._defer_wrapped_reconciliation(repo_name, item_number, candidate.data, exc, result)
+                    if deferred_result is not None:
+                        return deferred_result
+                    _record_issue_stage_result(item_number, "issue.sibling-dependency-gate", f"issue#{item_number} sibling dependency gate", Outcome.DEFERRED, {"reason": "relationship reconciliation unavailable"})
+                    result.error = f"Sibling dependency reconciliation is unresolved: {exc}"
+                    result.target_outcome = ExplicitTargetOutcome.DEFERRED
+                    result.actions = ["Deferred - unresolved sibling dependency reconciliation"]
+                    return result
+                dependency_outcome = Outcome.COMPLETED if dependency_satisfaction is DependencySatisfaction.SATISFIED else Outcome.BLOCKED if dependency_satisfaction is DependencySatisfaction.INVALID else Outcome.DEFERRED
+                _record_issue_stage_result(item_number, "issue.sibling-dependency-gate", f"issue#{item_number} sibling dependency gate", dependency_outcome, {"satisfaction": dependency_satisfaction.value})
+                if dependency_satisfaction is DependencySatisfaction.INVALID:
+                    result.error = "Sibling dependency declaration is invalid"
+                    result.target_outcome = ExplicitTargetOutcome.BLOCKED
+                    result.actions = ["Rejected - invalid sibling dependency declaration"]
+                    return result
+                if dependency_satisfaction in {DependencySatisfaction.WAITING, DependencySatisfaction.UNAVAILABLE}:
+                    result.target_outcome = ExplicitTargetOutcome.DEFERRED
+                    result.actions = ["Deferred - sibling prerequisite remains open or unavailable"]
+                    return result
+            dispatch_relationship: Optional[IndividualRelationshipContext] = None
+            submission_current = self._is_open_issue(dispatch_snapshot) and is_implementation_ready(dispatch_snapshot)
+            if validator.is_reissue_required(item_number) is True:
+                submission_current = False
+            decomposition_enabled = self._is_issue_decomposition_validation_enabled(repo_name, config)
+            if inherited_parent_number is not None:
+                try:
+                    latest_set = self._fetch_authoritative_decomposition_set(repo_name, inherited_parent_number)
+                except Exception as exc:
+                    deferred_result = self._defer_wrapped_reconciliation(repo_name, item_number, candidate.data, exc, result)
+                    if deferred_result is not None:
+                        return deferred_result
+                    raise
+                if latest_set is not None:
+                    dispatch_relationship = self._child_review_context(*latest_set, item_number)
+                submission_current = latest_set is not None and self._is_open_issue(latest_set[0]) and is_implementation_ready(latest_set[0]) and item_number in {child.get("number") for child in latest_set[1]}
+                if decomposition_validator is not None and decomposition_validator.is_reissue_required(inherited_parent_number) is True:
+                    submission_current = False
+                if decomposition_enabled and decomposition_decision is not None and decomposition_validator is not None:
+                    submission_current = submission_current and latest_set is not None and decomposition_validator.identity(*latest_set) == decomposition_decision.identity
+            elif submission_current:
+                # An Issue classified as standalone can become a parent without
+                # changing its own text or labels. Recheck membership before any
+                # ownership-facing operation and require a new set pass instead.
+                try:
+                    direct_child_reader = getattr(self.github, "get_direct_sub_issues_strict", None)
+                    latest_children = direct_child_reader(repo_name, item_number) if callable(direct_child_reader) else []
+                    submission_current = not (isinstance(latest_children, list) and latest_children) and self._standalone_relationship_is_current(repo_name, item_number, dispatch_snapshot)
+                except Exception as exc:
+                    deferred_result = self._defer_wrapped_reconciliation(repo_name, item_number, candidate.data, exc, result)
+                    if deferred_result is not None:
+                        return deferred_result
+                    raise
+            dispatch_identity = validator.identity(
+                item_number,
+                str(dispatch_snapshot.get("title") or ""),
+                str(dispatch_snapshot.get("body") or ""),
+                dispatch_relationship,
+            )
+            expected_identity = decision.identity if spec_validation_enabled and decision is not None else individual_identity
+            if spec_validation_enabled and decision is not None:
+                current_decision = validator.store.get(expected_identity)
+                submission_current = submission_current and current_decision is not None and current_decision.rerun_authority == decision.rerun_authority
+            if not submission_current or dispatch_identity != expected_identity:
+                result.target_outcome = ExplicitTargetOutcome.SKIPPED
+                result.actions = ["Skipped - validated Issue generation is stale or no longer submitted"]
+                return result
+
+            # All subsequent admission checks must consume exactly the
+            # authoritative generation whose specification was authorized.
+            candidate.data.update(dispatch_snapshot)
+            collected_candidate.data.update(dispatch_snapshot)
+
+            # Refill and direct dispatch share this last authoritative hierarchy
+            # gate. Candidate collection metadata is not sufficient because a
+            # child can open after enumeration and before slot admission.
+            try:
+                hierarchy_blocked = self._has_open_sub_issues(repo_name, candidate)
+            except Exception as exc:
+                deferred_result = self._defer_wrapped_reconciliation(repo_name, item_number, candidate.data, exc, result)
+                if deferred_result is not None:
+                    return deferred_result
+                result.error = f"Cannot establish current Issue hierarchy before dispatch: {exc}"
+                result.refill_retry_required = True
+                return result
+            if hierarchy_blocked:
+                result.target_outcome = ExplicitTargetOutcome.SKIPPED
+                result.actions = ["Skipped - unresolved Issue hierarchy dependency"]
+                return result
+
+        # Validation and other authorization work above belongs to the already
+        # started critical operation and may publish its decision. A drain that
+        # arrived while it ran must stop before implementation ownership or any
+        # local/cloud provider dispatch is started.
+        if self.is_draining:
+            result.target_outcome = ExplicitTargetOutcome.DEFERRED
+            result.actions = ["Deferred - graceful shutdown began before implementation dispatch"]
+            return result
+
+        slots = self._get_implementation_slots(repo_name)
+        try:
+            owner = slots.resolve_owner(candidate.type, candidate.data, self.github)
+        except ImplementationOwnerResolutionError as exc:
+            result.error = f"Cannot safely resolve logical implementation owner: {exc}"
+            return result
+        except Exception as exc:
+            result.error = str(exc)
+            return result
+
+        implementation_pr = item_number if candidate.type == "pr" and owner.kind != "pr" else None
+        labels = candidate.data.get("labels", [])
+        urgent_issue = candidate.type == "issue" and isinstance(labels, list) and any(label == "urgent" or (isinstance(label, dict) and label.get("name") == "urgent") for label in labels)
+
+        generation_context: Dict[str, Any] = {}
+
+        def issue_generation_is_current() -> bool:
+            if candidate.type != "issue":
+                return True
+            latest = self.github.get_issue_dispatch_snapshot_strict(repo_name, item_number)
+            latest_relationship: Optional[IndividualRelationshipContext] = None
+            current_set = None
+            if inherited_parent_number is not None:
+                current_set = self._fetch_authoritative_decomposition_set(repo_name, inherited_parent_number)
+                if current_set is not None:
+                    latest_relationship = self._child_review_context(*current_set, item_number)
+            # Captured unconditionally: the Implementation generation this
+            # freshest authoritative read would produce (#2061), used below
+            # only once this function's own freshness checks return True.
+            generation_context["snapshot"] = latest
+            generation_context["family_set"] = current_set
+            child_current = isinstance(latest, dict) and self._is_open_issue(latest) and validator.identity(item_number, str(latest.get("title") or ""), str(latest.get("body") or ""), latest_relationship) == expected_identity
+            if not child_current:
+                return False
+            latest_labels = latest.get("labels", [])
+            latest_is_urgent = isinstance(latest_labels, list) and any(label == "urgent" or (isinstance(label, dict) and label.get("name") == "urgent") for label in latest_labels)
+            if urgent_issue and not latest_is_urgent:
+                return False
+            if inherited_parent_number is not None:
+                if current_set is None or not self._is_open_issue(current_set[0]) or not is_implementation_ready(current_set[0]) or item_number not in {child.get("number") for child in current_set[1]}:
+                    return False
+                if decomposition_enabled and decomposition_decision is not None and decomposition_validator is not None:
+                    if decomposition_validator.identity(*current_set) != decomposition_decision.identity:
+                        return False
+                if isinstance(self.github, GitHubClient) and hasattr(self.github, "token"):
+                    try:
+                        return self._reconcile_sibling_dependencies(repo_name, item_number, latest) is DependencySatisfaction.SATISFIED
+                    except Exception as exc:
+                        if _reconciliation_admission_deferral(exc) is not None:
+                            raise
+                        return False
+                return True
+            direct_child_reader = getattr(self.github, "get_direct_sub_issues_strict", None)
+            latest_children = direct_child_reader(repo_name, item_number) if callable(direct_child_reader) else []
+            return is_implementation_ready(latest) and not (isinstance(latest_children, list) and latest_children) and self._standalone_relationship_is_current(repo_name, item_number, latest)
+
+        if candidate.type == "issue":
+            if not issue_generation_is_current():
+                result.target_outcome = ExplicitTargetOutcome.SKIPPED
+                result.actions = ["Skipped - validated Issue generation changed before ownership admission"]
+                return result
+            initial_implementation_generation = self._compute_implementation_generation(
+                repo_name,
+                generation_context["snapshot"],
+                generation_context.get("family_set"),
+            )
+            slots = self._get_implementation_slots(repo_name)
+            owner = ImplementationOwner("issue", item_number)
+
+            def refresh_generation() -> Optional[str]:
+                if not issue_generation_is_current():
+                    return None
+                return self._compute_implementation_generation(
+                    repo_name,
+                    generation_context["snapshot"],
+                    generation_context.get("family_set"),
+                )
+
+            def dispatch_issue(retry_authority: Optional[ImplementationRetryRequest]) -> CandidateProcessingResult:
+                if retry_authority is not None:
+                    if explicit_only:
+                        return self._process_single_candidate_reserved(
+                            repo_name,
+                            candidate,
+                            config,
+                            jules_mode,
+                            manual_retry=True,
+                            retry_authority=retry_authority,
+                            explicit_only=True,
+                        )
+                    return self._process_single_candidate_reserved(
+                        repo_name,
+                        candidate,
+                        config,
+                        jules_mode,
+                        manual_retry=True,
+                        retry_authority=retry_authority,
+                    )
+                if advance_issue_attempt:
+                    if explicit_only:
+                        return self._process_single_candidate_reserved(
+                            repo_name,
+                            candidate,
+                            config,
+                            jules_mode,
+                            advance_issue_attempt=True,
+                            explicit_only=True,
+                        )
+                    return self._process_single_candidate_reserved(
+                        repo_name,
+                        candidate,
+                        config,
+                        jules_mode,
+                        advance_issue_attempt=True,
+                    )
+                if explicit_only:
+                    return self._process_single_candidate_reserved(repo_name, candidate, config, jules_mode, explicit_only=True)
+                return self._process_single_candidate_reserved(repo_name, candidate, config, jules_mode)
+
+            def explain_duplicate_generation(generation: str, execution_id: str) -> str:
+                try:
+                    return explain_already_owned(self._get_local_job_store(), repo_name, item_number, generation, execution_id).message
+                except Exception:
+                    logger.opt(exception=True).debug("Duplicate-start diagnostic failed for issue#{}; preserving refusal", item_number)
+                    prefix, retry_guidance = duplicate_suppression_guidance(repo_name, item_number)
+                    return f"{prefix} Supplementary outcome evidence is unavailable. {retry_guidance}"
+
+            def record_retry_authority(authority: ImplementationRetryRequest, is_manual: bool) -> None:
+                _record_issue_stage_result(
+                    item_number,
+                    "issue.manual-retry",
+                    f"issue#{item_number} manual retry authorized",
+                    Outcome.COMPLETED,
+                    {
+                        "reason": "explicit --only --force --retry" if is_manual else "automatic stale-Jules recovery",
+                        "owner": owner.key,
+                        "request_id": authority.request_id,
+                        "attempt_id": authority.attempt_id,
+                        "generation": authority.generation,
+                        "phase": "owned",
+                    },
+                )
+
+            service = IssueImplementationService(self.issue_stage_routing, slots, self._get_local_job_store() if manual_retry else None)
+            request = IssueImplementationRequest(
+                repository=repo_name,
+                target_number=item_number,
+                initial_generation=initial_implementation_generation,
+                explicit_only=explicit_only,
+                continue_execution=continue_execution,
+                manual_retry=manual_retry,
+                retry_request_id=retry_request_id,
+                urgent=urgent_issue,
+            )
+            ports = IssueImplementationPorts(
+                refresh_generation=refresh_generation,
+                dispatch=dispatch_issue,
+                is_draining=lambda: self.is_draining,
+                github_client=self.github if isinstance(self.github, GitHubClient) else None,
+                reconciliation_client=self.github,
+                explain_duplicate=explain_duplicate_generation,
+                record_duplicate=lambda generation, explanation: _record_issue_stage_result(
+                    item_number,
+                    "issue.implementation-duplicate-suppression",
+                    f"issue#{item_number} duplicate automatic-start suppression",
+                    Outcome.SKIPPED,
+                    {"generation": generation, "explanation": explanation},
+                ),
+                record_retry=record_retry_authority,
+                record_not_started=lambda generation, reason: _record_issue_stage_result(
+                    item_number,
+                    "issue.implementation-not-started",
+                    f"issue#{item_number} preparation retry",
+                    Outcome.DEFERRED,
+                    {"generation": generation, "reason": reason, "provider_started": False},
+                ),
+                record_release=lambda released: _record_issue_stage_result(
+                    item_number,
+                    "issue.cloud-submission-slot-release",
+                    f"issue#{item_number} Cloud submission slot cleanup",
+                    Outcome.COMPLETED if released else Outcome.DEFERRED,
+                    {"slot_released": released, "reason": "Cloud submission did not start"},
+                ),
+                bind_validation_identity=lambda _execution_id: slots.record_validation_identity(owner, expected_identity.key),
+            )
+            try:
+                return service.execute(request, ports)
+            except ImplementationHierarchyConflict as exc:
+                result.target_outcome = ExplicitTargetOutcome.DEFERRED
+                result.actions = [f"Deferred - direct parent/child implementation conflict ({exc})"]
+                return result
+            except ImplementationHierarchyUnavailable as exc:
+                result.error = f"Cannot establish authoritative hierarchy for implementation admission: {exc}"
+                result.refill_retry_required = True
+                return result
+
+        # Try to reuse an existing owner before reconciliation.  In particular,
+        # this atomically records a newly discovered branch-linked PR while its
+        # Issue owner still exists.  Reconciling first could release that owner
+        # when the closed Issue has no timeline relationship for the PR.
+        with repository_dispatch_authority(repo_name):
+            try:
+                generation_is_current = issue_generation_is_current()
+            except Exception as exc:
+                deferred_result = self._defer_wrapped_reconciliation(repo_name, item_number, candidate.data, exc, result)
+                if deferred_result is not None:
+                    return deferred_result
+                result.error = f"Cannot confirm Issue generation before ownership admission: {exc}"
+                result.refill_retry_required = True
+                return result
+            if not generation_is_current:
+                result.target_outcome = ExplicitTargetOutcome.SKIPPED
+                result.actions = ["Skipped - validated Issue generation changed before ownership admission"]
+                return result
+            if self.is_draining:
+                result.target_outcome = ExplicitTargetOutcome.DEFERRED
+                result.actions = ["Deferred - graceful shutdown began before implementation ownership admission"]
+                return result
+            if explicit_only and candidate.type == "pr":
+                retained = self._get_local_job_store().unsettled_pr_repair(repo_name, item_number)
+                if retained is not None and self._retire_superseded_pending_pr_repair(repo_name, retained, slots):
+                    retained = None
+                if retained is not None:
+                    from .pr_repair_dispatch import LocalPRRepairHandoff, PRRepairResult, RepairDisposition, RepairKind
+
+                    retained_execution = retained.implementation_execution_id
+                    claim = self._get_local_job_store().get_pr_repair_claim(retained.job_id)
+                    execution_restored = False
+                    if claim is not None and retained_execution and retained_execution not in slots.active_execution_ids(owner):
+                        execution_restored = slots.restore_local_pr_repair_execution(retained, owner)
+                    attached = claim is not None and bool(retained_execution) and retained_execution in slots.active_execution_ids(owner)
+                    reason = f"Attached explicit processing to retained local PR repair job {retained.job_id}" if attached else "Cannot attach explicit processing to retained PR repair authority or execution"
+                    _record_pr_stage_result(
+                        item_number,
+                        "pr.repair-delegation",
+                        f"pr#{item_number} local repair admission",
+                        Outcome.DEFERRED,
+                        {
+                            "effect": "local-pr-repair-admission",
+                            "repair_kind": claim.repair_kind if claim is not None else "",
+                            "backend": retained.backend_name,
+                            "admission_status": "retained" if attached else "deferred",
+                            "job_id": retained.job_id if attached else "",
+                            "reason": reason,
+                            "execution_restored": execution_restored,
+                        },
+                    )
+                    if attached:
+                        assert claim is not None
+                        kind = RepairKind.CI_FAILURE if retained.kind is LocalJobKind.PR_CI_FAILURE else RepairKind.MERGE_CONFLICT
+                        attached_handoff = LocalPRRepairHandoff(
+                            retained.job_id,
+                            repo_name,
+                            item_number,
+                            kind,
+                            claim.head_sha,
+                            claim.base_identity,
+                            retained_execution,
+                        )
+                        result.repair_result = PRRepairResult(
+                            RepairDisposition.DEFERRED,
+                            (reason,),
+                            reason,
+                            repository=repo_name,
+                            pr_number=item_number,
+                            input_head=claim.head_sha,
+                            base_ref=claim.base_ref,
+                            local_handoff=attached_handoff,
+                        )
+                    result.actions = [reason]
+                    result.target_outcome = ExplicitTargetOutcome.DEFERRED
+                    result.target_reason = reason
+                    return result
+            execution_id = slots.current_execution_id(owner) if continue_execution else None
+            inherited_execution = execution_id is not None
+            owner_existed_before_admission = owner in slots.active_owners()
+            already_owned = False
+            auto_retry_deferred = False
+            retry_authority = None
+            try:
+                if not inherited_execution:
+                    implementation_key = self._compute_implementation_generation(repo_name, generation_context["snapshot"], generation_context.get("family_set")) if candidate.type == "issue" else None
+                    if manual_retry:
+                        assert implementation_key is not None
+                        assert retry_request_id is not None
+                        admission = IssueRetryAdmissionService(self.issue_stage_routing, slots).admit(
+                            repo_name,
+                            item_number,
+                            implementation_key,
+                            retry_request_id,
+                            IssueRetryOrigin.MANUAL,
+                            github_client=self.github if isinstance(self.github, GitHubClient) else None,
+                            bypass_capacity=explicit_only,
+                        )
+                        if admission.disposition is IssueRetryDisposition.FAILED:
+                            result.error = f"Cannot acquire durable Issue retry authority: {admission.reason}"
+                            return result
+                        execution_id = admission.authority.ownership_reference if admission.disposition is IssueRetryDisposition.OWNED and admission.authority is not None else None
+                        already_owned = False
+                        retry_authority = admission.authority if admission.disposition is IssueRetryDisposition.OWNED else None
+                        auto_retry_deferred = admission.disposition in {IssueRetryDisposition.DEFERRED, IssueRetryDisposition.STALE}
+                        if admission.disposition is IssueRetryDisposition.DEFERRED:
+                            result.actions = [f"Deferred - {admission.reason}"]
+                    else:
+                        retry_authority = None
+                        auto_retry = self._pending_stale_jules_recovery(repo_name, item_number, implementation_key) if candidate.type == "issue" and implementation_key is not None else None
+                        if auto_retry is not None:
+                            assert implementation_key is not None
+                            admission = IssueRetryAdmissionService(self.issue_stage_routing, slots).admit(
+                                repo_name,
+                                item_number,
+                                implementation_key,
+                                auto_retry.request_id,
+                                IssueRetryOrigin.STALE_JULES,
+                                github_client=self.github if isinstance(self.github, GitHubClient) else None,
+                            )
+                            if admission.disposition is IssueRetryDisposition.FAILED:
+                                result.error = f"Cannot acquire durable Issue retry authority: {admission.reason}"
+                                return result
+                            execution_id = admission.authority.ownership_reference if admission.disposition is IssueRetryDisposition.OWNED and admission.authority is not None else None
+                            already_owned = False
+                            retry_authority = admission.authority if admission.disposition is IssueRetryDisposition.OWNED else None
+                            auto_retry_deferred = admission.disposition in {IssueRetryDisposition.DEFERRED, IssueRetryDisposition.STALE}
+                        else:
+                            execution_id, already_owned = self._start_issue_implementation_execution(
+                                repo_name,
+                                slots,
+                                owner,
+                                implementation_key,
+                                implementation_pr=implementation_pr,
+                                bypass_capacity=explicit_only,
+                                bypass_active_execution=explicit_only and force and candidate.type == "pr",
+                                allow_urgent_emergency=urgent_issue,
+                                github_client=self.github if owner.kind == "issue" and isinstance(self.github, GitHubClient) else None,
+                            )
+                if execution_id is None and not already_owned and not explicit_only and not auto_retry_deferred:
+                    slots.reconcile(self.github)
+                    try:
+                        generation_is_current = issue_generation_is_current()
+                    except Exception as exc:
+                        deferred_result = self._defer_wrapped_reconciliation(repo_name, item_number, candidate.data, exc, result)
+                        if deferred_result is not None:
+                            return deferred_result
+                        result.error = f"Cannot confirm Issue generation during capacity reconciliation: {exc}"
+                        result.refill_retry_required = True
+                        return result
+                    if not generation_is_current:
+                        result.target_outcome = ExplicitTargetOutcome.SKIPPED
+                        result.actions = ["Skipped - validated Issue generation changed during capacity reconciliation"]
+                        return result
+                    implementation_key = self._compute_implementation_generation(repo_name, generation_context["snapshot"], generation_context.get("family_set")) if candidate.type == "issue" else None
+                    execution_id, already_owned = self._start_issue_implementation_execution(
+                        repo_name,
+                        slots,
+                        owner,
+                        implementation_key,
+                        implementation_pr=implementation_pr,
+                        allow_urgent_emergency=urgent_issue,
+                        github_client=self.github if owner.kind == "issue" and isinstance(self.github, GitHubClient) else None,
+                    )
+            except ImplementationHierarchyConflict as exc:
+                result.target_outcome = ExplicitTargetOutcome.DEFERRED
+                result.actions = [f"Deferred - direct parent/child implementation conflict ({exc})"]
+                return result
+            except ImplementationHierarchyUnavailable as exc:
+                result.error = f"Cannot establish authoritative hierarchy for implementation admission: {exc}"
+                result.refill_retry_required = True
+                return result
+            except ImplementationSlotUnavailable as exc:
+                # A missing/malformed/inconsistent generation binding (or any
+                # other unreadable durable ownership evidence) must fail
+                # closed for this owner only (REQ-008 of #2061); letting this
+                # propagate would abort every other candidate in the same
+                # batch (e.g. the capacity-refill loop), not just this one.
+                result.error = f"Cannot safely establish implementation ownership evidence for {owner.key}: {exc}"
+                result.refill_retry_required = True
+                return result
+        if already_owned:
+            result.target_outcome = ExplicitTargetOutcome.SKIPPED
+            assert implementation_key is not None
+            try:
+                skip_diagnostic = explain_already_owned(
+                    self._get_local_job_store(),
+                    repo_name,
+                    item_number,
+                    implementation_key,
+                    slots.current_execution_id(owner) or "",
+                )
+                explanation = skip_diagnostic.message
+            except Exception:
+                logger.opt(exception=True).debug("Duplicate-start diagnostic failed for issue#{}; preserving refusal", item_number)
+                prefix, retry_guidance = duplicate_suppression_guidance(repo_name, item_number)
+                explanation = f"{prefix} Supplementary outcome evidence is unavailable. {retry_guidance}"
+            result.actions = [explanation]
+            _record_issue_stage_result(
+                item_number,
+                "issue.implementation-duplicate-suppression",
+                f"issue#{item_number} duplicate automatic-start suppression",
+                Outcome.SKIPPED,
+                {"generation": implementation_key, "explanation": explanation},
+            )
+            return result
+        if execution_id is None:
+            reason = "active execution already exists" if slots.active_execution_ids(owner) else "logical implementation limit is occupied"
+            if candidate.type == "pr":
+                result.outcome = PRProcessingOutcome.DEFERRED
+                _record_pr_stage_result(item_number, "pr.implementation-admission", f"pr#{item_number} implementation admission", Outcome.DEFERRED, {"owner": owner.key, "reason": reason})
+            result.target_outcome = ExplicitTargetOutcome.DEFERRED
+            if not result.actions:
+                result.actions = [f"Deferred - {reason} ({owner.key})"]
+            result.capacity_deferred = not bool(slots.active_execution_ids(owner))
+            return result
+
+        if candidate.type == "pr":
+            _record_pr_stage_result(item_number, "pr.implementation-admission", f"pr#{item_number} implementation admission", Outcome.COMPLETED, {"owner": owner.key, "reused_owner": owner_existed_before_admission})
+
+        if candidate.type == "issue" and not inherited_execution:
+            if not slots.record_validation_identity(owner, expected_identity.key):
+                slots.finish_execution(owner, execution_id)
+                result.error = "Could not bind implementation ownership to validated Issue generation"
+                return result
+
+        try:
+            # Issue force changes scheduling eligibility, not generation-level
+            # serialization. PR forced recovery retains its separate execution.
+            if explicit_only and force and candidate.type == "pr":
+                if advance_issue_attempt:
+                    result = self._process_single_candidate_reserved(
+                        repo_name,
+                        candidate,
+                        config,
+                        jules_mode,
+                        force_adversarial_validation=True,
+                        advance_issue_attempt=True,
+                    )
+                else:
+                    result = self._process_single_candidate_reserved(repo_name, candidate, config, jules_mode, force_adversarial_validation=True)
+            else:
+                with slots.serialize(owner):
+                    if retry_authority is not None:
+                        _record_issue_stage_result(
+                            item_number,
+                            "issue.manual-retry",
+                            f"issue#{item_number} manual retry authorized",
+                            Outcome.COMPLETED,
+                            {
+                                "reason": "explicit --only --force --retry" if manual_retry else "automatic stale-Jules recovery",
+                                "owner": owner.key,
+                                "request_id": retry_authority.request_id,
+                                "attempt_id": retry_authority.attempt_id,
+                                "generation": retry_authority.generation,
+                                "phase": "owned",
+                            },
+                        )
+                        result = self._process_single_candidate_reserved(
+                            repo_name,
+                            candidate,
+                            config,
+                            jules_mode,
+                            manual_retry=True,
+                            retry_authority=retry_authority,
+                            **({"explicit_only": True} if explicit_only and candidate.type == "issue" else {}),
+                        )
+                        result.actions.insert(
+                            0,
+                            f"Retry accepted for issue #{item_number}: request={retry_authority.request_id} attempt={retry_authority.attempt_id} phase=owned",
+                        )
+                    elif advance_issue_attempt:
+                        if explicit_only and candidate.type == "issue":
+                            result = self._process_single_candidate_reserved(repo_name, candidate, config, jules_mode, advance_issue_attempt=True, explicit_only=True)
+                        else:
+                            result = self._process_single_candidate_reserved(repo_name, candidate, config, jules_mode, advance_issue_attempt=True)
+                    else:
+                        if explicit_only and candidate.type == "issue":
+                            result = self._process_single_candidate_reserved(repo_name, candidate, config, jules_mode, explicit_only=True)
+                        else:
+                            result = self._process_single_candidate_reserved(repo_name, candidate, config, jules_mode)
+        finally:
+            from .issue_dispatch import DispatchOutcome
+
+            local_job_owns_execution = candidate.type == "issue" and result.dispatch_result is not None and result.dispatch_result.outcome is DispatchOutcome.LOCAL_ACCEPTED
+            if candidate.type == "pr" and not inherited_execution:
+                try:
+                    retained = self._get_local_job_store().pr_repair_for_execution(repo_name, item_number, execution_id)
+                except RuntimeError as exc:
+                    retained = None
+                    local_job_owns_execution = True
+                    result.target_outcome = ExplicitTargetOutcome.DEFERRED
+                    result.error = f"Cannot confirm local PR repair ownership transfer: {exc}"
+                if retained is not None:
+                    handoff = result.repair_result.local_handoff if result.repair_result is not None else None
+                    if handoff is not None and (handoff.job_id != retained.job_id or handoff.implementation_execution_id != execution_id):
+                        result.error = "Durable local PR repair handoff identity does not match its retained execution"
+                    local_job_owns_execution = True
+            if not inherited_execution and not local_job_owns_execution:
+                slots.finish_execution(owner, execution_id)
+                if result.cloud_submission_not_started is True:
+                    if candidate.type == "issue" and implementation_key is not None:
+                        self.issue_stage_routing.record_implementation_not_started(repo_name, item_number, implementation_key, result.error or "all dispatch candidates confirmed not started")
+                        _record_issue_stage_result(item_number, "issue.implementation-not-started", f"issue#{item_number} preparation retry", Outcome.DEFERRED, {"generation": implementation_key, "reason": result.error, "provider_started": False})
+                    from .cloud_manager import CloudManager
+                    from .cloud_run import CloudRunRepository
+
+                    released = False
+                    # Quota filtering can reject dispatch before the provider
+                    # reads its journal. Preserve even unmirrored remote work.
+                    with slots.serialize(owner):
+                        try:
+                            runs = CloudRunRepository(repo_name).list_for_issue(owner.number)
+                            binding = CloudManager(repo_name).read_bindings_strict().get(str(owner.number))
+                            if not runs and binding is None:
+                                released = slots.release_unbound_idle_owner(owner)
+                        except Exception as exc:
+                            logger.warning(f"Retaining {owner.key} after rejected Cloud submission: cannot confirm absent provider ownership: {exc}")
+                    _record_issue_stage_result(owner.number, "issue.cloud-submission-slot-release", f"issue#{owner.number} Cloud submission slot cleanup", Outcome.COMPLETED if released else Outcome.DEFERRED, {"slot_released": released, "reason": "Cloud submission did not start"})
+                if not owner_existed_before_admission and result.actions == ["Skipped - another instance started processing (@auto-coder label added)"]:
+                    slots.release_unbound_idle_owner(owner)
+                slots.reconcile(self.github)
+        return result
+
+    def _process_single_candidate_reserved(
+        self,
+        repo_name: str,
+        candidate: Candidate,
+        config: AutomationConfig,
+        jules_mode: bool = False,
+        force_adversarial_validation: bool = False,
+        advance_issue_attempt: bool = False,
+        manual_retry: bool = False,
+        retry_authority: Optional[ImplementationRetryRequest] = None,
+        explicit_only: bool = False,
+    ) -> CandidateProcessingResult:
+        """Process a candidate after its durable owner slot is reserved."""
+        result = CandidateProcessingResult(
+            type=candidate.type,
+            number=candidate.data.get("number"),
+            title=candidate.data.get("title"),
+            success=False,
+            actions=[],
+            error=None,
+        )
+
+        if self.is_draining:
+            result.target_outcome = ExplicitTargetOutcome.DEFERRED
+            result.actions = ["Deferred - graceful shutdown began before reserved dispatch"]
+            return result
+        if manual_retry and retry_authority is None:
+            result.target_outcome = ExplicitTargetOutcome.DEFERRED
+            result.error = "Explicit retry dispatch requires durable owned retry authority"
+            result.actions = ["Deferred - explicit retry dispatch authority is unavailable"]
+            return result
+
+        try:
+            # Get item number and type
+            item_number = candidate.data.get("number")
+            item_type = candidate.type
+
+            # Ensure item_number is not None
+            if item_number is None:
+                raise ValueError(f"Item number is missing for {item_type} #{candidate.data.get('number', 'N/A')}")
+
+            implementation_slots = self._get_implementation_slots(repo_name)
+            previous_binding = None
+            if manual_retry and item_type == "issue":
+                from .cloud_manager import CloudManager
+
+                previous_binding = CloudManager(repo_name).read_bindings_strict().get(str(item_number))
+
+            if item_type == "pr":
+                from .pr_processor import _reject_unsafe_codex_cloud_pr
+
+                unsafe_branch_result = _reject_unsafe_codex_cloud_pr(self.github, repo_name, candidate.data, config)
+                if unsafe_branch_result.closed:
+                    result.actions = list(unsafe_branch_result.actions)
+                    result.success = True
+                    result.target_outcome = ExplicitTargetOutcome.SUCCESS
+                    return result
+                if unsafe_branch_result.metadata_error:
+                    result.actions = list(unsafe_branch_result.actions)
+                    result.error = unsafe_branch_result.metadata_error
+                    return result
+                candidate.data = unsafe_branch_result.authoritative_pr_data or candidate.data
+
+            # Check author allowlists before any processing or API actions
+            if item_type == "pr" and not self._is_pr_author_allowed(candidate.data):
+                logger.info(f"Skipping PR #{item_number} - author not in PR allowlist")
+                result.target_outcome = ExplicitTargetOutcome.SKIPPED
+                result.target_reason = "PR author is not in the allowlist"
+                return result
+            elif item_type == "issue" and not self._is_issue_author_allowed(candidate.data):
+                logger.info(f"Skipping Issue #{item_number} - author not in Issue allowlist")
+                result.target_outcome = ExplicitTargetOutcome.SKIPPED
+                result.target_reason = "Issue author is not in the allowlist"
+                return result
+
+            # Candidate data is not an authority for GitHub's item type. The
+            # Issues API represents pull requests as issue-like objects, and
+            # candidates can also arrive from retries, explicit target_type
+            # arguments, or other internal enqueue paths. Gate at the common
+            # Issue dispatch boundary, before labels, attempts, branches,
+            # CloudRuns, or task-start comments are ever created.
+            if item_type == "issue":
+                authoritative_type = self._get_authoritative_item_type(repo_name, item_number)
+                if authoritative_type != "issue":
+                    raise ValueError(f"Refusing Issue dispatch for {repo_name}#{item_number}: GitHub identifies the target as {authoritative_type}")
+                if advance_issue_attempt:
+                    from .attempt_manager import increment_attempt
+
+                    increment_attempt(repo_name, item_number)
+
+            # Close empty PRs or stale Jules PRs before the label gate below.
+            if item_type == "pr":
+                from .pr_processor import _close_empty_pr, _close_stale_jules_pr
+
+                empty_pr_result = _close_empty_pr(self.github, repo_name, candidate.data, config)
+                if empty_pr_result.closed:
+                    for action in empty_pr_result.actions:
+                        logger.info(f"PR #{item_number}: {action}")
+                    result.actions = list(empty_pr_result.actions)
+                    # Start the new attempt on the unlocked issue(s) right away
+                    for issue_number in empty_pr_result.issue_numbers:
+                        result.actions.extend(self._process_unlocked_issue(repo_name, issue_number, config, jules_mode))
+                    result.success = True
+                    result.target_outcome = ExplicitTargetOutcome.SUCCESS
+                    return result
+
+                stale_jules_result = _close_stale_jules_pr(self.github, repo_name, candidate.data, config)
+                if stale_jules_result.closed:
+                    for action in stale_jules_result.actions:
+                        logger.info(f"PR #{item_number}: {action}")
+                    result.actions = list(stale_jules_result.actions)
+                    # Start the new attempt on the unlocked issue(s) right away
+                    for issue_number in stale_jules_result.issue_numbers:
+                        result.actions.extend(self._process_unlocked_issue(repo_name, issue_number, config, jules_mode))
+                    result.success = True
+                    result.target_outcome = ExplicitTargetOutcome.SUCCESS
+                    return result
+
+            # Use LabelManager context manager to handle @auto-coder label automatically
+            with LabelManager(
+                self.github,
+                repo_name,
+                item_number,
+                item_type=item_type,
+                config=config,
+                # A replacement attempt continues the Issue's existing logical
+                # ownership. Its retained @auto-coder label belongs to this
+                # lifecycle, not another worker, so it must not reject the handoff.
+                known_labels=candidate.data.get("labels") if candidate.data else None,
+            ) as should_process:
+                if not should_process:
+                    get_trace_logger().log("Skip", f"Skipping {item_type} #{item_number} - already processing", item_type=item_type, item_number=item_number, details={"reason": "label_exists"})
+                    result.target_outcome = ExplicitTargetOutcome.SKIPPED
+                    result.actions = ["Skipped - another instance started processing (@auto-coder label added)"]
+                    return result
+
+                if item_type == "issue":
+                    # Check if issue has difficult label
+                    is_difficult = False
+                    if candidate.data:
+                        raw_labels = candidate.data.get("labels", [])
+                        for label in raw_labels:
+                            lname = label.get("name", "") if isinstance(label, dict) else str(label)
+                            if lname.strip().lower() == "difficult":
+                                is_difficult = True
+                                break
+
+                    if is_difficult:
+                        # For difficult issues, bypass Jules and delegate to backend_with_high_score_cloud directly
+                        logger.info(f"Issue #{item_number} has 'difficult' label. Delegating to backend_with_high_score_cloud.")
+                        get_trace_logger().log("Dispatch", f"Dispatching issue #{item_number} to High Score Cloud Backend (difficult label)", item_type="issue", item_number=item_number, details={"mode": "high_score_cloud"})
+                        _record_issue_stage_result(item_number, "issue.dispatch-route", f"issue#{item_number} dispatch route", Outcome.COMPLETED, {"route": "high-score-cloud"})
+                        from .issue_processor import _process_issue_high_score_cloud
+
+                        result.actions = _process_issue_high_score_cloud(
+                            repo_name,
+                            candidate.data,
+                            config,
+                            self.github,
+                            label_context=should_process,
+                            implementation_slots=implementation_slots,
+                            **({"manual_retry": True} if manual_retry else {}),  # type: ignore[arg-type]
+                            **({"retry_authority": retry_authority} if retry_authority is not None else {}),  # type: ignore[arg-type]
+                        )
+                    else:
+                        get_trace_logger().log("Dispatch", f"Dispatching issue #{item_number} through the ordinary backend pool", item_type="issue", item_number=item_number, details={"mode": "ordinary"})
+                        _record_issue_stage_result(item_number, "issue.dispatch-route", f"issue#{item_number} dispatch route", Outcome.COMPLETED, {"route": "ordinary"})
+                        from .issue_processor import _dispatch_issue_candidates, _ordinary_issue_candidates
+
+                        dispatch = _dispatch_issue_candidates(
+                            repo_name,
+                            candidate.data,
+                            config,
+                            self.github,
+                            _ordinary_issue_candidates(repo_name),
+                            label_context=should_process,
+                            implementation_slots=implementation_slots,
+                            retry_authority=retry_authority,
+                            local_job_store=(self._get_local_job_store() if explicit_only or self.local_job_store is not None else None),
+                            implementation_execution_id=implementation_slots.current_execution_id(ImplementationOwner("issue", item_number)) or "",
+                        )
+                        result.actions = dispatch.actions
+                        result.dispatch_result = dispatch.result
+
+                    # Cloud launchers persist the authoritative provider task in
+                    # CloudManager. Mirror that production output into logical
+                    # slot membership before the local launch execution returns,
+                    # so later generations cannot validate around remote work.
+                    from .cloud_manager import CloudManager
+                    from .issue_dispatch import DispatchOutcome
+
+                    if result.dispatch_result is not None and result.dispatch_result.outcome not in {
+                        DispatchOutcome.LOCAL_COMPLETED,
+                        DispatchOutcome.LOCAL_ACCEPTED,
+                        DispatchOutcome.REMOTE_ACCEPTED,
+                    }:
+                        result.success = False
+                        result.outcome = PRProcessingOutcome.DEFERRED
+                        result.target_outcome = ExplicitTargetOutcome.DEFERRED
+                        result.target_reason = result.dispatch_result.diagnostic
+                        result.error = result.dispatch_result.diagnostic
+                        result.cloud_submission_not_started = result.dispatch_result.outcome is DispatchOutcome.DEFERRED and result.dispatch_result.tracking_complete and not result.dispatch_result.claim_incarnation
+                        if not result.actions and result.dispatch_result.diagnostic:
+                            result.actions = [result.dispatch_result.diagnostic]
+                        return result
+
+                    binding = CloudManager(repo_name).get_binding(item_number)
+                    if manual_retry and (is_difficult or (result.dispatch_result is not None and result.dispatch_result.outcome is DispatchOutcome.REMOTE_ACCEPTED)):
+                        # Codex retries are classified from their exact durable
+                        # receipt, never from action wording or whether an
+                        # arbitrary CSV pointer happened to change.
+                        assert retry_authority is not None
+                        from .retry_dispatch import RetryDispatchRepository
+
+                        retry_handoff = RetryDispatchRepository(repo_name).get(retry_authority.request_id)
+                        if retry_handoff is not None and retry_handoff.route == "codex-cloud":
+                            outcome, reason = self._codex_retry_reconciler(repo_name).reconcile(retry_authority.request_id)
+                            result.target_outcome = outcome
+                            result.target_reason = reason
+                            result.actions.append(reason)
+                            result.success = outcome in {ExplicitTargetOutcome.SUCCESS, ExplicitTargetOutcome.SKIPPED}
+                            if outcome is ExplicitTargetOutcome.DEFERRED:
+                                result.error = reason
+                            return result
+                        if binding is None or binding == previous_binding:
+                            raise RuntimeError("Manual retry did not establish a new provider tracking target")
+                    if binding is not None:
+                        owner = ImplementationOwner("issue", item_number)
+                        if not self._get_implementation_slots(repo_name).record_provider_session(owner, binding.task_id):
+                            raise RuntimeError(f"Could not retain asynchronous implementation ownership for issue #{item_number}")
+                    result.success = True
+                    result.target_outcome = ExplicitTargetOutcome.SUCCESS
+                elif item_type == "pr":
+                    # PR processing
+                    pr_result = process_pull_request(
+                        self.github,
+                        config,
+                        repo_name,
+                        candidate.data,
+                        force_adversarial_validation=force_adversarial_validation,
+                        adversarial_validation_scheduler=self.adversarial_validation_scheduler,
+                        stage_routing=self.issue_stage_routing,
+                        implementation_slots=self._get_implementation_slots(repo_name),
+                        local_repair_context=LocalPRRepairContext(
+                            self._get_local_job_store(),
+                            implementation_slots.current_execution_id(implementation_slots.resolve_owner("pr", candidate.data, self.github)) or "",
+                            forced_retry=force_adversarial_validation,
+                        ),
+                    )
+                    result.actions = pr_result.actions_taken
+                    # Check if there was an error during processing
+                    if pr_result.error:
+                        result.error = pr_result.error
+                    result.outcome = pr_result.outcome
+                    result.retry_not_before = pr_result.retry_not_before
+                    result.target_reason = pr_result.target_reason
+                    result.repair_result = pr_result.repair_result
+                    result.final_gate = pr_result.final_gate
+                    result.success = pr_result.outcome != PRProcessingOutcome.FAILED
+                    result.target_outcome = {
+                        PRProcessingOutcome.SUCCESS: ExplicitTargetOutcome.SUCCESS,
+                        PRProcessingOutcome.DEFERRED: ExplicitTargetOutcome.DEFERRED,
+                        PRProcessingOutcome.FAILED: ExplicitTargetOutcome.FAILED,
+                    }[pr_result.outcome]
+
+        except CloudSubmissionNotStartedError as e:
+            result.cloud_submission_not_started = True
+            result.error = str(e)
+            result.actions = [f"Deferred: {e}"]
+            result.target_outcome = ExplicitTargetOutcome.DEFERRED
+            result.outcome = PRProcessingOutcome.DEFERRED
+        except AutoCoderRetryableBackendError as e:
+            diagnostic = str(e)
+            result.actions.append(f"Deferred: {diagnostic}")
+            result.error = diagnostic
+            result.outcome = PRProcessingOutcome.DEFERRED
+            result.success = True
+            result.target_outcome = ExplicitTargetOutcome.DEFERRED
+            logger.warning(f"Deferred {candidate.type} #{candidate.data.get('number', 'N/A')} after retryable backend failure: {diagnostic}")
+        except Exception as e:
+            result.error = str(e)
+            result.target_outcome = ExplicitTargetOutcome.FAILED
+            result.target_reason = str(e)
+            logger.error(f"Error processing {candidate.type} #{candidate.data.get('number', 'N/A')}: {e}")
+
+        return result
+
+    def _defer_issue_evaluation(
+        self,
+        repo_name: str,
+        item_number: int,
+        issue_data: Dict[str, Any],
+        error: GitHubRequestError,
+        result: CandidateProcessingResult,
+        *,
+        revision_known: bool = True,
+    ) -> CandidateProcessingResult:
+        """Retain an Issue hierarchy/readiness evaluation interrupted by GitHub.
+
+        Mirrors ``process_pull_request``'s ``GitHubRequestError`` handling for
+        PRs (see ``pr_processor.py``): the obligation is durably registered
+        with the pending-work scheduler (``ISSUE_PROCESSING_STAGE``) instead of
+        being reported as an ordinary error, so a registered stage handler
+        resumes it through current authoritative state (REQ-001, REQ-002).
+        """
+        # Initial refill enumeration can be refused before a snapshot exists.
+        # Its empty revision requires a fresh strict read when due rather than
+        # pretending the number-only placeholder was authoritative content.
+        revision = _issue_content_revision(issue_data) if revision_known else ""
+        identity = WorkIdentity(repo_name, f"issue:{item_number}", ISSUE_PROCESSING_STAGE, revision)
+        obligation = get_pending_work_store(repo_name).defer(
+            identity,
+            error,
+            (ISSUE_PROCESSING_REFRESH_EFFECT, ISSUE_PROCESSING_STAGE),
+        )
+        logger.warning(
+            "Deferred GitHub reconciliation repository={} issue={} stage={} reason={} api_origin={} retry_at={} delivery={}",
+            repo_name,
+            item_number,
+            ISSUE_PROCESSING_STAGE,
+            getattr(error, "reason", obligation.reason.value),
+            error.outcome.context.api_origin,
+            obligation.not_before,
+            error.outcome.delivery.value,
+        )
+        self._wake_pending_work()
+        result.error = str(error)
+        result.target_outcome = ExplicitTargetOutcome.DEFERRED
+        result.target_reason = (
+            f"Deferred reconciliation for {repo_name} issue #{item_number}: "
+            f"stage={ISSUE_PROCESSING_STAGE}; "
+            f"reason={getattr(error, 'reason', obligation.reason.value)}; "
+            f"api_origin={error.outcome.context.api_origin}; "
+            f"retry_at={obligation.not_before}; "
+            f"delivery={error.outcome.delivery.value}"
+        )
+        result.actions = [result.target_reason]
+        result.refill_retry_required = True
+        return result
+
+    def _defer_wrapped_reconciliation(
+        self,
+        repo_name: str,
+        item_number: int,
+        issue_data: Dict[str, Any],
+        error: BaseException,
+        result: CandidateProcessingResult,
+    ) -> CandidateProcessingResult | None:
+        """Retain typed admission or transport failures without losing certainty."""
+        deferred = _reconciliation_request_error(error)
+        if deferred is None:
+            return None
+        result = self._defer_issue_evaluation(repo_name, item_number, issue_data, deferred, result)
+        if deferred.outcome.classification is GitHubApiOutcome.TRANSPORT_FAILURE:
+            _record_issue_stage_result(item_number, "issue.parent-reconciliation", f"issue#{item_number} parent reconciliation", Outcome.DEFERRED, {"reason": str(deferred), "delivery": deferred.outcome.delivery.value})
+        return result
+
+    def _defer_validation_publication(
+        self,
+        repo_name: str,
+        item_number: int,
+        decision: ValidationDecision,
+        error: GitHubRequestError,
+        result: CandidateProcessingResult,
+    ) -> CandidateProcessingResult:
+        """Retain a BLOCKED publication (diagnostic/readiness-withdrawal) interrupted by GitHub.
+
+        Unlike ``_defer_issue_evaluation`` this never reports the durable
+        ``BLOCKED`` terminal outcome on an operational failure (REQ-006): a
+        publication interruption stays a DEFERRED, automatically-resumable
+        obligation on ``VALIDATION_PUBLICATION_STAGE``, and only the effects
+        this specific decision has not yet durably completed (per the
+        ``SpecificationValidationStore`` flags) are retained (REQ-001, REQ-002).
+        """
+        identity = validation_publication_identity(repo_name, item_number, decision.identity.key)
+        validator = self._get_specification_validator(repo_name)
+        current = validator.store.get(decision.identity)
+        unfinished: tuple[str, ...] = ()
+        if current is None or not current.findings_published:
+            unfinished += (DIAGNOSTIC_EFFECT,)
+        if current is None or not current.readiness_removed:
+            unfinished += (READINESS_WITHDRAWAL_EFFECT,)
+        obligation = get_pending_work_store(repo_name).defer(identity, error, unfinished)
+        logger.warning(
+            "Deferred BLOCKED publication for Issue #{} after GitHub operational failure {}; next eligible at {}",
+            item_number,
+            obligation.reason.value,
+            obligation.not_before,
+        )
+        self._wake_pending_work()
+        result.error = str(error)
+        result.target_outcome = ExplicitTargetOutcome.DEFERRED
+        result.actions = [f"Deferred BLOCKED publication: {obligation.reason.value}"]
+        return result
+
+    def _reconcile_terminal_pr_resumption(self, repo_name: str, pr_data: dict[str, object]) -> None:
+        """End stale resumption work without admitting another implementation.
+
+        The caller has freshly observed terminal PR metadata. Ordinary slot
+        reconciliation still checks execution liveness and complete ownership;
+        Issue-owned work uses the existing retirement obligation as well.
+        """
+        pr_number = pr_data["number"]
+        if isinstance(pr_number, bool) or not isinstance(pr_number, int) or pr_number <= 0:
+            raise ValueError("Terminal PR resumption requires a positive PR number")
+        self.invalidations.retire_ci_watches(repo_name, pr_number)
+        self._schedule_pr_owner_reclamation(repo_name, pr_data)
+        self._get_implementation_slots(repo_name).reconcile(self.github)
+        self.notify_pr_merged_or_closed()
+
+    def _schedule_pr_owner_reclamation(self, repo_name: str, pr_data: Dict[str, Any], reason: str = "pr-closed") -> None:
+        """Resolve a closed/merged PR's owner and schedule its reclamation check.
+
+        Issue #2148 REQ-001: a terminal PR observation must make the affected
+        ordinary Issue owner eligible for reconciliation without itself
+        starting a new coding execution. Failures here are logged and
+        swallowed -- this is a best-effort scheduling hint, never a blocker
+        for the caller's own (already-authorized) completion.
+        """
+        try:
+            slots = self._get_implementation_slots(repo_name)
+            schedule_reevaluation_for_pr_owner(pr_data, slots, self.github, reason=reason)
+        except Exception as exc:
+            logger.warning(f"Could not schedule reclamation reevaluation for PR reclamation in {repo_name}: {exc}")
+
+    def _get_implementation_slots(self, repo_name: str) -> ImplementationSlotRepository:
+        with self._implementation_slots_lock:
+            if self.implementation_slots is None or self.implementation_slots.repo_name != repo_name:
+                self.implementation_slots = ImplementationSlotRepository(repo_name, self.config.MAX_CONCURRENT_IMPLEMENTATIONS)
+            return self.implementation_slots
+
+    def _schedule_codex_retry_handoff(self, repo_name: str, request_id: str, issue_number: int) -> None:
+        identity = WorkIdentity(repo_name, f"issue:{issue_number}:retry:{request_id}", CODEX_RETRY_HANDOFF_STAGE, request_id)
+        get_pending_work_store(repo_name).schedule_reevaluation(identity, (CODEX_RETRY_HANDOFF_EFFECT,))
+        self._wake_pending_work()
+
+    def _rediscover_codex_retry_handoff(self, repo_name: str, request_id: str, issue_number: int) -> None:
+        """Create missing startup work without rearming retained retry state."""
+        identity = WorkIdentity(repo_name, f"issue:{issue_number}:retry:{request_id}", CODEX_RETRY_HANDOFF_STAGE, request_id)
+        pending_store = get_pending_work_store(repo_name)
+        if pending_store.get(identity) is None:
+            pending_store.schedule_reevaluation(identity, (CODEX_RETRY_HANDOFF_EFFECT,))
+        self._wake_pending_work()
+
+    def _codex_retry_reconciler(self, repo_name: str) -> CodexRetryReconciler:
+        """Wire accepted-retry reconciliation to this controller's stores."""
+        return CodexRetryReconciler(
+            repo_name,
+            self._get_implementation_slots(repo_name),
+            lambda request_id, issue_number: self._schedule_codex_retry_handoff(repo_name, request_id, issue_number),
+        )
+
+    def get_implementation_slot_snapshot(self, repo_name: str) -> ImplementationSlotObservation:
+        """Public read-only occupancy observation for `repo_name`'s slot store.
+
+        When this controller is not yet bound to any repository (before any
+        worker/admission call has run), or is already bound to exactly
+        `repo_name`, this reuses (and, only in the unbound case, lazily
+        establishes) the same instance admission/lifecycle operations use,
+        so the dashboard observes this controller's actual effective store
+        and normal limit rather than a default substitute.
+
+        Deliberately never lets this read *replace* an existing binding to
+        a *different* repository: that would rebind live controller state
+        as a side effect of a read-only diagnostic call (REQ-006).
+        Establishing the *first* binding from an unbound (`None`)
+        controller is not a rebind, so this diagnostic read can still be
+        what lazily establishes the binding admission/lifecycle operations
+        reuse afterward -- but that check-then-establish step shares
+        `_implementation_slots_lock` with `_get_implementation_slots`, so a
+        concurrent lifecycle call that wins the race to establish a
+        *different* repository's binding is never subsequently overwritten
+        by this observation once it resumes: this method re-reads the
+        binding under the same lock immediately before acting, rather than
+        trusting an earlier, possibly now-stale read. Only a genuine
+        mismatch (whether observed on the first read or discovered after
+        losing the race) constructs a standalone, uncached repository
+        object scoped to `repo_name` -- observing that repository's own
+        correctly-selected store without ever touching or replacing the
+        controller's actual binding. This is a non-blocking diagnostic
+        read only; it never creates, repairs or mutates durable slot state.
+        """
+        with self._implementation_slots_lock:
+            current = self.implementation_slots
+            if current is None:
+                self.implementation_slots = ImplementationSlotRepository(repo_name, self.config.MAX_CONCURRENT_IMPLEMENTATIONS)
+                repository = self.implementation_slots
+            elif current.repo_name == repo_name:
+                repository = current
+            else:
+                repository = ImplementationSlotRepository(repo_name, self.config.MAX_CONCURRENT_IMPLEMENTATIONS)
+        return repository.snapshot()
+
+    def _get_authoritative_item_type(self, repo_name: str, item_number: int) -> str:
+        """Establish an issue-like target's authoritative GitHub type.
+
+        A caller-supplied candidate type is not authoritative: GitHub's Issues
+        API represents pull requests as issue-like objects, and candidates can
+        arrive already misclassified from stale collections, explicit
+        target_type arguments, or other internal enqueue paths. Delegates to
+        the shared implementation (util.gh_cache.resolve_authoritative_item_type)
+        so every Issue dispatch path -- including the direct Jules-fallback
+        resumption path in issue_processor.handle_stale_jules_issue_sessions --
+        uses the same cache-bypassing lookup and the same fail-closed behavior.
+        """
+        return resolve_authoritative_item_type(self.github, repo_name, item_number)
+
+    def _process_unlocked_issue(
+        self,
+        repo_name: str,
+        issue_number: int,
+        config: AutomationConfig,
+        jules_mode: bool,
+        advance_attempt: bool = False,
+    ) -> List[str]:
+        """Process an issue whose Jules attempt was just abandoned.
+
+        Args:
+            repo_name: Repository name
+            issue_number: Issue to start the next attempt on
+            config: AutomationConfig instance
+            jules_mode: Whether to use Jules mode for processing
+
+        Returns:
+            Actions taken while processing the issue
+        """
+        issue_candidate = self._create_candidate_from_single(repo_name, "issue", issue_number)
+        if not issue_candidate:
+            logger.warning(f"Could not build a candidate for issue #{issue_number}, skipping the new attempt")
+            return [f"Failed to start a new attempt for issue #{issue_number}"]
+
+        logger.info(f"Starting a new attempt for issue #{issue_number}")
+        issue_result = self._process_single_candidate_unified(
+            repo_name,
+            issue_candidate,
+            config,
+            jules_mode=jules_mode,
+            continue_execution=True,
+            advance_issue_attempt=advance_attempt,
+            origin="stale-provider-session-reassignment",
+        )
+        actions = [f"Started a new attempt for issue #{issue_number}"] + list(issue_result.actions)
+        if issue_result.error:
+            actions.append(f"Error processing issue #{issue_number}: {issue_result.error}")
+        return actions
+
+    def _process_single_candidate(self, repo_name: str, candidate: Candidate, origin: str = "worker") -> CandidateProcessingResult:
+        """Process a single candidate (issue/PR).
+
+        Args:
+            repo_name: Repository name
+            candidate: Target candidate to process
+            origin: Diagnostic label for what triggered this evaluation
+                (REQ-001); does not affect processing behavior.
+
+        Returns:
+            Processing result
+        """
+        # Daemon intake may run before start_automation has assembled the
+        # repository runner. Establish the same lazy durable authority before
+        # dispatch routing decides between handoff and synchronous execution.
+        if candidate.type == "issue":
+            self._get_local_job_store()
+
+        # Check if Jules mode should be used based on configuration
+        if self.config.jules_mode is not None:
+            jules_mode = self.config.jules_mode
+        else:
+            from .llm_backend_config import is_jules_mode_enabled
+
+            jules_mode = is_jules_mode_enabled(repo_name=repo_name)
+
+        return self._process_single_candidate_unified(
+            repo_name,
+            candidate,
+            self.config,
+            jules_mode=jules_mode,
+            origin=origin,
+        )
+
+    def _future_issue_admission_deferral(self, repo_name: str, issue_number: int) -> PendingObligation | None:
+        """Return the target's retained admission deadline while it is closed."""
+        now = time.time()
+        entity = f"issue:{issue_number}"
+        for obligation in get_pending_work_store(repo_name).all_pending():
+            if obligation.identity.entity == entity and obligation.identity.stage == ISSUE_PROCESSING_STAGE and obligation.reason is PendingReason.ADMISSION_DEFERRED and obligation.not_before > now:
+                return obligation
+        return None
+
+    def _pending_work_refusal(self, repo_name: str) -> Optional[str]:
+        """Return a refusal message unless ``repo_name``'s pending-work storage is READY.
+
+        Establishes READY (including atomic fresh initialization when no
+        legacy work exists) before any repository work that could depend on
+        pending-work retention or resumption.
+        """
+        try:
+            get_pending_work_store(repo_name)
+        except PendingWorkPersistenceError as exc:
+            logger.error("Refusing repository work for {}: {}", repo_name, exc)
+            return str(exc)
+        return None
+
+    def run(self, repo_name: str) -> Dict[str, Any]:
+        """Run the main automation process."""
+        logger.info(f"Starting automation for repository: {repo_name}")
+        refusal = self._pending_work_refusal(repo_name)
+        if refusal is not None:
+            return {
+                "repository": repo_name,
+                "timestamp": datetime.now().isoformat(),
+                "issues_processed": [],
+                "prs_processed": [],
+                "errors": [refusal],
+            }
+
+        # Check if current branch corresponds to a closed PR/Issue
+        if not self._check_and_handle_closed_branch(repo_name):
+            # check_and_handle_closed_state will handle branch switching and exit
+            # This line should not be reached, but just in case
+            return {
+                "repository": repo_name,
+                "timestamp": datetime.now().isoformat(),
+                "issues_processed": [],
+                "prs_processed": [],
+                "errors": ["Exited due to closed item on current branch"],
+            }
+
+        # Get LLM backend information
+        llm_backend_info = self._get_llm_backend_info()
+
+        results: Dict[str, Any] = {
+            "repository": repo_name,
+            "timestamp": datetime.now().isoformat(),
+            "llm_backend": llm_backend_info["backend"],
+            "llm_provider": llm_backend_info["provider"],
+            "llm_model": llm_backend_info["model"],
+            "issues_processed": [],
+            "prs_processed": [],
+            "errors": [],
+        }
+
+        try:
+            # Get initial candidates
+            total_processed = 0
+
+            while True:
+                heartbeat("run:check-updates", repo_name)
+
+                # Check for updates and restart if necessary
+                check_for_updates_and_restart()
+
+                if self._claim_jules_session_list_refresh():
+                    # All list-dependent maintenance shares this cycle's fresh listing.
+                    invalidate_jules_sessions_cache()
+
+                    # Check and resume failed Jules sessions. Passing the real
+                    # ImplementationSlotRepository is required so retired-session
+                    # guards (REQ-009) actually apply in this production maintenance
+                    # loop instead of silently no-opping on the None default.
+                    check_and_resume_or_archive_sessions(
+                        repo_name,
+                        self._get_implementation_slots(repo_name),
+                    )
+
+                    # Take issues away from Jules sessions that timed out without creating a PR
+                    self.handle_stale_jules_issue_sessions(repo_name)
+
+                    # Check and start recurrent Jules tasks
+                    check_and_start_recurrent_jules_tasks(
+                        repo_name,
+                        self._get_implementation_slots(repo_name),
+                    )
+
+                # Pull latest changes for monitored repository
+                try:
+                    logger.info("Pulling latest changes for monitored repository...")
+                    pull_res = git_pull()
+                    if not pull_res.success:
+                        logger.warning(f"Failed to pull latest changes: {pull_res.stderr}")
+                except Exception as e:
+                    logger.warning(f"Failed to pull monitored repository: {e}")
+
+                # Get candidates
+                candidates = self._get_candidates(repo_name)
+
+                if not candidates:
+                    logger.info("No more candidates found, ending automation")
+                    break
+
+                # Process all candidates in this batch
+                batch_processed = 0
+                for candidate in candidates:
+                    try:
+                        logger.info(f"Processing {candidate.type} #{candidate.data.get('number', 'N/A')}")
+                        heartbeat("run:processing", f"{candidate.type} #{candidate.data.get('number', 'N/A')}")
+
+                        # Process the candidate
+                        result = self._process_single_candidate(repo_name, candidate, origin="batch-scan-worker")
+
+                        # Track results
+                        # Convert dataclass to dict for backward compatibility with existing code
+                        result_dict = {
+                            "type": result.type,
+                            "number": result.number,
+                            "title": result.title,
+                            "success": result.success,
+                            "actions": result.actions,
+                            "error": result.error,
+                            "outcome": result.outcome.value,
+                        }
+                        if candidate.type == "issue":
+                            results["issues_processed"].append(result_dict)  # type: ignore
+                        elif candidate.type == "pr":
+                            results["prs_processed"].append(result_dict)  # type: ignore
+
+                        batch_processed += 1
+                        total_processed += 1
+
+                        logger.info(f"Successfully processed {candidate.type} #{candidate.data.get('number', 'N/A')}")
+
+                    except Exception as e:
+                        error_msg = f"Failed to process candidate: {e}"
+                        logger.error(error_msg)
+                        results["errors"].append(error_msg)  # type: ignore
+
+                # If no candidates were processed in this batch, end the loop
+                if batch_processed == 0:
+                    logger.info("No candidates were processed in this batch, ending automation")
+                    break
+
+                # Clear GitHub API cache after each batch
+                get_github_cache().clear()
+                logger.debug("Cleared GitHub API cache")
+            # Save results report
+            self._save_report(results, "automation_report", repo_name)
+
+            logger.info(f"Automation completed for {repo_name}")
+            return results
+
+        except Exception as e:
+            error_msg = f"Automation failed for {repo_name}: {e}"
+            logger.error(error_msg)
+            results["errors"].append(error_msg)  # type: ignore
+            return results
+
+    def process_single(
+        self,
+        repo_name: str,
+        target_type: str,
+        number: int,
+        jules_mode: bool = False,
+        *,
+        explicit_only: bool = False,
+        force: bool = False,
+        retry: bool = False,
+        resume: bool = False,
+    ) -> Dict[str, Any]:
+        """Process a single issue or PR by number.
+
+        Args:
+            repo_name: Repository name
+            target_type: Type of target ('issue' or 'pr')
+            number: Issue or PR number
+            jules_mode: Whether to use Jules mode for processing (default: False)
+
+        Returns:
+            Dictionary with processing results
+        """
+        if retry and not (explicit_only and force):
+            raise ValueError("retry requires explicit_only and force")
+        if resume and (not explicit_only or retry):
+            raise ValueError("resume requires explicit_only and cannot be combined with retry")
+        refusal = self._pending_work_refusal(repo_name)
+        if refusal is not None:
+            refused: Dict[str, Any] = {
+                "repository": repo_name,
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "issues_processed": [],
+                "prs_processed": [],
+                "errors": [refusal],
+            }
+            if explicit_only:
+                refused.update(
+                    target_number=number,
+                    target_type=target_type if target_type in {"issue", "pr"} else None,
+                    target_outcome=ExplicitTargetOutcome.FAILED.value,
+                    target_actions=[],
+                    target_reason=refusal,
+                )
+            return refused
+        with active_repo_context(repo_name):
+            os.environ["REPO_NAME"] = repo_name
+            self.config.repo_name = repo_name
+            # Check if Jules mode should be used based on configuration
+            from .llm_backend_config import is_jules_mode_enabled
+
+            # Both must be true for Jules mode to be enabled
+            # jules_mode parameter is requested state, and is_jules_mode_enabled checks config
+            jules_mode = jules_mode and is_jules_mode_enabled(repo_name=repo_name)
+            from datetime import datetime
+
+            with ProgressStage("Processing single PR/IS"):
+                # Check if current branch corresponds to a closed PR/Issue
+                if not resume and not self._check_and_handle_closed_branch(repo_name):
+                    # check_and_handle_closed_state will handle branch switching and exit
+                    # This line should not be reached, but just in case
+                    closed_result: Dict[str, Any] = {
+                        "repository": repo_name,
+                        "timestamp": datetime.now().isoformat(),
+                        "issues_processed": [],
+                        "prs_processed": [],
+                        "errors": ["Exited due to closed item on current branch"],
+                    }
+                    if explicit_only:
+                        closed_result.update(
+                            target_number=number,
+                            target_type=target_type if target_type in {"issue", "pr"} else None,
+                            target_outcome=ExplicitTargetOutcome.FAILED.value,
+                            target_actions=[],
+                            target_reason="Exited due to closed item on current branch",
+                        )
+                    return closed_result
+
+                logger.info(f"Processing single target: type={target_type}, number={number} for {repo_name}")
+                result = ProcessResult(
+                    repository=repo_name,
+                    timestamp=datetime.now().isoformat(),
+                    target_number=number if explicit_only else None,
+                )
+
+                def explicit_result() -> Dict[str, Any]:
+                    return {
+                        "repository": result.repository,
+                        "timestamp": result.timestamp,
+                        "issues_processed": result.issues_processed,
+                        "prs_processed": result.prs_processed,
+                        "errors": result.errors,
+                        "target_number": result.target_number,
+                        "target_type": result.target_type,
+                        "target_outcome": result.target_outcome,
+                        "target_actions": result.target_actions,
+                        "target_reason": result.target_reason,
+                        "repair_result": result.repair_result,
+                        "final_gate": result.final_gate,
+                    }
+
+                try:
+                    retry_request_id = f"implementation-retry-{uuid.uuid4().hex}" if retry else None
+                    # Create a Candidate from the single item
+                    candidate = self._create_candidate_from_single(repo_name, target_type, number, propagate_errors=True) if explicit_only else self._create_candidate_from_single(repo_name, target_type, number)
+                    if not candidate:
+                        if explicit_only:
+                            result.target_outcome = ExplicitTargetOutcome.FAILED.value
+                            result.target_reason = f"Could not resolve requested target #{number}"
+                            result.errors.append(result.target_reason)
+                        return explicit_result()
+
+                    if retry and candidate.type != "issue":
+                        raise ValueError("--retry supports Issue targets only")
+
+                    if explicit_only:
+                        result.target_type = candidate.type if candidate.type in {"issue", "pr"} else None
+
+                    if resume:
+                        if candidate.type != "issue":
+                            raise ValueError("--resume supports Issue targets only")
+                        resumed = self._resume_explicit_issue(repo_name, number)
+                        result.target_outcome = resumed.target_outcome.value if resumed.target_outcome else ExplicitTargetOutcome.FAILED.value
+                        result.target_reason = resumed.target_reason or resumed.error
+                        result.target_actions = list(resumed.actions)
+                        if resumed.success:
+                            result.issues_processed.append({"issue_data": candidate.data, "actions_taken": resumed.actions})
+                        elif resumed.error:
+                            result.errors.append(resumed.error)
+                        return explicit_result()
+
+                    if explicit_only and candidate.type == "issue":
+                        try:
+                            refreshed_target = self._preflight_explicit_issue_relationships(repo_name, number, refresh_all=True)
+                            candidate.data.update(refreshed_target)
+                        except ParentSpecificationError as exc:
+                            result.target_outcome = ExplicitTargetOutcome.BLOCKED.value
+                            result.target_reason = f"Blocked relationship reconciliation for Issue #{number}: {exc}"
+                            result.target_actions = [result.target_reason]
+                            result.errors.append(result.target_reason)
+                            return explicit_result()
+                        except ParentOperationalError as exc:
+                            deferred = _reconciliation_admission_deferral(exc)
+                            if deferred is not None:
+                                deferred_result = self._defer_issue_evaluation(
+                                    repo_name,
+                                    number,
+                                    candidate.data,
+                                    deferred,
+                                    CandidateProcessingResult(type="issue", number=number, title=str(candidate.data.get("title") or "")),
+                                )
+                                result.target_outcome = ExplicitTargetOutcome.DEFERRED.value
+                                result.target_reason = deferred_result.target_reason
+                                result.target_actions = list(deferred_result.actions)
+                                result.errors.append(deferred_result.error or str(deferred))
+                                return explicit_result()
+                            result.target_outcome = ExplicitTargetOutcome.DEFERRED.value
+                            result.target_reason = f"Retryable relationship reconciliation failure for Issue #{number}: {exc}"
+                            result.target_actions = [result.target_reason]
+                            result.errors.append(result.target_reason)
+                            return explicit_result()
+
+                    # Explicit/single-item processing is another supported
+                    # discovery origin for specification changes.  Resolve and
+                    # validate a submitted parent generation before unified
+                    # processing can reject a closed child or defer an owned
+                    # child.  This mirrors invalidation-worker discovery and
+                    # keeps validation eligibility independent of
+                    # implementation eligibility.
+                    if candidate.type == "issue":
+                        self._validate_submitted_parent_generation_for_child(
+                            repo_name,
+                            number,
+                            candidate.data,
+                            target_only=explicit_only,
+                            relationships_preflight_done=explicit_only,
+                        )
+
+                    # Use unified processing function
+                    processing_args = (repo_name, candidate, self.config, jules_mode)
+                    if explicit_only and retry_request_id is not None:
+                        processing_result = self._process_single_candidate_unified(
+                            *processing_args,
+                            explicit_only=True,
+                            force=force,
+                            origin="explicit-single-target",
+                            retry=retry,
+                            retry_request_id=retry_request_id,
+                        )
+                    elif explicit_only:
+                        processing_result = self._process_single_candidate_unified(
+                            *processing_args,
+                            explicit_only=True,
+                            force=force,
+                            origin="explicit-single-target",
+                            retry=retry,
+                        )
+                    else:
+                        processing_result = self._process_single_candidate_unified(*processing_args, origin="explicit-single-target")
+
+                    from .issue_dispatch import DispatchOutcome
+
+                    if explicit_only and candidate.type == processing_result.type == "issue" and processing_result.number == number and processing_result.dispatch_result is not None and processing_result.dispatch_result.outcome is DispatchOutcome.LOCAL_ACCEPTED:
+                        self._complete_explicit_local_issue(repo_name, processing_result)
+                    if explicit_only and candidate.type == processing_result.type == "pr" and processing_result.number == number and processing_result.repair_result is not None and processing_result.repair_result.local_handoff is not None:
+                        self._complete_explicit_local_pr_repair(repo_name, processing_result)
+
+                    if explicit_only:
+                        result.target_actions = list(processing_result.actions)
+                        result.target_reason = processing_result.target_reason or processing_result.error or (processing_result.actions[0] if processing_result.actions else None)
+                        result.repair_result = processing_result.repair_result
+                        result.final_gate = processing_result.final_gate
+                        identity_matches = processing_result.number == number and processing_result.type == candidate.type
+                        target_outcome = processing_result.target_outcome
+                        if not identity_matches:
+                            diagnostic = f"Explicit target identity mismatch: requested {candidate.type} #{number}, " f"processed {processing_result.type} #{processing_result.number}"
+                            result.errors.append(diagnostic)
+                            result.target_reason = diagnostic
+                            result.target_outcome = ExplicitTargetOutcome.FAILED.value
+                        elif target_outcome is None:
+                            diagnostic = f"Explicit processing returned no authoritative outcome for {candidate.type} #{number}"
+                            result.errors.append(diagnostic)
+                            result.target_reason = diagnostic
+                            result.target_outcome = ExplicitTargetOutcome.FAILED.value
+                        elif target_outcome is ExplicitTargetOutcome.SUCCESS and processing_result.error:
+                            diagnostic = f"Contradictory successful outcome for {candidate.type} #{number}: {processing_result.error}"
+                            result.errors.append(diagnostic)
+                            result.target_reason = diagnostic
+                            result.target_outcome = ExplicitTargetOutcome.FAILED.value
+                        else:
+                            result.target_outcome = target_outcome.value
+
+                    # Only add to processed list if there was no error and processing succeeded
+                    if processing_result.error:
+                        # Add error to errors list instead of processed list
+                        error_msg = f"Error processing {candidate.type} #{candidate.data.get('number', 'N/A')}: {processing_result.error}"
+                        result.errors.append(error_msg)
+                        if candidate.type == "pr":
+                            result.prs_processed.append(
+                                {
+                                    "pr_data": candidate.data,
+                                    "actions_taken": processing_result.actions,
+                                    "outcome": processing_result.outcome.value,
+                                }
+                            )
+                    elif processing_result.success:
+                        # Convert to the format expected by process_single
+                        if candidate.type == "issue":
+                            processed_item = {
+                                "issue_data": candidate.data,
+                                "actions_taken": processing_result.actions,
+                            }
+                            result.issues_processed.append(processed_item)
+                        elif candidate.type == "pr":
+                            processed_item = {
+                                "pr_data": candidate.data,
+                                "actions_taken": processing_result.actions,
+                                "outcome": processing_result.outcome.value,
+                            }
+                            result.prs_processed.append(processed_item)
+
+                    # After processing, check if the single PR/issue is now closed
+                    try:
+                        if result.issues_processed or result.prs_processed:
+                            # Get the processed item
+                            first_processed_item: Dict[str, Any]
+                            item_number = None
+                            item_type = None
+
+                            if result.issues_processed:
+                                first_processed_item = result.issues_processed[0]
+                                issue_data: Dict[str, Any] = first_processed_item.get("issue_data", {})
+                                item_number = issue_data.get("number")
+                                item_type = "issue"
+                            elif result.prs_processed:
+                                first_processed_item = result.prs_processed[0]
+                                pr_data: Dict[str, Any] = first_processed_item.get("pr_data", {})
+                                item_number = pr_data.get("number")
+                                item_type = "pr"
+
+                            if item_number and item_type:
+                                # Check the current state of the item
+                                from .util.github_action import check_and_handle_closed_state
+
+                                check_and_handle_closed_state(
+                                    repo_name,
+                                    item_type,
+                                    item_number,
+                                    self.config,
+                                    self.github,
+                                )
+                    except Exception as e:
+                        logger.warning(f"Failed to check/handle closed item state: {e}")
+
+                except GitHubRequestDeferred as deferred:
+                    result.target_outcome = ExplicitTargetOutcome.DEFERRED.value if explicit_only else None
+                    result.target_reason = str(deferred)
+                    result.errors.append(str(deferred))
+                    logger.warning("Single target #{} deferred: {}", number, deferred)
+
+                except Exception as e:
+                    msg = f"Error in process_single: {e}"
+                    logger.error(msg)
+                    result.errors.append(msg)
+                    if explicit_only:
+                        result.target_outcome = ExplicitTargetOutcome.FAILED.value
+                        result.target_reason = msg
+
+            # Convert dataclass to dict for backward compatibility with existing code
+            output: Dict[str, Any] = {
+                "repository": result.repository,
+                "timestamp": result.timestamp,
+                "issues_processed": result.issues_processed,
+                "prs_processed": result.prs_processed,
+                "errors": result.errors,
+            }
+            if explicit_only:
+                output.update(
+                    target_number=result.target_number,
+                    target_type=result.target_type,
+                    target_outcome=result.target_outcome or ExplicitTargetOutcome.FAILED.value,
+                    target_actions=result.target_actions,
+                    target_reason=result.target_reason,
+                    repair_result=result.repair_result,
+                    final_gate=result.final_gate,
+                )
+                if result.target_outcome is None:
+                    diagnostic = f"Explicit processing produced no outcome for target #{number}"
+                    output["errors"].append(diagnostic)
+                    output["target_reason"] = diagnostic
+            return output
+
+    def create_feature_issues(self, repo_name: str) -> List[Dict[str, Any]]:
+        """Analyze repository and create feature enhancement issues."""
+        with active_repo_context(repo_name):
+            os.environ["REPO_NAME"] = repo_name
+            self.config.repo_name = repo_name
+            return create_feature_issues(
+                self.github,
+                self.config,
+                repo_name,
+            )
+
+    def fix_to_pass_tests(
+        self,
+        llm_backend_manager: Any,
+        max_attempts: Optional[int] = None,
+        message_backend_manager: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Run tests and, if failing, repeatedly request LLM fixes until tests pass."""
+        if self.config.repo_name:
+            os.environ["REPO_NAME"] = self.config.repo_name
+        run_override = getattr(self, "_run_local_tests", None)
+        apply_override = getattr(self, "_apply_workspace_test_fix", None)
+
+        if callable(run_override) or callable(apply_override):
+            original_run = fix_to_pass_tests_runner_module.run_local_tests
+            original_apply = fix_to_pass_tests_runner_module.apply_workspace_test_fix
+            try:
+                if callable(run_override):
+                    fix_to_pass_tests_runner_module.run_local_tests = run_override
+                if callable(apply_override):
+                    fix_to_pass_tests_runner_module.apply_workspace_test_fix = apply_override
+                return fix_to_pass_tests(
+                    self.config,
+                    llm_backend_manager,
+                    max_attempts,
+                    message_backend_manager,
+                )
+            finally:
+                fix_to_pass_tests_runner_module.run_local_tests = original_run
+                fix_to_pass_tests_runner_module.apply_workspace_test_fix = original_apply
+
+        return fix_to_pass_tests(
+            self.config,
+            llm_backend_manager,
+            max_attempts,
+            message_backend_manager,
+        )
+
+    def _get_llm_backend_info(self) -> Dict[str, Optional[str]]:
+        """Get LLM backend, provider, and model information for telemetry."""
+
+        info: Dict[str, Optional[str]] = {
+            "backend": None,
+            "provider": None,
+            "model": None,
+        }
+
+        def _extract_from_manager(
+            manager: Optional[Any],
+        ) -> Optional[Dict[str, Optional[str]]]:
+            if manager is None:
+                return None
+
+            getter = getattr(manager, "get_last_backend_provider_and_model", None)
+            if callable(getter):
+                try:
+                    backend, provider, model = getter()
+                    return {"backend": backend, "provider": provider, "model": model}
+                except Exception:
+                    pass
+
+            getter = getattr(manager, "get_last_backend_and_model", None)
+            if callable(getter):
+                try:
+                    backend, model = getter()
+                    return {"backend": backend, "provider": None, "model": model}
+                except Exception:
+                    pass
+            return None
+
+        try:
+            sources = (
+                lambda: get_llm_backend_manager(),
+                lambda: LLMBackendManager.get_llm_instance(),
+                lambda: LLMBackendManager._instance,
+            )
+
+            for source in sources:
+                try:
+                    details = _extract_from_manager(source())
+                except (RuntimeError, AttributeError):
+                    continue
+                if details:
+                    info.update(details)
+                    return info
+        except Exception as e:
+            logger.debug(f"Error getting LLM backend info: {e}")
+
+        return info
+
+    def _save_report(self, data: Dict[str, Any], filename: str, repo_name: Optional[str] = None) -> None:
+        """Save report to file.
+
+        Args:
+            data: Report data to save
+            filename: Base filename (without timestamp and extension)
+            repo_name: Repository name (e.g., 'owner/repo'). If provided, saves to
+                      ~/.auto-coder/{repository}/ instead of the default reports/ directory.
+        """
+        try:
+            # If repository name is specified, use repository-specific directory
+            if repo_name:
+                reports_dir = self.config.get_reports_dir(repo_name)
+            else:
+                reports_dir = self.config.REPORTS_DIR
+
+            # Create reports directory if it doesn't exist
+            os.makedirs(reports_dir, exist_ok=True)
+
+            filepath = os.path.join(
+                reports_dir,
+                f"{filename}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+            )
+            # Secure file creation with 0o600 permissions
+            fd = os.open(filepath, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                # Ensure permissions are correct even if file existed
+                os.chmod(filepath, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+            except Exception:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                raise
+            log_action(f"Report saved to {filepath}")
+        except Exception as e:
+            logger.error(f"Error saving report {filename}: {e}")
+
+    def _create_pr_analysis_prompt(
+        self,
+        repo_name: str,
+        pr_data: Dict[str, Any],
+        pr_diff: str = "",
+    ) -> str:
+        """Compatibility wrapper used in tests to expose the PR prompt builder."""
+        return _engine_pr_prompt(repo_name, pr_data, pr_diff, self.config)
+
+    def _get_pr_diff(self, repo_name: str, pr_number: int) -> str:
+        """Get PR diff for analysis."""
+        return _pr_get_diff(repo_name, pr_number, self.config)
+
+    def _take_issue_actions(
+        self,
+        repo_name: str,
+        issue_data: Dict[str, Any],
+        backend_manager: Optional[Any] = None,
+        retry_authority: Optional[ImplementationRetryRequest] = None,
+    ) -> List[str]:
+        """Take actions on an issue using direct LLM CLI analysis and implementation."""
+        from .issue_processor import _take_issue_actions as _take_issue_actions_func
+
+        return _take_issue_actions_func(
+            repo_name,
+            issue_data,
+            self.config,
+            self.github,
+            backend_manager=backend_manager,
+            implementation_slots=self._get_implementation_slots(repo_name),
+            **({"retry_authority": retry_authority} if retry_authority is not None else {}),  # type: ignore[arg-type]
+        )
+
+    def _apply_issue_actions_directly(self, repo_name: str, issue_data: Dict[str, Any]) -> List[str]:
+        """Ask LLM CLI to analyze an issue and take appropriate actions directly."""
+        from .issue_processor import _apply_issue_actions_directly as _apply_issue_actions_directly_func
+
+        return _apply_issue_actions_directly_func(
+            repo_name,
+            issue_data,
+            self.config,
+            self.github,
+        )
+
+    def _commit_changes(self, fix_suggestion: Dict[str, Any]) -> str:
+        """Commit changes made by the automation."""
+        try:
+            # Use git_commit_with_retry for centralized commit logic
+            commit_message = f"Auto-Coder: {fix_suggestion.get('summary', 'Fix applied')}"
+            commit_result = git_commit_with_retry(commit_message)
+
+            if commit_result.success:
+                return f"Committed changes: {commit_message}"
+            else:
+                return f"Failed to commit changes: {commit_result.stderr}"
+        except Exception as e:
+            return f"Error committing changes: {e}"
+
+    # Additional methods needed by tests
+    def _resolve_pr_merge_conflicts(self, repo_name: str, pr_number: int) -> bool:
+        """Resolve merge conflicts for a PR."""
+        try:
+            # Get PR details to determine the base branch
+            # repo = self.github.get_repository(repo_name)
+            # pr = repo.get_pull(pr_number)
+            pr = self.github.get_pull_request(repo_name, pr_number)
+            pr_data = self.github.get_pr_details(pr)
+            base_branch = pr_data.get("base_branch", "main")
+
+            # Clean up any existing conflicts
+            self.cmd.run_command(["git", "reset", "--hard", "HEAD"])
+            self.cmd.run_command(["git", "clean", "-fd"])
+            self.cmd.run_command(["git", "merge", "--abort"])
+
+            # Checkout the PR branch
+            # Checkout the PR branch
+            # Use direct git commands instead of gh pr checkout
+            # Fetch the PR head to a local branch named pr-<number>
+            fetch_ref = f"pull/{pr_number}/head:pr-{pr_number}"
+            self.cmd.run_command(["git", "fetch", "origin", fetch_ref])
+            self.cmd.run_command(["git", "checkout", f"pr-{pr_number}"])
+
+            # If base branch is not main, fetch and merge it
+            if base_branch != "main":
+                self.cmd.run_command(["git", "fetch", "origin", base_branch])
+                # Resolve base to a fully qualified remote ref to avoid ambiguity
+                origin_ref = f"refs/remotes/origin/{base_branch}"
+                base_check = self.cmd.run_command(["git", "rev-parse", "--verify", origin_ref])
+                resolved_base = origin_ref if base_check.success else base_branch
+                self.cmd.run_command(["git", "merge", resolved_base])
+
+            # Push the resolved conflicts
+            self.cmd.run_command(["git", "push"])
+
+            return True
+        except Exception as e:
+            logger.error(f"Failed to resolve merge conflicts for PR #{pr_number}: {e}")
+            return False
+
+    def _update_with_base_branch(self, repo_name: str, pr_data: Dict[str, Any]) -> List[str]:
+        """Update PR branch with latest changes from base branch."""
+        import subprocess
+
+        actions = []
+
+        try:
+            # Get the base branch from PR data, default to 'main'
+            base_branch = pr_data.get("base_branch", "main")
+            pr_number = pr_data.get("number", 999)
+
+            # Fetch the latest changes from origin
+            fetch_result = subprocess.run(["git", "fetch", "origin"], capture_output=True, text=True)
+            if fetch_result.returncode != 0:
+                return [f"Failed to fetch from origin: {fetch_result.stderr}"]
+
+            # Check how many commits behind the base branch we are
+            rev_list_result = subprocess.run(
+                [
+                    "git",
+                    "rev-list",
+                    "--count",
+                    f"HEAD..refs/remotes/origin/{base_branch}",
+                ],
+                capture_output=True,
+                text=True,
+            )
+
+            if rev_list_result.returncode == 0:
+                commits_behind = int(rev_list_result.stdout.strip())
+                if commits_behind > 0:
+                    actions.append(f"{commits_behind} commits behind {base_branch}")
+
+                    # Merge the base branch
+                    merge_result = subprocess.run(
+                        [
+                            "git",
+                            "merge",
+                            f"refs/remotes/origin/{base_branch}",
+                            "--no-edit",
+                        ],
+                        capture_output=True,
+                        text=True,
+                    )
+
+                    if merge_result.returncode == 0:
+                        actions.append(f"Successfully merged {base_branch} branch into PR #{pr_number}")
+
+                        # Push the updated branch
+                        push_result = subprocess.run(["git", "push"], capture_output=True, text=True)
+                        if push_result.returncode == 0:
+                            actions.append("Pushed updated branch")
+                            actions.append(self.FLAG_SKIP_ANALYSIS)
+                        else:
+                            actions.append(f"Failed to push: {push_result.stderr}")
+                    else:
+                        actions.append(f"Failed to merge {base_branch}: {merge_result.stderr}")
+                else:
+                    actions.append(f"PR #{pr_number} is up to date with {base_branch} branch")
+            else:
+                actions.append(f"Could not determine commit status: {rev_list_result.stderr}")
+
+        except Exception as e:
+            actions.append(f"Error updating with base branch: {e}")
+
+        return actions
+
+    def _get_repository_context(self, repo_name: str) -> Dict[str, Any]:
+        """Get repository context information."""
+        try:
+            repo = self.github.get_repository(repo_name)
+            return {
+                "name": repo.name,
+                "description": repo.description or "",
+                "language": repo.language or "",
+                "stars": repo.stargazers_count,
+                "forks": repo.forks_count,
+            }
+        except Exception as e:
+            logger.error(f"Failed to get repository context for {repo_name}: {e}")
+            # Return minimal fallback data
+            return {
+                "name": repo_name.split("/")[-1] if "/" in repo_name else repo_name,
+                "description": "Unable to fetch description",
+                "language": "Unknown",
+                "stars": 0,
+                "forks": 0,
+            }
+
+    def _format_feature_issue_body(self, suggestion: Dict[str, Any]) -> str:
+        """Format feature suggestion as issue body."""
+        body = "## Feature Request\n\n"
+        body += f"**Description:**\n{suggestion.get('description', 'No description provided')}\n\n"
+        body += f"**Rationale:**\n{suggestion.get('rationale', 'No rationale provided')}\n\n"
+        body += f"**Priority:** {suggestion.get('priority', 'medium')}\n\n"
+
+        # Add acceptance criteria if present
+        acceptance_criteria = suggestion.get("acceptance_criteria", [])
+        if acceptance_criteria:
+            body += "**Acceptance Criteria:**\n"
+            for criteria in acceptance_criteria:
+                body += f"- [ ] {criteria}\n"
+            body += "\n"
+
+        body += "*This feature request was generated automatically by Auto-Coder.*"
+        return body
+
+    def _should_auto_merge_pr(self, analysis: Dict[str, Any], pr_data: Dict[str, Any]) -> bool:
+        """Determine if PR should be auto-merged."""
+        return analysis.get("risk_level") == "low" and not pr_data.get("draft", False)
+
+    def _run_pr_tests(self, repo_name: str, pr_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Run tests for PR."""
+        test_script_path = self.config.TEST_SCRIPT_PATH
+
+        if not os.path.exists(test_script_path):
+            return {
+                "success": False,
+                "errors": f"Test script not found: {test_script_path}",
+                "return_code": -1,
+            }
+
+        try:
+            target_container = get_target_container(self.config)
+            if target_container:
+                logger.info(f"Running PR tests via target container: {target_container}")
+                cmd_list = ["docker", "exec", target_container, "bash", test_script_path]
+            else:
+                logger.info(f"Running PR tests via script: {test_script_path}")
+                cmd_list = ["bash", test_script_path]
+
+            result = self.cmd.run_command(
+                cmd_list,
+                timeout=self.cmd.DEFAULT_TIMEOUTS["test"],
+            )
+
+            if result.success:
+                return {"success": True, "output": result.stdout}
+            else:
+                return {
+                    "success": False,
+                    "output": result.stdout,
+                    "errors": result.stderr,
+                    "return_code": result.returncode,
+                }
+        except Exception as e:
+            return {
+                "success": False,
+                "errors": f"Failed to execute tests: {e}",
+                "return_code": -1,
+            }
+
+    def _extract_important_errors(self, test_result: Union[TestResult, Dict[str, Any]]) -> str:
+        """Extract important errors using the structured TestResult flow when available.
+
+        Falls back to the legacy regex-based extraction when conversion fails.
+        """
+        try:
+            # Prefer structured extractor from fix_to_pass_tests_runner
+            if isinstance(test_result, TestResult):
+                return cast(
+                    str,
+                    extract_important_errors(test_result),
+                )
+            # Convert legacy dict payloads to TestResult for better extraction
+            tr = fix_to_pass_tests_runner_module._to_test_result(test_result)
+            return cast(str, extract_important_errors(tr))
+        except Exception:
+            # Legacy fallback: minimal regex-based extraction from dict payloads
+            import re
+
+            important_lines: List[str] = []
+            output = ""
+            errors_field = ""
+            try:
+                if isinstance(test_result, dict):
+                    output = str(test_result.get("output", ""))
+                    errors_field = str(test_result.get("errors", ""))
+            except Exception:
+                pass
+
+            if output:
+                error_patterns = [
+                    r"ERROR:.*",
+                    r"FAILED:.*",
+                    r"Failures?:.*",
+                    r"Error.*",
+                    r"Exception.*",
+                    r"Traceback.*",
+                ]
+                for line in output.split("\n"):
+                    line = line.strip()
+                    if any(re.search(pattern, line, re.IGNORECASE) for pattern in error_patterns):
+                        if line and line not in important_lines:
+                            important_lines.append(line)
+
+            if errors_field and errors_field not in important_lines:
+                important_lines.append(errors_field)
+
+            return "\n".join(important_lines)
+
+    def _apply_github_actions_fix(
+        self,
+        repo_name: str,
+        pr_data: Dict[str, Any],
+        test_result: TestResult,
+        github_logs: Optional[str] = None,
+    ) -> List[str]:
+        """Apply GitHub Actions fix using structured TestResult context.
+
+        - Accepts TestResult to enable richer, framework-aware error extraction
+        - Passes structured metadata to the LLM prompt for targeted fixes
+        """
+        actions: List[str] = []
+
+        try:
+            # Derive a concise error summary using the structured extractor
+            error_summary = cast(
+                str,
+                fix_to_pass_tests_runner_module.extract_important_errors(test_result),
+            )
+            if not github_logs:
+                github_logs = error_summary
+
+            # Prepare enhanced prompt with structured context
+            linked_issues_context = get_linked_issues_context(self.github, repo_name, pr_data.get("body", ""))
+
+            prompt = render_prompt(
+                "pr.github_actions_fix_direct",
+                linked_issues_context=linked_issues_context,
+                data={
+                    "repo_name": repo_name,
+                    "pr_title": pr_data.get("title", "N/A"),
+                    "pr_body": pr_data.get("body", "N/A"),
+                    "pr_number": pr_data.get("number", "N/A"),
+                    "github_logs": (github_logs or ""),
+                    # Structured enhancements
+                    "structured_errors": test_result.extraction_context or {},
+                    "framework_type": test_result.framework_type or "unknown",
+                },
+            )
+
+            llm_response = run_llm_prompt(prompt)
+            preview = (llm_response or "").strip()[:256]
+            actions.append(f"Applied GitHub Actions fix{': ' + preview + '...' if preview else ''}")
+
+            # Commit the changes using the centralized commit logic
+            commit_result = git_commit_with_retry(f"Auto-Coder: Fix GitHub Actions issues for PR #{pr_data.get('number', 'N/A')}")
+            if commit_result.success:
+                actions.append("Committed changes")
+
+                # Push the changes
+                push_result = git_push()
+                if push_result.success:
+                    actions.append("Pushed changes")
+                else:
+                    actions.append(f"Failed to push: {push_result.stderr}")
+            else:
+                actions.append(f"Failed to commit: {commit_result.stderr}")
+
+        except Exception as e:
+            actions.append(f"Error applying GitHub Actions fix: {e}")
+
+        return actions
+
+    def _format_direct_fix_comment(self, pr_data: Dict[str, Any], github_logs: str, fix_actions: List[str]) -> str:
+        """Format direct fix comment."""
+        return f"Auto-Coder Applied GitHub Actions Fixes\n\n**PR:** #{pr_data['number']} - {pr_data['title']}\n\nError: {github_logs}\n\nFixes applied: {', '.join(fix_actions)}"
+
+    def parse_commit_history_with_actions(self, repo_name: str, search_depth: int = 10) -> List[Dict[str, Any]]:
+        """Parse git commit history and identify commits that triggered GitHub Actions.
+
+        Args:
+            repo_name: Repository name in format 'owner/repo'
+            search_depth: Number of recent commits to check (default: 10)
+
+        Returns:
+            List of commits that have GitHub Actions runs with status information.
+            Each dict contains: commit_hash, message, actions_status, actions_url
+        """
+        import subprocess
+
+        try:
+            # Use git log --oneline to retrieve recent commit history
+            result = subprocess.run(
+                ["git", "log", "--oneline", f"-{search_depth}"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+            if result.returncode != 0:
+                logger.error(f"Failed to get git log: {result.stderr}")
+                return []
+
+            commits_with_actions = []
+
+            # Parse the output to extract commit hashes and messages
+            lines = result.stdout.strip().split("\n")
+
+            for line in lines:
+                if not line.strip():
+                    continue
+
+                # Parse commit hash and message (format: "hash message")
+                # Strip leading/trailing whitespace from line first
+                line = line.strip()
+                parts = line.split(" ", 1)
+                if len(parts) < 2:
+                    continue
+
+                commit_hash = parts[0]
+                commit_message = parts[1]
+
+                # Skip lines with empty commit hash (e.g., malformed lines)
+                if not commit_hash:
+                    continue
+
+                # Check if this commit has associated GitHub Actions runs
+                try:
+                    # Use GhApi to list workflow runs for this commit
+                    token = self.github.token
+                    api = get_ghapi_client(token)
+                    owner, repo = repo_name.split("/")
+
+                    runs_resp = api.actions.list_workflow_runs_for_repo(owner, repo, head_sha=commit_hash, per_page=1)
+                    runs = runs_resp.get("workflow_runs", [])
+
+                    if not runs:
+                        logger.debug(f"Commit {commit_hash[:8]}: No GitHub Actions runs found")
+                        continue
+
+                    # Check if there are any runs (success or failure)
+                    actions_status = None
+                    actions_url = ""
+
+                    for run in runs:
+                        status = (run.get("conclusion") or run.get("status") or "").lower()
+                        # Only include relevant statuses
+                        if status in [
+                            "success",
+                            "completed",
+                            "failure",
+                            "failed",
+                            "cancelled",
+                            "pass",
+                            "timed_out",
+                        ]:
+                            actions_status = status
+                            actions_url = run.get("html_url", "")
+                            break
+
+                    # Only add commits that have completed Action runs
+                    if actions_status:
+                        commits_with_actions.append(
+                            {
+                                "commit_hash": commit_hash,
+                                "message": commit_message,
+                                "actions_status": actions_status,
+                                "actions_url": actions_url,
+                            }
+                        )
+                        logger.info(f"Commit {commit_hash[:8]}: Found Actions run with status '{actions_status}'")
+
+                except Exception as e:
+                    logger.warning(f"Error checking Actions for commit {commit_hash[:8]}: {e}")
+                    continue
+
+            logger.info(f"Found {len(commits_with_actions)} commits with GitHub Actions")
+            return commits_with_actions
+
+        except Exception as e:
+            logger.error(f"Error parsing commit history: {e}")
+            return []
+
+    def _create_candidate_from_single(self, repo_name: str, target_type: str, number: int, propagate_errors: bool = False, cancel_initial_refusal: bool = False) -> Optional[Candidate]:
+        """Create a Candidate from a single issue or PR.
+
+        Args:
+            repo_name: Repository name
+            target_type: Type of target ('issue' or 'pr')
+            number: Issue or PR number
+            cancel_initial_refusal: Allow this initial Issue GET to use a
+                completed local refusal received during admission waiting.
+        Returns:
+            Candidate or None if failed
+        """
+        from .issue_context import extract_linked_issues_from_pr_body
+
+        try:
+            # Handle 'auto' type
+            if target_type == "auto" and propagate_errors:
+                target_type = self.github.get_item_type_strict(repo_name, number)
+            if target_type == "auto":
+                # Prefer PR to avoid mislabeling PR issues.
+                # get_pull_request() returns an empty result instead of raising when the
+                # number belongs to an issue, so the number has to be verified.
+                target_type = "issue"
+                try:
+                    pr = self.github.get_pull_request(repo_name, number)
+                    pr_data = self.github.get_pr_details(pr) if pr else None
+                    if pr_data and pr_data.get("number"):
+                        target_type = "pr"
+                except Exception:
+                    pass
+
+            if target_type == "pr":
+                # Get PR data
+                # repo = self.github.get_repository(repo_name)
+                # pr = repo.get_pull(number)
+                if propagate_errors:
+                    try:
+                        # Invalidation completion needs a cache-bypassing API
+                        # result that distinguishes authoritative 404 from a
+                        # transport failure. get_pull_request() intentionally
+                        # flattens both to None for legacy polling callers.
+                        pr = self.github.get_pull_request_metadata_strict(repo_name, number)
+                    except httpx.HTTPStatusError as error:
+                        if error.response.status_code == 404:
+                            logger.info(f"PR #{number} no longer exists in {repo_name}")
+                            self.open_target_observations.observe(OpenTarget("pr", number), "absent")
+                            # This strict 404 is authoritative terminal evidence.
+                            # Commit retirement before returning absence to the
+                            # durable worker, which may then complete generation.
+                            self.invalidations.retire_ci_watches(repo_name, number)
+                            # Issue #2148 REQ-001/AS-006: an explicit single-target
+                            # (--only/--force) or otherwise-authoritative closure
+                            # observation of a PR must make its old owner eligible
+                            # for reclamation without starting a new execution.
+                            self._schedule_pr_owner_reclamation(repo_name, {"number": number})
+                            return None
+                        raise
+                else:
+                    pr = self.github.get_pull_request(repo_name, number)
+                pr_data = self.github.get_pr_details(pr) if pr else None
+                if not pr_data or not pr_data.get("number"):
+                    logger.error(f"PR #{number} not found in {repo_name}")
+                    return None
+                if propagate_errors:
+                    self.open_target_observations.observe(OpenTarget("pr", number, str(pr_data.get("title") or ""), str(pr_data.get("created_at") or "")), str(pr_data.get("state") or ""))
+                    if pr_data.get("state") == "closed":
+                        self.invalidations.retire_ci_watches(repo_name, number)
+                        self._schedule_pr_owner_reclamation(repo_name, pr_data)
+                    elif pr_data.get("state") == "open":
+                        self.invalidations.restore_ci_watches_for_open_lifecycle(
+                            repo_name,
+                            number,
+                            str(pr_data.get("head", {}).get("sha") or ""),
+                        )
+                if not self._is_pr_author_allowed(pr_data):
+                    logger.info(f"Skipping PR #{number} - author not in PR allowlist")
+                    return None
+                branch_name = pr_data.get("head_branch")
+                pr_body = pr_data.get("body", "")
+                related_issues = []
+                if pr_body:
+                    related_issues = extract_linked_issues_from_pr_body(pr_body)
+
+                return Candidate(
+                    type="pr",
+                    data=pr_data,
+                    priority=0,  # Single processing doesn't need priority
+                    branch_name=branch_name,
+                    related_issues=related_issues,
+                )
+            elif target_type == "issue":
+                if propagate_errors:
+                    try:
+                        # This one strict snapshot is both the type authority and
+                        # the candidate source. A second, failure-flattening read
+                        # could otherwise turn a transport outage into absence.
+                        cancellation = cancel_github_reads_when(lambda context: is_issue_resource_read(context, repo_name, number) and self._cached_issue_refusal(repo_name, number, self.config) is not None) if cancel_initial_refusal else nullcontext()
+                        # End the cancellation scope before closure cleanup,
+                        # which can itself need authoritative reads and effects.
+                        with cancellation:
+                            issue = self.github.get_issue_dispatch_snapshot_strict(repo_name, number)
+                    except httpx.HTTPStatusError as error:
+                        if error.response.status_code == 404:
+                            logger.info(f"Issue #{number} no longer exists in {repo_name}")
+                            self.open_target_observations.observe(OpenTarget("issue", number), "absent")
+                            return None
+                        raise
+                    if "pull_request" in issue:
+                        logger.error(f"Refusing Issue candidate for {repo_name}#{number}: GitHub identifies the target as pr")
+                        return None
+                else:
+                    authoritative_type = self._get_authoritative_item_type(repo_name, number)
+                    if authoritative_type != "issue":
+                        logger.error(f"Refusing Issue candidate for {repo_name}#{number}: GitHub identifies the target as {authoritative_type}")
+                        return None
+
+                    # Get issue data
+                    # repo = self.github.get_repository(repo_name)
+                    # issue = repo.get_issue(number)
+                    issue = self.github.get_issue(repo_name, number)
+                issue_data = self.github.get_issue_details(issue)
+                if not issue_data or not issue_data.get("number"):
+                    return None
+                if propagate_errors:
+                    self.open_target_observations.observe(OpenTarget("issue", number, str(issue_data.get("title") or ""), str(issue_data.get("created_at") or "")), str(issue_data.get("state") or ""))
+                if propagate_errors and issue_data.get("state") == "closed":
+                    # This data came from the matching strict snapshot above.
+                    # Commit closure effects before allowlist/admission filters
+                    # can turn the candidate into an early successful absence.
+                    self._revoke_closed_issue_eligibility(repo_name, number)
+                if not self._is_issue_author_allowed(issue_data):
+                    logger.info(f"Skipping issue #{number} - author not in issue allowlist")
+                    return None
+
+                return Candidate(
+                    type="issue",
+                    data=issue_data,
+                    priority=0,  # Single processing doesn't need priority
+                    issue_number=number,
+                )
+        except (GitHubRequestDeferred, GitHubReadCancelled):
+            # Preserve unsent cancellation and deferral control flow so the
+            # worker can finish a refusal or retain its durable schedule.
+            raise
+        except Exception as e:
+            logger.error(f"Failed to create candidate for {target_type} #{number}: {e}")
+            if propagate_errors:
+                raise
+            return None
+
+        return None
+
+    # Constants
+    FLAG_SKIP_ANALYSIS = "[SKIP_LLM_ANALYSIS]"
+
+
+def build_pr_local_job_adapters(github: Any, config: AutomationConfig, store: LocalJobStore, repository_path: Path | None = None) -> dict[LocalJobKind, Any]:
+    """Compose every production durable PR execution adapter."""
+    from .pr_local_job_runtime import build_pr_local_job_adapters as compose_adapters
+
+    return compose_adapters(github, config, store, repository_path=repository_path)

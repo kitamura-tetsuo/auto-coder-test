@@ -1,0 +1,263 @@
+#!/bin/bash
+set -Eeuo pipefail
+
+# The PR workflow runs the repository-wide quality gate in its dedicated job.
+# Only this explicit leading mode omits that duplicate work; CI environment
+# variables alone deliberately retain the normal, complete test entry point.
+CI_TESTS_ONLY=0
+if [ "${1:-}" = "--ci-tests-only" ]; then
+    CI_TESTS_ONLY=1
+    shift
+fi
+
+# -----------------------------------------------------------------------------
+# Environment detection and setup
+# -----------------------------------------------------------------------------
+# Handle remote execution if AM_I_AUTOCODER_CONTAINER matches
+if [ "${AM_I_AUTOCODER_CONTAINER:-false}" = "true" ] && [ "${INSIDE_TARGET_EXECUTION:-false}" != "true" ]; then
+    # Determine target container name from repo name
+    if [ -z "${REPO_NAME:-}" ]; then
+        # Try to detect repo name (similar to get_repo_or_detect in Python)
+        if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+            # Extract owner/repo from origin URL
+            REMOTE_URL=$(git remote get-url origin 2>/dev/null || true)
+            if [ -n "$REMOTE_URL" ]; then
+                # Handle both HTTPS and SSH URLs
+                REPO_NAME=$(echo "$REMOTE_URL" | sed -E 's/.*[:\/]([^\/]+\/[^\/]+)(\.git)?$/\1/' | sed 's/\.git$//')
+            fi
+        fi
+        # Fallback to current directory name if detection failed
+        if [ -z "${REPO_NAME:-}" ]; then
+            REPO_NAME=$(basename "$(pwd)")
+        fi
+    fi
+
+    if [ -n "${REPO_NAME:-}" ]; then
+        CLEAN_REPO_NAME=$(echo "$REPO_NAME" | sed 's/.*\///')
+        TARGET_CONTAINER="auto-coder-$CLEAN_REPO_NAME"
+        echo "[INFO] Redirecting test execution to target container: $TARGET_CONTAINER"
+        
+        # Ensure Docker is accessible
+        if ! command -v docker >/dev/null 2>&1; then
+            echo "[ERROR] docker command not found. Cannot execute tests in target container."
+            exit 1
+        fi
+
+        # Execute this script inside the target container
+        FORWARDED_ARGS=("$@")
+        if [ "$CI_TESTS_ONLY" -eq 1 ]; then
+            FORWARDED_ARGS=(--ci-tests-only "${FORWARDED_ARGS[@]}")
+        fi
+        docker exec -e INSIDE_TARGET_EXECUTION=true "$TARGET_CONTAINER" ./scripts/test.sh "${FORWARDED_ARGS[@]}"
+        exit $?
+    else
+        echo "[WARN] AM_I_AUTOCODER_CONTAINER is true but REPO_NAME is not set. Running locally."
+    fi
+fi
+
+# Detect CI environment and set appropriate flags
+
+echo "Detecting CI environment..."
+
+# Check if running in CI
+IS_CI=0
+if [ "${GITHUB_ACTIONS:-}" = "true" ] || [ "${CI:-}" = "true" ]; then
+    IS_CI=1
+    echo "[INFO] Running in CI environment (GitHub Actions or other CI)"
+else
+    echo "[INFO] Running in local development environment"
+fi
+
+# Check if running in a container
+IN_CONTAINER=0
+if [ -f /.dockerenv ] || [ -f /run/.containerenv ]; then
+    IN_CONTAINER=1
+    echo "[INFO] Running inside a container"
+else
+    echo "[INFO] Running on host system"
+fi
+
+# Set test environment isolation variables
+export AUTOCODER_TEST_IN_CONTAINER="${IN_CONTAINER}"
+export AUTOCODER_TEST_IS_CI="${IS_CI}"
+
+echo ""
+echo "Environment configuration:"
+echo "  CI environment: ${IS_CI}"
+echo "  Container: ${IN_CONTAINER}"
+echo ""
+
+# -----------------------------------------------------------------------------
+# Dependency checking
+# -----------------------------------------------------------------------------
+# Check for required CLI dependencies and provide helpful warnings
+
+check_cli_dependency() {
+    local cmd=$1
+    local name=$2
+    local optional=${3:-false}
+
+    if command -v "$cmd" >/dev/null 2>&1; then
+        echo "[INFO] $name is available"
+        return 0
+    else
+        if [ "$optional" = "true" ]; then
+            echo "[WARN] $name is not available (optional dependency)"
+            return 1
+        else
+            echo "[ERROR] $name is not available (required dependency)"
+            return 2
+        fi
+    fi
+}
+
+echo "Checking CLI dependencies..."
+CLI_DEPS_OK=0
+
+# Check for Node.js (optional)
+if check_cli_dependency "node" "Node.js" "true"; then
+    NODE_VERSION=$(node --version 2>/dev/null || echo "unknown")
+    echo "       Node.js version: $NODE_VERSION"
+fi
+
+# Check for Python 3 (required)
+if ! check_cli_dependency "python3" "Python 3" "false"; then
+    CLI_DEPS_OK=1
+fi
+
+PYTHON_VERSION=$(python3 --version 2>/dev/null || echo "unknown")
+echo "       Python version: $PYTHON_VERSION"
+
+# Summary
+echo ""
+echo "Dependency check summary:"
+if [ $CLI_DEPS_OK -eq 0 ]; then
+    echo "[OK] Core dependencies are available"
+else
+    echo "[ERROR] Some required dependencies are missing"
+fi
+
+echo ""
+
+# Continue with test execution even if some optional dependencies are missing
+if [ $CLI_DEPS_OK -ne 0 ]; then
+    echo "[ERROR] Cannot continue without required dependencies"
+    exit 1
+fi
+
+# -----------------------------------------------------------------------------
+# Runner selection
+# -----------------------------------------------------------------------------
+# Prefer uv runner for consistent, reproducible environments.
+# Optionally allow activating a local virtualenv by setting AC_USE_LOCAL_VENV=1.
+
+USE_UV=0
+if command -v uv >/dev/null 2>&1; then
+  USE_UV=1
+fi
+
+if [ "${AC_USE_LOCAL_VENV:-0}" = "1" ]; then
+  if [ -f "./venv/bin/activate" ]; then
+    # shellcheck source=/dev/null
+    source ./venv/bin/activate
+  elif [ -f "../venv/bin/activate" ]; then
+    # shellcheck source=/dev/null
+    source ../venv/bin/activate
+  fi
+fi
+
+# Unset VIRTUAL_ENV to prevent conflicts with uv's environment detection
+# This prevents warnings about VIRTUAL_ENV not matching the project environment path
+if [ -n "${VIRTUAL_ENV:-}" ]; then
+  unset VIRTUAL_ENV
+fi
+
+# Always sync dependencies with uv when available
+# Skip sync in CI to avoid conflicts with pre-synced environment
+if [ "$USE_UV" -eq 1 ] && [ "${GITHUB_ACTIONS:-}" != "true" ] && [ "${CI:-}" != "true" ]; then
+  uv sync -q --extra test
+  # Install test dependencies including pytest-timeout
+  # Note: We need to ensure pytest-timeout is installed in the environment that uv uses
+  if ! uv run python -c "import pytest_timeout" 2>/dev/null; then
+    uv pip install pytest-timeout
+  fi
+fi
+
+RUN=""
+PYTHON_RUNNER="python3"
+if [ "$USE_UV" -eq 1 ]; then
+  RUN="uv run"
+  PYTHON_RUNNER="uv run python"
+else
+  printf "[WARN] uv is not installed. Falling back to system Python's pytest.
+"
+  printf "       Ensure Python 3.12 is active and dependencies are installed.
+" >&2
+fi
+
+# -----------------------------------------------------------------------------
+# Code quality checks (matching .pre-commit-config.yaml)
+# -----------------------------------------------------------------------------
+echo ""
+if [ "$CI_TESTS_ONLY" -eq 0 ]; then
+echo "Installing code quality tools..."
+
+# Install code quality tools
+if [ "$USE_UV" -eq 1 ]; then
+  uv pip install black isort flake8 mypy types-toml
+else
+  pip install black isort flake8 mypy types-toml
+fi
+
+echo ""
+echo "Running code quality checks..."
+
+# Run black (auto-fix in local, check only in CI)
+echo "[CHECK] Running black..."
+if [ "$IS_CI" -eq 0 ]; then
+  echo "  [LOCAL] Running black in auto-fix mode..."
+  $RUN black src/ tests/
+else
+  echo "  [CI] Running black in check mode..."
+  $RUN black --check src/ tests/
+fi
+
+# Run isort (auto-fix in local, check only in CI)
+echo "[CHECK] Running isort..."
+if [ "$IS_CI" -eq 0 ]; then
+  echo "  [LOCAL] Running isort in auto-fix mode..."
+  $RUN isort src/ tests/
+else
+  echo "  [CI] Running isort in check mode..."
+  $RUN isort --check-only src/ tests/
+fi
+
+# Run flake8
+echo "[CHECK] Running flake8..."
+$RUN flake8 src/ tests/
+
+# Run mypy
+echo "[CHECK] Running mypy..."
+# Canonical package-wide check: matches the PR Tests "Lint & Type Check" job
+# and the mypy pre-commit hook exactly. This recursively analyzes the
+# checked-out src/auto_coder package (including new/otherwise-unimported
+# submodules) under root pyproject.toml's [tool.mypy] configuration. Do not
+# add "|| true" here: `set -Eeuo pipefail` must stop this script on a nonzero
+# result before the "checks passed" message and before the test collector.
+$RUN mypy --config-file pyproject.toml -p auto_coder
+
+echo "[OK] All code quality checks passed!"
+echo ""
+else
+  echo "[INFO] Explicit CI test-only mode: quality checks run in the PR quality job."
+fi
+
+# -----------------------------------------------------------------------------
+# Test execution via log collector
+# -----------------------------------------------------------------------------
+echo "Running tests via local_test_log_collector.py..."
+$PYTHON_RUNNER src/auto_coder/local_test_log_collector.py "$@"
+EXIT_CODE=$?
+
+echo "Test run completed with exit code: $EXIT_CODE"
+exit $EXIT_CODE

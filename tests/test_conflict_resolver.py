@@ -1,0 +1,456 @@
+import json
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from src.auto_coder.automation_config import AutomationConfig
+from src.auto_coder.conflict_resolver import (
+    _extract_session_id_from_pr_body,
+    _perform_base_branch_merge_and_conflict_resolution,
+    _trigger_fallback_for_conflict_failure,
+    check_mergeability_with_llm,
+    resolve_merge_conflicts_with_llm,
+)
+from src.auto_coder.utils import CommandResult
+
+
+def test_extract_session_id_from_pr_body_jules_session_url():
+    """A real Jules session URL should be extracted even if the body also
+    contains a self-referencing GitHub PR link (regression for 404s when
+    archiving sessions for PRs Jules created directly)."""
+    pr_body = "This PR was created by Jules.\n\n" "https://jules.google.com/session/901463134778726610\n\n" "https://github.com/kitamura-tetsuo/outliner/pull/3976"
+    assert _extract_session_id_from_pr_body(pr_body) == "901463134778726610"
+
+
+def test_perform_base_merge_uses_fq_remote_ref():
+    config = AutomationConfig()
+
+    with (
+        patch("src.auto_coder.conflict_resolver.cmd") as mock_cmd,
+        patch("src.auto_coder.conflict_resolver.GitHubClient") as mock_gh_client_class,
+        patch("src.auto_coder.conflict_resolver.git_push") as mock_git_push,
+    ):
+        # Setup mocks
+        mock_client = MagicMock()
+        mock_gh_client_class.get_instance.return_value = mock_client
+        mock_repo = MagicMock()
+        mock_client.get_repository.return_value = mock_repo
+        mock_pr = MagicMock()
+        mock_repo.get_pull.return_value = mock_pr
+        mock_client.get_pr_details.return_value = {"number": 123, "head_branch": "pr-branch", "author": {"login": "someone"}}
+
+        # Sequence: reset, clean, abort, fetch pr (Step 1), checkout (Step 1), fetch origin base (Step 2), rev-parse (Step 3), merge (Step 3)
+        mock_cmd.run_command.side_effect = [
+            CommandResult(True, stdout="", stderr="", returncode=0),  # reset
+            CommandResult(True, stdout="", stderr="", returncode=0),  # clean
+            CommandResult(False, stdout="", stderr="", returncode=1),  # merge --abort
+            CommandResult(True, stdout="", stderr="", returncode=0),  # fetch pr
+            CommandResult(True, stdout="", stderr="", returncode=0),  # checkout pr
+            CommandResult(True, stdout="", stderr="", returncode=0),  # fetch origin main
+            CommandResult(True, stdout="abc123\n", stderr="", returncode=0),  # rev-parse
+            CommandResult(True, stdout="", stderr="", returncode=0),  # merge
+        ]
+
+        mock_git_push.return_value = CommandResult(True, stdout="", stderr="", returncode=0)
+
+        ok = _perform_base_branch_merge_and_conflict_resolution(
+            pr_number=123,
+            base_branch="main",
+            config=config,
+            repo_name="test/repo",
+            pr_data={"number": 123},
+        )
+
+        assert ok is True
+        # Validate that merge was called with a fully qualified remote ref
+        calls = [c[0][0] for c in mock_cmd.run_command.call_args_list]
+        assert any("refs/remotes/origin/main" in str(arg) for arg in calls)
+
+
+def test_perform_base_merge_closes_jules_pr_on_degrade_with_linked_issues():
+    """Test that Jules PR is closed on degradation even with linked issues."""
+    with (
+        patch("src.auto_coder.conflict_resolver.cmd") as mock_cmd,
+        patch("src.auto_coder.conflict_resolver.GitHubClient") as mock_gh_client_class,
+        patch("src.auto_coder.conflict_resolver.scan_conflict_markers") as mock_scan,
+        patch("src.auto_coder.conflict_resolver.run_llm_noedit_prompt") as mock_llm,
+        patch("src.auto_coder.conflict_resolver.create_high_score_backend_manager") as mock_create_backend,
+        patch("src.auto_coder.conflict_resolver._archive_jules_session") as mock_archive,
+        patch("src.auto_coder.conflict_resolver.check_mergeability_with_llm") as mock_check_mergeability,
+    ):
+        mock_check_mergeability.return_value = False
+        # Setup mocks
+        mock_create_backend.return_value = None
+        mock_client = MagicMock()
+        mock_gh_client_class.get_instance.return_value = mock_client
+        mock_repo = MagicMock()
+        mock_client.get_repository.return_value = mock_repo
+        mock_pr = MagicMock()
+        mock_repo.get_pull.return_value = mock_pr
+        mock_client.get_pr_details.return_value = {"number": 1253, "title": "Fix something", "body": "Session ID: xyz", "author": {"login": "google-labs-jules"}, "head_branch": "jules-branch"}
+
+        # Sequence: reset, clean, abort, fetch pr, checkout, fetch base, rev-parse, merge (fails)
+        mock_cmd.run_command.side_effect = [
+            CommandResult(True, "", "", 0),  # reset
+            CommandResult(True, "", "", 0),  # clean
+            CommandResult(True, "", "", 0),  # merge --abort
+            CommandResult(True, "", "", 0),  # fetch pr
+            CommandResult(True, "", "", 0),  # checkout pr
+            CommandResult(True, "", "", 0),  # fetch origin main
+            CommandResult(True, "abc123\n", "", 0),  # rev-parse
+            CommandResult(False, "CONFLICT", "", 1),  # git merge fails
+        ]
+
+        mock_scan.return_value = ["file1.py"]
+        mock_llm.return_value = "DEGRADING_MERGE"
+
+        pr_data = {"number": 1253, "title": "Fix something", "body": "Session ID: xyz", "author": {"login": "google-labs-jules"}, "baseRefName": "main"}
+
+        ok = _perform_base_branch_merge_and_conflict_resolution(
+            pr_number=1253,
+            base_branch="main",
+            config=AutomationConfig(),
+            repo_name="test/repo",
+            pr_data=pr_data,
+        )
+
+        assert ok is False
+        mock_client.close_pr.assert_called_once()
+        mock_archive.assert_called_once()
+
+
+def test_perform_base_merge_enriches_pr_data_when_missing_fields():
+    """Test that pr_data is enriched if author or body is missing."""
+    config = AutomationConfig()
+
+    with (
+        patch("src.auto_coder.conflict_resolver.cmd") as mock_cmd,
+        patch("src.auto_coder.conflict_resolver.GitHubClient") as mock_gh_client_class,
+        patch("src.auto_coder.conflict_resolver.git_push") as mock_git_push,
+    ):
+        # Setup mocks
+        mock_client = MagicMock()
+        mock_gh_client_class.get_instance.return_value = mock_client
+        mock_repo = MagicMock()
+        mock_client.get_repository.return_value = mock_repo
+        mock_pr = MagicMock()
+        mock_repo.get_pull.return_value = mock_pr
+
+        mock_client.get_pr_details.return_value = {"number": 1253, "author": {"login": "google-labs-jules"}, "body": "Fixes #123", "baseRefName": "main", "head_branch": "jules-fix"}
+
+        mock_cmd.run_command.side_effect = [
+            CommandResult(True, "", "", 0),  # reset
+            CommandResult(True, "", "", 0),  # clean
+            CommandResult(False, "", "", 1),  # merge --abort
+            CommandResult(True, "", "", 0),  # fetch pr
+            CommandResult(True, "", "", 0),  # checkout pr
+            CommandResult(True, "", "", 0),  # fetch base
+            CommandResult(True, "abc123\n", "", 0),  # rev-parse
+            CommandResult(True, "", "", 0),  # merge
+        ]
+
+        mock_git_push.return_value = CommandResult(True, "", "", 0)
+
+        pr_data = {"number": 1253}
+
+        ok = _perform_base_branch_merge_and_conflict_resolution(
+            pr_number=1253,
+            base_branch="main",
+            config=config,
+            repo_name="test/repo",
+            pr_data=pr_data,
+        )
+
+        assert ok is True
+        mock_client.get_pr_details.assert_called()
+
+
+def test_perform_base_merge_closes_jules_pr_recreates_session_on_degrade():
+    """Test that Jules PR is closed on degradation and its session is recreated."""
+    from src.auto_coder.issue_dispatch import DispatchOutcome, DispatchResult, IssueAttemptIdentity
+    from src.auto_coder.issue_processor import IssueDispatchExecution
+
+    config = AutomationConfig()
+    with (
+        patch("src.auto_coder.conflict_resolver.cmd") as mock_cmd,
+        patch("src.auto_coder.conflict_resolver.GitHubClient") as mock_gh_client_class,
+        patch("src.auto_coder.conflict_resolver.scan_conflict_markers") as mock_scan,
+        patch("src.auto_coder.conflict_resolver._archive_jules_session") as mock_archive,
+        patch("src.auto_coder.conflict_resolver._close_pr") as mock_close,
+        patch("src.auto_coder.conflict_resolver.check_mergeability_with_llm") as mock_check_mergeability,
+        patch("src.auto_coder.conflict_resolver._extract_session_id_from_pr_body") as mock_extract_session_id,
+        patch("src.auto_coder.cloud_manager.CloudManager") as mock_cloud_manager_class,
+        patch("src.auto_coder.attempt_manager.increment_attempt") as mock_increment_attempt,
+        patch("src.auto_coder.issue_processor._dispatch_issue_candidates") as mock_process_issue,
+    ):
+        mock_check_mergeability.return_value = False
+        mock_extract_session_id.return_value = "session_xyz"
+
+        # Setup GitHubClient mock
+        mock_client = MagicMock()
+        mock_gh_client_class.get_instance.return_value = mock_client
+        mock_repo = MagicMock()
+        mock_client.get_repository.return_value = mock_repo
+        mock_pr = MagicMock()
+        mock_repo.get_pull.return_value = mock_pr
+
+        # Setup CloudManager mock
+        mock_cloud_manager = MagicMock()
+        mock_cloud_manager_class.return_value = mock_cloud_manager
+        mock_cloud_manager.get_issue_by_session.return_value = 123
+
+        # Setup issue mock details
+        mock_issue = MagicMock()
+        mock_client.get_issue.return_value = mock_issue
+        mock_client.get_issue_details.return_value = {
+            "number": 123,
+            "title": "Test Title",
+            "body": "## Requirements\nREQ-001: Preserve replacement dispatch.",
+            "state": "open",
+            "labels": ["implementation-ready", "@auto-coder"],
+        }
+        mock_client.get_item_type_strict.return_value = "issue"
+        mock_client.get_issue_dispatch_snapshot_strict.return_value = {
+            "number": 123,
+            "body": "## Requirements\nREQ-001: Preserve replacement dispatch.",
+            "state": "open",
+            "labels": [{"name": "implementation-ready"}, {"name": "@auto-coder"}],
+        }
+        mock_client.get_all_sub_issues.return_value = []
+        mock_client.disable_labels = False
+        mock_client.try_add_labels.return_value = False
+
+        dispatch_order = []
+        mock_increment_attempt.side_effect = lambda *_args: dispatch_order.append("increment") or 2
+        mock_process_issue.side_effect = lambda *_args, **_kwargs: dispatch_order.append("dispatch") or IssueDispatchExecution(
+            DispatchResult(
+                IssueAttemptIdentity("test", "repo", 123, "2"),
+                DispatchOutcome.REMOTE_ACCEPTED,
+                "jules",
+                "jules",
+                "sessions/replacement",
+            ),
+            ["dispatched"],
+        )
+
+        # Sequence: reset, clean, abort, fetch pr, checkout, fetch base, rev-parse, merge (fails)
+        mock_cmd.run_command.side_effect = [
+            CommandResult(True, "", "", 0),  # reset
+            CommandResult(True, "", "", 0),  # clean
+            CommandResult(True, "", "", 0),  # merge --abort
+            CommandResult(True, "", "", 0),  # fetch pr
+            CommandResult(True, "", "", 0),  # checkout pr
+            CommandResult(True, "", "", 0),  # fetch origin main
+            CommandResult(True, "abc123\n", "", 0),  # rev-parse
+            CommandResult(False, "CONFLICT", "", 1),  # git merge fails
+        ]
+
+        mock_scan.return_value = ["file1.py"]
+
+        pr_data = {"number": 1253, "title": "Fix something", "body": "Session ID: session_xyz", "author": {"login": "google-labs-jules"}, "baseRefName": "main"}
+
+        ok = _perform_base_branch_merge_and_conflict_resolution(
+            pr_number=1253,
+            base_branch="main",
+            config=config,
+            repo_name="test/repo",
+            pr_data=pr_data,
+        )
+
+        assert ok is False
+        mock_close.assert_called_once_with("test/repo", 1253)
+        mock_archive.assert_called_once_with("test/repo", 1253, "Session ID: session_xyz")
+        mock_increment_attempt.assert_called_once_with("test/repo", 123)
+        mock_process_issue.assert_called_once()
+        assert dispatch_order == ["increment", "dispatch"]
+        mock_client.try_add_labels.assert_not_called()
+        mock_client.remove_labels.assert_not_called()
+
+
+def test_perform_base_merge_skips_conflict_resolution_for_dependabot_pr():
+    """Merge conflicts of dependency-bot PRs must never be resolved."""
+    config = AutomationConfig()
+
+    with (
+        patch("src.auto_coder.conflict_resolver.cmd") as mock_cmd,
+        patch("src.auto_coder.conflict_resolver.GitHubClient") as mock_gh_client_class,
+        patch("src.auto_coder.conflict_resolver.check_mergeability_with_llm") as mock_check_mergeability,
+        patch("src.auto_coder.conflict_resolver.resolve_merge_conflicts_with_llm") as mock_resolve,
+        patch("src.auto_coder.conflict_resolver._trigger_fallback_for_conflict_failure") as mock_fallback,
+    ):
+        mock_client = MagicMock()
+        mock_gh_client_class.get_instance.return_value = mock_client
+        mock_client.get_pr_details.return_value = {
+            "number": 4242,
+            "head_branch": "dependabot/pip/requests-2.32.0",
+            "author": {"login": "dependabot[bot]"},
+        }
+
+        # Sequence: reset, clean, abort, fetch pr, checkout, fetch base, rev-parse, merge (fails), merge --abort
+        mock_cmd.run_command.side_effect = [
+            CommandResult(True, "", "", 0),  # reset
+            CommandResult(True, "", "", 0),  # clean
+            CommandResult(True, "", "", 0),  # merge --abort
+            CommandResult(True, "", "", 0),  # fetch pr
+            CommandResult(True, "", "", 0),  # checkout pr
+            CommandResult(True, "", "", 0),  # fetch origin main
+            CommandResult(True, "abc123\n", "", 0),  # rev-parse
+            CommandResult(False, "CONFLICT", "", 1),  # git merge fails
+            CommandResult(True, "", "", 0),  # merge --abort after skipping
+        ]
+
+        pr_data = {
+            "number": 4242,
+            "title": "Bump requests from 2.31.0 to 2.32.0",
+            "body": "## Requirements\nREQ-001: Preserve the tested dispatch behavior.",
+            "author": {"login": "dependabot[bot]"},
+            "baseRefName": "main",
+        }
+
+        ok = _perform_base_branch_merge_and_conflict_resolution(
+            pr_number=4242,
+            base_branch="main",
+            config=config,
+            repo_name="test/repo",
+            pr_data=pr_data,
+        )
+
+        assert ok is False
+        mock_check_mergeability.assert_not_called()
+        mock_resolve.assert_not_called()
+        mock_fallback.assert_not_called()
+        # The conflicted merge must be aborted instead of resolved
+        assert mock_cmd.run_command.call_args_list[-1][0][0] == ["git", "merge", "--abort"]
+
+
+def test_check_mergeability_uses_llm_for_human_pr():
+    """Non-bot PRs still go through the LLM mergeability check."""
+    config = AutomationConfig()
+
+    with (
+        patch("src.auto_coder.conflict_resolver.run_llm_noedit_prompt") as mock_llm,
+        patch("src.auto_coder.conflict_resolver.create_high_score_backend_manager") as mock_create_backend,
+        patch("src.auto_coder.conflict_resolver.render_prompt") as mock_render_prompt,
+        patch("src.auto_coder.conflict_resolver.get_commit_log") as mock_commit_log,
+        patch("src.auto_coder.conflict_resolver.GitHubClient"),
+    ):
+        mock_create_backend.return_value = None
+        mock_commit_log.return_value = "abc123 commit"
+        mock_render_prompt.return_value = "prompt"
+        mock_llm.return_value = "SAFE_TO_MERGE"
+
+        pr_data = {
+            "number": 4243,
+            "title": "Add feature",
+            "body": "## Requirements\nREQ-001: Preserve the tested dispatch behavior.",
+            "author": {"login": "some-human"},
+            "baseRefName": "main",
+        }
+
+        assert check_mergeability_with_llm(pr_data, "conflict in src/app.py", config) is True
+
+        mock_llm.assert_called_once()
+
+
+def test_trigger_fallback_keys_attempt_on_pr_head_commit():
+    """The attempt increment carries a trigger derived from the PR head commit.
+
+    Without it, a PR whose conflict resolution keeps failing bumps the attempt
+    counter of its linked issue on every automation cycle.
+    """
+    with (
+        patch("src.auto_coder.conflict_resolver.cmd") as mock_cmd,
+        patch("src.auto_coder.conflict_resolver.GitHubClient") as mock_gh_client_class,
+        patch("src.auto_coder.conflict_resolver.increment_attempt") as mock_increment,
+    ):
+        mock_cmd.run_command.return_value = CommandResult(True, stdout="", stderr="", returncode=0)
+
+        mock_client = MagicMock()
+        mock_gh_client_class.get_instance.return_value = mock_client
+        mock_client.get_pr_details.return_value = {
+            "number": 4809,
+            "body": "close #4787",
+            "head_sha": "abcdef1234567890abcdef",
+        }
+        mock_client.get_issue.return_value = {"number": 4787, "state": "open"}
+
+        _trigger_fallback_for_conflict_failure("owner/repo", 4809, "Failed to commit conflict resolution")
+
+        mock_increment.assert_called_once_with("owner/repo", 4787, trigger="pr-4809-abcdef123456")
+
+
+def test_trigger_fallback_without_head_sha_falls_back_to_pr_number():
+    with (
+        patch("src.auto_coder.conflict_resolver.cmd") as mock_cmd,
+        patch("src.auto_coder.conflict_resolver.GitHubClient") as mock_gh_client_class,
+        patch("src.auto_coder.conflict_resolver.increment_attempt") as mock_increment,
+    ):
+        mock_cmd.run_command.return_value = CommandResult(True, stdout="", stderr="", returncode=0)
+
+        mock_client = MagicMock()
+        mock_gh_client_class.get_instance.return_value = mock_client
+        mock_client.get_pr_details.return_value = {"number": 4809, "body": "close #4787"}
+        mock_client.get_issue.return_value = {"number": 4787, "state": "open"}
+
+        _trigger_fallback_for_conflict_failure("owner/repo", 4809, "Failed to commit conflict resolution")
+
+        mock_increment.assert_called_once_with("owner/repo", 4787, trigger="pr-4809")
+
+
+def test_resolve_merge_conflicts_commit_message_uses_pr_number():
+    """The commit message must contain the PR number, not the whole PR payload."""
+    config = AutomationConfig()
+    pr_data = {"number": 4809, "title": "fix: something", "body": "close #4787", "base_branch": "main"}
+
+    with (
+        patch("src.auto_coder.conflict_resolver.cmd") as mock_cmd,
+        patch("src.auto_coder.conflict_resolver.GitHubClient"),
+        patch("src.auto_coder.conflict_resolver.get_commit_log", return_value="log"),
+        patch("src.auto_coder.conflict_resolver.create_high_score_backend_manager", return_value=None),
+        patch("src.auto_coder.conflict_resolver.run_llm_prompt", return_value="resolved"),
+        patch("src.auto_coder.conflict_resolver.scan_conflict_markers", return_value=[]),
+        patch("src.auto_coder.conflict_resolver.git_commit_with_retry") as mock_commit,
+        patch("src.auto_coder.conflict_resolver.git_push") as mock_push,
+    ):
+        mock_cmd.run_command.return_value = CommandResult(True, stdout="", stderr="", returncode=0)
+        mock_commit.return_value = CommandResult(True, stdout="", stderr="", returncode=0)
+        mock_push.return_value = CommandResult(True, stdout="", stderr="", returncode=0)
+
+        actions = resolve_merge_conflicts_with_llm(pr_data, "conflict info", config, "owner/repo")
+
+        mock_commit.assert_called_once_with("Resolve merge conflicts for PR #4809")
+        assert "Committed resolved merge for PR #4809" in actions
+        assert "Pushed resolved merge for PR #4809" in actions
+
+
+@pytest.mark.parametrize(
+    ("disposition", "display_actions", "expected"),
+    [
+        ("applied", (), True),
+        ("failed", ("ACTION_FLAG:SKIP_ANALYSIS",), False),
+    ],
+)
+def test_local_base_merge_uses_typed_publication_evidence(disposition, display_actions, expected):
+    """REQ-003/006: conflict publication text cannot authorize its consumer."""
+    pr = {"number": 5465, "body": "<!-- auto-coder:local-llm -->", "author": {"login": "kitamura-tetsuo"}, "baseRefName": "main", "head_branch": "issue-5456"}
+    with (
+        patch("src.auto_coder.conflict_resolver.cmd") as commands,
+        patch("src.auto_coder.conflict_resolver.GitHubClient.get_instance") as github,
+        patch("src.auto_coder.conflict_resolver.scan_conflict_markers", return_value=["app.txt"]),
+        patch("src.auto_coder.conflict_resolver.check_mergeability_with_llm") as analysis,
+        patch("src.auto_coder.conflict_resolver.resolve_merge_conflicts_with_llm") as repair,
+        patch("src.auto_coder.conflict_resolver._trigger_fallback_for_conflict_failure") as fallback,
+    ):
+        from src.auto_coder.conflict_resolver import ConflictPublicationDisposition, ConflictResolutionResult
+
+        repair_result = ConflictResolutionResult()
+        repair_result.extend(display_actions)
+        repair_result.disposition = ConflictPublicationDisposition(disposition)
+        repair.return_value = repair_result
+        github.return_value.get_pr_details.return_value = pr
+        commands.run_command.side_effect = [CommandResult(True, "", "", 0)] * 7 + [CommandResult(False, "CONFLICT", "", 1), CommandResult(True, "", "", 0)]
+        assert _perform_base_branch_merge_and_conflict_resolution(5465, "main", AutomationConfig(), pr, "owner/repo") is expected
+    analysis.assert_not_called()
+    assert repair.call_count == 1
+    assert fallback.call_count == int(not expected)
+    assert repair.call_args.args[1] == "app.txt"

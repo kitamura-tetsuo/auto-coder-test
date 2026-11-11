@@ -1,0 +1,539 @@
+"""
+Unit tests for CodexCloudClient.
+"""
+
+from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from auto_coder.cloud_task_client_base import CloudTaskState
+from auto_coder.codex_cloud_client import CodexCloudClient, CodexSubmissionOutcome
+from auto_coder.codex_usage_checker import codex_cloud_quota_allows_task, parse_codex_weekly_usage
+from auto_coder.codex_wham_client import FollowUpDeliveryOutcome, FollowUpDeliveryResult
+from auto_coder.llm_backend_config import BackendConfig, LLMBackendConfiguration, reset_llm_config
+
+
+class TestCodexCloudClient:
+    """Test suite for CodexCloudClient."""
+
+    @pytest.fixture
+    def allow_cloud_task(self):
+        with patch("auto_coder.codex_cloud_client.codex_cloud_quota_allows_task", return_value=True):
+            yield
+
+    @pytest.fixture(autouse=True)
+    def _allow_cloud_task(self, allow_cloud_task):
+        yield
+
+    @pytest.fixture
+    def mock_backend_config(self):
+        """Create mock configuration for codex-cloud."""
+        config = LLMBackendConfiguration()
+        cloud_config = BackendConfig(
+            name="codex-cloud",
+            backend_type="codex-cloud",
+            model="gpt-5.6-terra",
+            api_key="test-codex-key",
+            environment_id="env_12345",
+            attempts=2,
+            options=["--dangerously-bypass-approvals-and-sandbox"],
+        )
+        config.backends["codex-cloud"] = cloud_config
+        return config
+
+    def test_init_loads_config_and_warns_for_ignored_model(self, mock_backend_config):
+        """Test initialization loads configuration."""
+        with (
+            patch("auto_coder.codex_cloud_client.get_llm_config", return_value=mock_backend_config),
+            patch("auto_coder.codex_cloud_client.logger.warning") as warning,
+        ):
+            client = CodexCloudClient("codex-cloud")
+            assert client.backend_name == "codex-cloud"
+            assert client.api_key == "test-codex-key"
+            assert client.environment_id == "env_12345"
+            assert client.attempts == 2
+            assert client.options == ["--dangerously-bypass-approvals-and-sandbox"]
+            warning.assert_called_once_with("Codex Cloud does not support user-selected models; configured model " "'gpt-5.6-terra' for backend 'codex-cloud' is being ignored.")
+
+    @pytest.mark.parametrize("route", ["remote", "codex/tasks", "codex/cloud/tasks"])
+    def test_start_task(self, mock_backend_config, route):
+        """Test starting a Codex Cloud task with codex cloud exec."""
+        with patch("auto_coder.codex_cloud_client.get_llm_config", return_value=mock_backend_config):
+            client = CodexCloudClient("codex-cloud")
+            client.environment_id = "env_12345"
+
+            mock_result = MagicMock()
+            mock_result.returncode = 0
+            mock_result.stdout = f"Task submitted successfully: https://chatgpt.com/{route}/task_e_6aca0ba72ea8832fb8d7b6a369f0f4c3"
+            mock_result.stderr = ""
+
+            with patch("auto_coder.codex_cloud_client.CommandExecutor.run_command", return_value=mock_result) as mock_run:
+                tid = client.start_task(
+                    "Implement GitHub issue #123",
+                    repo_name="owner/repo",
+                    base_branch="main",
+                    title="Feature X",
+                )
+
+                assert tid == "task_e_6aca0ba72ea8832fb8d7b6a369f0f4c3"
+                assert tid in client.active_tasks
+                assert client.task_urls[tid] == "https://chatgpt.com/remote/task_e_6aca0ba72ea8832fb8d7b6a369f0f4c3"
+
+                cmd_args = mock_run.call_args[0][0]
+                assert cmd_args == [
+                    "codex",
+                    "cloud",
+                    "exec",
+                    "--env",
+                    "env_12345",
+                    "--attempts",
+                    "2",
+                    "--branch",
+                    "main",
+                    "--dangerously-bypass-approvals-and-sandbox",
+                    "Implement GitHub issue #123",
+                ]
+
+    def test_configured_model_from_toml_is_ignored_at_cloud_boundaries(self, tmp_path, monkeypatch):
+        """Cloud dispatch ignores the model while status preserves server metadata."""
+        config_path = tmp_path / "llm_config.toml"
+        config_path.write_text(
+            """
+[backends.codex-cloud]
+backend_type = "codex-cloud"
+model = "terra"
+environment_id = "env_from_toml"
+""".strip(),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("AUTO_CODER_CONFIG_PATH", str(config_path))
+        reset_llm_config()
+        start_result = MagicMock(
+            returncode=0,
+            stdout="https://chatgpt.com/codex/tasks/task_e_6a26c19ac8a88326af83ebfb44b89fe2",
+            stderr="",
+        )
+        status_result = MagicMock(
+            returncode=0,
+            stdout=('{"task_id":"task_e_6a26c19ac8a88326af83ebfb44b89fe2",' '"status":"READY","model_version":"sol"}'),
+            stderr="",
+        )
+
+        try:
+            with (
+                patch("auto_coder.codex_cloud_client.logger.warning") as warning,
+                patch(
+                    "auto_coder.codex_cloud_client.CommandExecutor.run_command",
+                    side_effect=[start_result, status_result],
+                ) as run,
+            ):
+                client = CodexCloudClient("codex-cloud")
+                task_id = client.start_task("Implement issue #1716")
+                task = client.get_task(task_id)
+
+            assert task_id == "task_e_6a26c19ac8a88326af83ebfb44b89fe2"
+            assert run.call_args_list[0].args[0] == [
+                "codex",
+                "cloud",
+                "exec",
+                "--env",
+                "env_from_toml",
+                "Implement issue #1716",
+            ]
+            assert run.call_args_list[1].args[0] == ["codex", "cloud", "status", task_id]
+            assert task is not None
+            assert task.state is CloudTaskState.COMPLETED
+            assert task.raw_state == "READY"
+            assert task.error is None
+            assert task.raw_data == {
+                "task_id": task_id,
+                "status": "READY",
+                "model_version": "sol",
+            }
+            warning.assert_called_once_with("Codex Cloud does not support user-selected models; configured model " "'terra' for backend 'codex-cloud' is being ignored.")
+        finally:
+            reset_llm_config()
+
+    def test_start_task_requires_environment_id(self, mock_backend_config):
+        """Codex Cloud submissions must identify their configured environment."""
+        mock_backend_config.backends["codex-cloud"].environment_id = None
+        with patch("auto_coder.codex_cloud_client.get_llm_config", return_value=mock_backend_config):
+            client = CodexCloudClient("codex-cloud")
+            client.environment_id = None
+            with pytest.raises(ValueError, match="environment_id"):
+                client.start_task("Implement the issue")
+
+    def test_start_task_rejects_failed_submission(self, mock_backend_config):
+        """A CLI failure must not be represented by a fabricated task ID."""
+        with patch("auto_coder.codex_cloud_client.get_llm_config", return_value=mock_backend_config):
+            client = CodexCloudClient("codex-cloud")
+            result = MagicMock(returncode=1, stdout="", stderr="environment not found")
+            with patch("auto_coder.codex_cloud_client.CommandExecutor.run_command", return_value=result):
+                with pytest.raises(RuntimeError, match="environment not found"):
+                    client.start_task("Implement the issue")
+
+    @pytest.mark.parametrize("route", ["remote", "codex/tasks", "codex/cloud/tasks"])
+    def test_submission_accepts_valid_identity_from_stderr_despite_nonzero_exit(self, mock_backend_config, route):
+        """Provider identity is stronger evidence than generic CLI diagnostics."""
+        with patch("auto_coder.codex_cloud_client.get_llm_config", return_value=mock_backend_config):
+            client = CodexCloudClient("codex-cloud")
+            result = MagicMock(
+                returncode=1,
+                stdout="A diagnostic was emitted",
+                stderr=f"Accepted: https://chatgpt.com/{route}/task_e_6a26c19ac8a88326af83ebfb44b89fe2",
+            )
+            with patch("auto_coder.codex_cloud_client.CommandExecutor.run_command", return_value=result):
+                submission = client.submit_task("Implement the issue")
+
+        assert submission.outcome is CodexSubmissionOutcome.ACCEPTED
+        assert submission.task_id == "task_e_6a26c19ac8a88326af83ebfb44b89fe2"
+        assert submission.task_url == "https://chatgpt.com/remote/task_e_6a26c19ac8a88326af83ebfb44b89fe2"
+
+    @pytest.mark.parametrize("route", ["remote", "codex/tasks", "codex/cloud/tasks"])
+    def test_submission_formats_selected_id_not_incidental_url(self, mock_backend_config, route):
+        """The explicit provider identity remains authoritative over incidental URLs."""
+        output = f'{{"task_id":"task_e_Selected9","url":"https://chatgpt.com/{route}/task_e_Other8"}}'
+        with patch("auto_coder.codex_cloud_client.get_llm_config", return_value=mock_backend_config):
+            client = CodexCloudClient("codex-cloud")
+            with patch(
+                "auto_coder.codex_cloud_client.CommandExecutor.run_command",
+                return_value=MagicMock(returncode=0, stdout=output, stderr=""),
+            ):
+                submission = client.submit_task("Implement the issue")
+
+        assert submission.task_id == "task_e_Selected9"
+        assert submission.task_url == "https://chatgpt.com/remote/task_e_Selected9"
+        assert client.task_urls == {"task_e_Selected9": submission.task_url}
+
+    def test_started_cli_without_identity_is_indeterminate(self, mock_backend_config):
+        with patch("auto_coder.codex_cloud_client.get_llm_config", return_value=mock_backend_config):
+            client = CodexCloudClient("codex-cloud")
+            result = MagicMock(returncode=1, stdout="", stderr="connection lost")
+            with patch("auto_coder.codex_cloud_client.CommandExecutor.run_command", return_value=result):
+                submission = client.submit_task("Implement the issue")
+
+        assert submission.outcome is CodexSubmissionOutcome.INDETERMINATE
+
+    def test_start_task_rejects_placeholder_task_id(self, mock_backend_config):
+        """A successful CLI exit must not make placeholder output authoritative."""
+        with patch("auto_coder.codex_cloud_client.get_llm_config", return_value=mock_backend_config):
+            client = CodexCloudClient("codex-cloud")
+            result = MagicMock(returncode=0, stdout='{"task_id": "task_fake"}', stderr="")
+            with patch("auto_coder.codex_cloud_client.CommandExecutor.run_command", return_value=result):
+                with pytest.raises(RuntimeError, match="did not return a task ID"):
+                    client.start_task("Implement the issue")
+
+    def test_client_followup_paths_reject_placeholder_task_id(self, mock_backend_config):
+        with patch("auto_coder.codex_cloud_client.get_llm_config", return_value=mock_backend_config):
+            client = CodexCloudClient("codex-cloud")
+            client.wham_client = MagicMock()
+
+            assert client.continue_if_paused("task_fake") is False
+            assert client.send_followup("task_fake", "Fix the PR") is False
+
+        client.wham_client.resolve_latest_assistant_turn.assert_not_called()
+
+    @pytest.mark.parametrize("ambiguous_outcome", [429, None])
+    def test_ambiguous_followup_with_remote_advancement_is_reconciled_without_second_post(self, mock_backend_config, tmp_path, ambiguous_outcome):
+        """A later process observes advancement and reports delivery without replaying work."""
+        with (
+            patch("auto_coder.codex_cloud_client.get_llm_config", return_value=mock_backend_config),
+            patch("auto_coder.codex_cloud_client._codex_followup_state_path", return_value=tmp_path / "followups.json"),
+        ):
+            client = CodexCloudClient("codex-cloud", repo_name="owner/repo")
+            wham = MagicMock()
+            wham.resolve_latest_assistant_turn.return_value = "task_e_123~assttrn_1"
+            wham.reconcile_follow_up.return_value = True
+            wham.send_follow_up.return_value = FollowUpDeliveryResult(FollowUpDeliveryOutcome.INDETERMINATE, ambiguous_outcome)
+            client.wham_client = wham
+
+            assert client.send_followup("task_e_123", "same logical work") is False
+            assert client.send_followup("task_e_123", "same logical work") is True
+
+        wham.send_follow_up.assert_called_once()
+        assert not (tmp_path / "followups.json").read_text(encoding="utf-8").strip() == ""
+
+    def test_ambiguous_followup_without_advancement_remains_deferred(self, mock_backend_config, tmp_path):
+        """Unchanged remote state cannot authorize another non-idempotent POST."""
+        with (
+            patch("auto_coder.codex_cloud_client.get_llm_config", return_value=mock_backend_config),
+            patch("auto_coder.codex_cloud_client._codex_followup_state_path", return_value=tmp_path / "followups.json"),
+        ):
+            client = CodexCloudClient("codex-cloud", repo_name="owner/repo")
+            wham = MagicMock()
+            wham.resolve_latest_assistant_turn.return_value = "task_e_123~assttrn_1"
+            wham.reconcile_follow_up.return_value = None
+            wham.send_follow_up.return_value = FollowUpDeliveryResult(FollowUpDeliveryOutcome.INDETERMINATE, 429)
+            client.wham_client = wham
+
+            assert client.send_followup("task_e_123", "same logical work") is False
+            assert client.send_followup("task_e_123", "same logical work") is False
+            assert client.send_followup("task_e_123", "same logical work") is False
+
+        wham.send_follow_up.assert_called_once()
+
+    def test_ambiguous_followup_with_force_bypasses_indeterminate(self, mock_backend_config, tmp_path):
+        """Force flag allows retrying even when delivery status is indeterminate."""
+        with (
+            patch("auto_coder.codex_cloud_client.get_llm_config", return_value=mock_backend_config),
+            patch("auto_coder.codex_cloud_client._codex_followup_state_path", return_value=tmp_path / "followups.json"),
+        ):
+            client = CodexCloudClient("codex-cloud", repo_name="owner/repo")
+            wham = MagicMock()
+            wham.resolve_latest_assistant_turn.return_value = "task_e_123~assttrn_1"
+            wham.reconcile_follow_up.return_value = None
+            wham.send_follow_up.side_effect = [
+                FollowUpDeliveryResult(FollowUpDeliveryOutcome.INDETERMINATE, 429),
+                FollowUpDeliveryResult(FollowUpDeliveryOutcome.DELIVERED, 200),
+            ]
+            client.wham_client = wham
+
+            assert client.send_followup("task_e_123", "same logical work") is False
+            # Second attempt with force=False is rejected
+            assert client.send_followup("task_e_123", "same logical work", force=False) is False
+            assert wham.send_follow_up.call_count == 1
+            # Third attempt with force=True bypasses the indeterminate check and sends
+            assert client.send_followup("task_e_123", "same logical work", force=True) is True
+            assert wham.send_follow_up.call_count == 2
+
+    def test_stable_identity_reconciles_when_rendered_prompt_changes(self, mock_backend_config, tmp_path):
+        """Mutable branch/head context must not create a second logical request."""
+        with (
+            patch("auto_coder.codex_cloud_client.get_llm_config", return_value=mock_backend_config),
+            patch("auto_coder.codex_cloud_client._codex_followup_state_path", return_value=tmp_path / "followups.json"),
+        ):
+            client = CodexCloudClient("codex-cloud", repo_name="owner/repo")
+            wham = MagicMock()
+            wham.resolve_latest_assistant_turn.return_value = "task_e_123~assttrn_1"
+            wham.reconcile_follow_up.return_value = True
+            wham.send_follow_up.return_value = FollowUpDeliveryResult(FollowUpDeliveryOutcome.INDETERMINATE, 429)
+            client.wham_client = wham
+
+            assert client.send_followup("task_e_123", "repair feedback at head-a", ("feedback-F",)) is False
+            assert client.send_followup("task_e_123", "repair feedback at head-b", ("feedback-F",)) is True
+
+        wham.send_follow_up.assert_called_once()
+
+    def test_confirmed_rejection_remains_retryable_and_success_clears_reservation(self, mock_backend_config, tmp_path):
+        """A proven rejection removes the reservation, while 2xx preserves normal success."""
+        with (
+            patch("auto_coder.codex_cloud_client.get_llm_config", return_value=mock_backend_config),
+            patch("auto_coder.codex_cloud_client._codex_followup_state_path", return_value=tmp_path / "followups.json"),
+        ):
+            client = CodexCloudClient("codex-cloud", repo_name="owner/repo")
+            wham = MagicMock()
+            wham.resolve_latest_assistant_turn.return_value = "task_e_123~assttrn_1"
+            wham.send_follow_up.side_effect = [
+                FollowUpDeliveryResult(FollowUpDeliveryOutcome.NOT_DELIVERED, 400),
+                FollowUpDeliveryResult(FollowUpDeliveryOutcome.DELIVERED, 200),
+            ]
+            client.wham_client = wham
+
+            assert client.send_followup("task_e_123", "same logical work") is False
+            assert client.send_followup("task_e_123", "same logical work") is True
+
+        assert wham.send_follow_up.call_count == 2
+
+    def test_start_task_skips_cli_when_weekly_quota_disallows_it(self, mock_backend_config):
+        with (
+            patch("auto_coder.codex_cloud_client.get_llm_config", return_value=mock_backend_config),
+            patch("auto_coder.codex_cloud_client.codex_cloud_quota_allows_task", return_value=False),
+            patch("auto_coder.codex_cloud_client.CommandExecutor.run_command") as mock_run,
+        ):
+            client = CodexCloudClient("codex-cloud")
+            with pytest.raises(RuntimeError, match="weekly quota"):
+                client.start_task("Implement the issue")
+            mock_run.assert_not_called()
+
+    def test_start_task_preserves_burst_admission_at_execution_gate(self, mock_backend_config):
+        mock_backend_config.quota_selection_strategy = "burst"
+        now = datetime.now(timezone.utc)
+        usage = parse_codex_weekly_usage(
+            {
+                "rateLimits": {
+                    "secondary": {
+                        "usedPercent": 88,
+                        "windowDurationMins": 10_080,
+                        "resetsAt": (now + timedelta(days=2)).timestamp(),
+                    }
+                },
+                "rateLimitResetCredits": {"availableCount": 1},
+            },
+            now=now,
+        )
+        result = MagicMock(
+            returncode=0,
+            stdout="https://chatgpt.com/codex/tasks/task_e_6a26c19ac8a88326af83ebfb44b89fe2",
+            stderr="",
+        )
+        with (
+            patch("auto_coder.codex_cloud_client.get_llm_config", return_value=mock_backend_config),
+            patch("auto_coder.codex_usage_checker.get_codex_weekly_usage", return_value=usage),
+            patch("auto_coder.codex_cloud_client.codex_cloud_quota_allows_task", wraps=codex_cloud_quota_allows_task) as quota_guard,
+            patch("auto_coder.codex_cloud_client.CommandExecutor.run_command", return_value=result) as run_command,
+        ):
+            task_id = CodexCloudClient("codex-cloud").start_task("Implement the issue")
+        assert task_id == "task_e_6a26c19ac8a88326af83ebfb44b89fe2"
+        assert usage.remaining_percent == 12
+        assert usage.minimum_remaining_percent == 15
+        assert usage.reset_credits.available_count == 1
+        quota_guard.assert_called_once_with(strategy="burst")
+        run_command.assert_called_once()
+
+    def test_list_tasks(self, mock_backend_config):
+        """Test listing tasks with codex cloud list --json."""
+        with patch("auto_coder.codex_cloud_client.get_llm_config", return_value=mock_backend_config):
+            client = CodexCloudClient("codex-cloud")
+            client.environment_id = "env_12345"
+
+            list_result = MagicMock()
+            list_result.returncode = 0
+            list_result.stdout = '[{"task_id": "task_e_1", "status": "RUNNING", "title": "Task 1"}, {"task_id": "task_e_2", "status": "READY", "title": "Task 2"}]'
+
+            with patch("auto_coder.codex_cloud_client.CommandExecutor.run_command", return_value=list_result) as mock_run:
+                tasks = client.list_tasks(repo_name="owner/repo")
+                assert len(tasks) == 2
+                assert tasks[0].task_id == "task_e_1"
+                assert tasks[0].state == CloudTaskState.RUNNING
+                assert tasks[0].url == "https://chatgpt.com/remote/task_e_1"
+                assert tasks[1].task_id == "task_e_2"
+                # READY is normalized to COMPLETED
+                assert tasks[1].state == CloudTaskState.COMPLETED
+
+                cmd_args = mock_run.call_args[0][0]
+                assert cmd_args == ["codex", "cloud", "list", "--json", "--env", "env_12345"]
+
+    def test_get_task_status(self, mock_backend_config):
+        """Test get_task executing codex cloud status <TASK_ID>."""
+        with patch("auto_coder.codex_cloud_client.get_llm_config", return_value=mock_backend_config):
+            client = CodexCloudClient("codex-cloud")
+
+            mock_result = MagicMock()
+            mock_result.returncode = 0
+            mock_result.stdout = '{"task_id": "task_e_123", "status": "READY", "title": "Test Task"}'
+
+            with patch("auto_coder.codex_cloud_client.CommandExecutor.run_command", return_value=mock_result) as mock_run:
+                task = client.get_task("task_e_123")
+                assert task is not None
+                assert task.task_id == "task_e_123"
+                assert task.state == CloudTaskState.COMPLETED
+                assert task.title == "Test Task"
+                assert task.url == "https://chatgpt.com/remote/task_e_123"
+
+                cmd_args = mock_run.call_args[0][0]
+                assert cmd_args == ["codex", "cloud", "status", "task_e_123"]
+
+    def test_get_diff(self, mock_backend_config):
+        """Test get_diff executing codex cloud diff <TASK_ID>."""
+        with patch("auto_coder.codex_cloud_client.get_llm_config", return_value=mock_backend_config):
+            client = CodexCloudClient("codex-cloud")
+
+            diff_result = MagicMock()
+            diff_result.returncode = 0
+            diff_result.stdout = "diff --git a/file.py b/file.py\n+new line"
+
+            with patch("auto_coder.codex_cloud_client.CommandExecutor.run_command", return_value=diff_result) as mock_run:
+                diff = client.get_diff("task_e_123")
+                assert "diff --git" in diff
+                cmd_args = mock_run.call_args[0][0]
+                assert cmd_args == ["codex", "cloud", "diff", "task_e_123"]
+
+    def test_apply_changes(self, mock_backend_config):
+        """Test apply_changes executing codex cloud apply <TASK_ID>."""
+        with patch("auto_coder.codex_cloud_client.get_llm_config", return_value=mock_backend_config):
+            client = CodexCloudClient("codex-cloud")
+
+            apply_result = MagicMock()
+            apply_result.returncode = 0
+
+            with patch("auto_coder.codex_cloud_client.CommandExecutor.run_command", return_value=apply_result) as mock_run:
+                success = client.apply_changes("task_e_123")
+                assert success is True
+                cmd_args = mock_run.call_args[0][0]
+                assert cmd_args == ["codex", "cloud", "apply", "task_e_123"]
+
+    def test_continue_if_paused_success(self, mock_backend_config):
+        """Test continue_if_paused resolves latest turn and sends default continuation prompt."""
+        with patch("auto_coder.codex_cloud_client.get_llm_config", return_value=mock_backend_config):
+            client = CodexCloudClient("codex-cloud")
+            mock_wham = MagicMock()
+            mock_wham.resolve_latest_assistant_turn.return_value = "task_e_123~assttrn_1"
+            mock_wham.send_follow_up.return_value = FollowUpDeliveryResult(FollowUpDeliveryOutcome.DELIVERED, 200)
+            client.wham_client = mock_wham
+
+            success = client.continue_if_paused("task_e_123")
+            assert success is True
+            mock_wham.resolve_latest_assistant_turn.assert_called_once_with("task_e_123")
+            mock_wham.send_follow_up.assert_called_once()
+            call_kwargs = mock_wham.send_follow_up.call_args[1]
+            assert call_kwargs["task_id"] == "task_e_123"
+            assert call_kwargs["turn_id"] == "task_e_123~assttrn_1"
+            assert "Review the current pull request status and continue working on it" in call_kwargs["prompt"]
+
+    def test_continue_if_paused_custom_prompt(self, mock_backend_config):
+        """Test continue_if_paused with custom prompt."""
+        with patch("auto_coder.codex_cloud_client.get_llm_config", return_value=mock_backend_config):
+            client = CodexCloudClient("codex-cloud")
+            mock_wham = MagicMock()
+            mock_wham.resolve_latest_assistant_turn.return_value = "task_e_123~assttrn_1"
+            mock_wham.send_follow_up.return_value = FollowUpDeliveryResult(FollowUpDeliveryOutcome.DELIVERED, 200)
+            client.wham_client = mock_wham
+
+            success = client.continue_if_paused("task_e_123", prompt="Custom fix request")
+            assert success is True
+            call_kwargs = mock_wham.send_follow_up.call_args[1]
+            assert call_kwargs["prompt"] == "Custom fix request"
+
+    def test_continue_if_paused_missing_turn_returns_false(self, mock_backend_config):
+        """Test continue_if_paused fails safely when no usable assistant turn exists."""
+        with patch("auto_coder.codex_cloud_client.get_llm_config", return_value=mock_backend_config):
+            client = CodexCloudClient("codex-cloud")
+            mock_wham = MagicMock()
+            mock_wham.resolve_latest_assistant_turn.return_value = None
+            client.wham_client = mock_wham
+
+            assert client.continue_if_paused("task_e_123") is False
+            mock_wham.send_follow_up.assert_not_called()
+
+    def test_continue_if_paused_wham_failure_returns_false(self, mock_backend_config):
+        """Test continue_if_paused returns False when WHAM follow-up send fails."""
+        with patch("auto_coder.codex_cloud_client.get_llm_config", return_value=mock_backend_config):
+            client = CodexCloudClient("codex-cloud")
+            mock_wham = MagicMock()
+            mock_wham.resolve_latest_assistant_turn.return_value = "task_e_123~assttrn_1"
+            mock_wham.send_follow_up.return_value = FollowUpDeliveryResult(FollowUpDeliveryOutcome.NOT_DELIVERED, 400)
+            client.wham_client = mock_wham
+
+            assert client.continue_if_paused("task_e_123") is False
+
+    def test_continue_if_paused_cooldown_prevents_tight_loop(self, mock_backend_config):
+        """Test anti-tight-loop cooldown prevents sending multiple follow-ups in quick succession."""
+        with patch("auto_coder.codex_cloud_client.get_llm_config", return_value=mock_backend_config):
+            client = CodexCloudClient("codex-cloud")
+            mock_wham = MagicMock()
+            mock_wham.resolve_latest_assistant_turn.return_value = "task_e_123~assttrn_1"
+            mock_wham.send_follow_up.return_value = FollowUpDeliveryResult(FollowUpDeliveryOutcome.DELIVERED, 200)
+            client.wham_client = mock_wham
+
+            # First continuation succeeds
+            assert client.continue_if_paused("task_e_123") is True
+            assert mock_wham.send_follow_up.call_count == 1
+
+            # Second continuation immediately afterwards is blocked by cooldown
+            assert client.continue_if_paused("task_e_123") is False
+            assert mock_wham.send_follow_up.call_count == 1
+
+            # Third continuation with force=True bypasses cooldown
+            assert client.continue_if_paused("task_e_123", force=True) is True
+            assert mock_wham.send_follow_up.call_count == 2
+
+    def test_stop_task(self, mock_backend_config):
+        """Test stop_task removes task from active tasks."""
+        with patch("auto_coder.codex_cloud_client.get_llm_config", return_value=mock_backend_config):
+            client = CodexCloudClient("codex-cloud")
+            client.active_tasks["task_to_stop"] = "some prompt"
+
+            stopped = client.stop_task("task_to_stop")
+            assert stopped is True
+            assert "task_to_stop" not in client.active_tasks

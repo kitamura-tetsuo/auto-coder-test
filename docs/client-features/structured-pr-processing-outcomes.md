@@ -1,0 +1,85 @@
+# Structured PR processing outcomes
+
+The dependency-bot processing policy (`IGNORE_DEPENDABOT_PRS`,
+`AUTO_MERGE_DEPENDABOT_PRS`) is enforced by one shared decision
+(`evaluate_dependency_bot_admission` in `src/auto_coder/pr_processor.py`) at
+the common PR-processing boundary in
+`AutomationEngine._process_single_candidate_unified_impl`, immediately after
+the PR author-allowlist check and before any implementation reservation,
+execution, or admission-related PR membership is created. This applies to
+every PR-processing origin -- startup-discovered and webhook-invalidated
+PRs, synchronous `run()` candidates, explicit single-target processing, and
+pending-work/merge-operation resumption -- not only the optional prefilter
+retained in `AutomationEngine._get_candidates` for priority scheduling. When
+`AUTO_MERGE_DEPENDABOT_PRS` is enabled, the common gate re-fetches
+cache-bypassing PR metadata and same-HEAD CI evidence for the current
+evaluation and reconfirms the PR's open/mergeable/HEAD facts again after
+that CI read, rather than reusing whatever the collector or an earlier
+evaluation already decided; a policy refusal is `SKIPPED` with a specific
+reason, while unavailable/incomplete evidence is retryable `DEFERRED`, and
+neither outcome disturbs an already-retained implementation owner.
+
+Codex Cloud pull requests whose authoritative remote head is the shared
+``work`` branch are rejected at the common merge/review boundary before CI,
+adversarial validation, repair delivery, checkout, or merge work. PR metadata
+is refreshed from GitHub without cache before every safety decision; a
+failed or incomplete refresh fails the processing pass closed. The existing
+task is asked to republish from a task-specific branch, retaining linked-Issue
+ownership only when that request succeeds.
+
+PR processing propagates a machine-readable `success`, `deferred`, or `failed`
+outcome through the automation engine. Internal exceptions remain visible in the
+human-readable action diagnostics and are also added to the top-level errors, so
+single-item completion output cannot report a false success. Expected states such
+as red CI, merge gates, and cloud-task waits remain deferred rather than failures.
+
+Reusing an authoritative saved adversarial-validation `ERROR` for the same head
+is also deferred: that evaluation observed an existing merge blocker; it did not
+execute and fail validation again. The saved verdict and review history remain
+unchanged. The worker acknowledges that invalidation evaluation without creating
+an `operational_processing_failure` backoff or a timed validation retry. New
+external invalidations still reevaluate current evidence. A changed head or another
+supported explicit revalidation trigger is required to run validation again;
+the saved `ERROR` never authorizes merge. A newly executed validation error or a
+failure to resolve the reviewer App identity or read the authoritative saved
+result remains a processing failure. This also applies to the early unresolved
+review-thread gate: an identity, native-review or required legacy-fallback read
+failure preserves its original diagnostic and returns failed before ordinary
+provenance waiting or repair delegation. The worker retains that unfinished
+evaluation through its existing operational-failure backoff rather than
+acknowledging it. A successful read with unresolved provenance still defers
+normally without requesting a code repair.
+
+The required legacy fallback uses `get_pr_comments_strict`, which performs a
+fresh read and preserves failures below the public comment reader. A failed
+REST read cannot be interpreted as an empty legacy history. An authenticated
+matching native review remains authoritative without requiring that fallback;
+ordinary informational `get_pr_comments` reads retain their best-effort behavior.
+
+Reaching `MAX_ADVERSARIAL_VALIDATIONS` does not bypass this saved-error wait.
+An applicable same-head `ERROR` still enters the ordinary trigger/reuse decision
+before the review-limit shortcut can grant merge eligibility. Force and eligible
+changed-provenance evidence retain their existing revalidation semantics; an old
+head's `ERROR` does not become an applicable current-head verdict. Other
+review-limit policies remain unchanged.
+
+The `pr.adversarial-validation` stage records this wait as `deferred` with
+`effect=saved-validation-wait`, the exact `examined_head`, `saved_verdict=ERROR`,
+and `reason=saved_error_requires_revalidation_trigger`. The worker also reports
+deferred processing, preserving the distinction from successful PR completion.
+
+The durable worker logs deferred PR processing explicitly, with the action
+diagnostics that explain the wait. Its `Worker` trace carries `outcome=deferred`
+and those actions; a deferred repair is never logged as successfully processed.
+
+A successful exact-head CI evaluation selects the merge route once. If its final
+strong-audit gate is still pending or the merge operation does not confirm
+completion, processing returns a deferred merge disposition and does not fall
+through to CI-failure repair. The existing audit and durable merge-operation state
+remain owned by their normal recovery paths; a later current CI evaluation may
+still independently select CI repair when it establishes an actionable failure.
+
+Codex CLI provider transport failures are classified from structured diagnostic
+events (with a conservative text fallback). Exhausted reconnects defer the
+current target to normal scheduling without consuming an implementation attempt,
+while preserving the provider status and endpoint diagnostic for operators.

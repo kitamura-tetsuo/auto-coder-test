@@ -1,0 +1,26 @@
+# AI Backend Usage Amount CLI
+
+  usage_amount_command:
+    description: "Inspect quota utilization, rate limit windows, and remaining usage for Claude and Codex AI backends."
+    implementation: |
+      usage_amount in src/auto_coder/cli_commands_usage.py,
+      check_claude_usage in src/auto_coder/claude_usage_checker.py,
+      get_codex_weekly_usage in src/auto_coder/codex_usage_checker.py
+    commands:
+      usage_amount:
+        usage: "auto-coder usage-amount [TARGET] [--backend all|claude|codex] [--json] [--no-cache] [--token TOKEN]"
+        description: "Check AI backend quota and usage amounts for Claude (Anthropic OAuth) and Codex (ChatGPT OAuth)."
+        options:
+          - "TARGET: Optional positional argument ('all', 'claude', 'codex', default: 'all')"
+          - "--backend, -b: Target backend option ('all', 'claude', 'codex')"
+          - "--json: Output results in structured JSON format"
+          - "--no-cache: Bypass in-memory cache and fetch fresh usage data"
+          - "--token: Explicit Claude OAuth token to use for verification"
+        behavior:
+          - "Claude: Displays rate-limit windows (5-hour, 7-day, model-specific) with utilization and reset timestamps, reset countdown, active quota strategy, task start allowance, and extra usage status."
+          - "Claude quota caching: Valid quota checks are cached in memory and persisted to `~/.auto-coder/claude_usage_cache.json`. When the Anthropic usage API returns HTTP 429 (rate limit on the usage check endpoint), Auto-Coder falls back to the cached quota instead of marking the backend as quota-insufficient, and HTTP 429 errors do not overwrite valid cache entries."
+          - "Claude credential discovery preserves explicit and environment token precedence, then supports Claude Code's platform storage (including macOS Keychain and `.credentials.json`) after verifying and refreshing an authenticated session through the Claude CLI. Authenticated credential-acquisition failures are reported separately from missing login, while unauthenticated users are directed to `claude auth login`."
+          - "Codex: Displays weekly window utilization and reset timestamp, reset countdown, active quota strategy, reset credits, task start allowance, and when strategy is surplus, detailed surplus availability, required minimum, and current remaining."
+          - "Codex requires a CLI with app-server account/rateLimits/read support (verified with 0.154.0). A short-lived stdio process has a 15-second request deadline and is terminated and reaped after each read. Server output and credentials are not logged."
+          - "Codex selects the codex bucket from rateLimitsByLimitId when supplied, otherwise the single rateLimits view. It selects the longest primary/secondary window of at least 10080 minutes; window position is not fixed. Missing/invalid durations, reset timestamps, or usage percentages make weekly quota unavailable."
+          - "Read-only command that does not require lock acquisition or GitHub authentication."

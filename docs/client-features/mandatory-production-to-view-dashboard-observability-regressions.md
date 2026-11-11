@@ -1,0 +1,223 @@
+# Mandatory production-to-view dashboard observability regressions
+
+Local CI/conflict repair admission emits `pr.repair-delegation` with
+`effect=local-pr-repair-admission`. A healthy first-use namespace can produce a
+durable job even when ordinary Issue dispatch is cloud-only; the facts retain the
+selected local backend, repair kind, admitted/deferred status, job ID, and reason.
+The stage remains `DEFERRED` while the job awaits execution. Corrupt ledgers and
+missing configured local capacity retain explicit refusal reasons with no job ID.
+`tests/test_local_pr_repair_admission_regression.py` drives the production producer,
+real configuration and SQLite stores, and mounted detail projection for CI,
+conflict, corrupt-storage, and disabled-backend cases. Run
+`bash scripts/test.sh tests/test_local_pr_repair_admission_regression.py`.
+
+Explicit PR restart attachment uses that stage with `admission_status=retained`
+and `execution_restored`, retaining the original job/backend identity and a
+deferred outcome. `tests/test_local_pr_repair_recovery.py` drives the production
+explicit entry through the real runner/finalizer and mounted detail view, covering
+Issue and standalone owners, missing execution recovery, and `--force` without a
+second offer. Refused or indeterminate recovery cannot imply publication or
+merge completion. Run `bash scripts/test.sh tests/test_local_pr_repair_recovery.py`.
+
+An explicit Issue retry can retire an unfinished local predecessor only with
+positive runner and writer-group settlement. Production emits
+`issue.retry-predecessor-retirement` as `superseded`, retaining request, job,
+and execution identities separately from `issue.manual-retry` authorization.
+`tests/test_stopped_issue_retry.py` crosses the production admission path and
+mounted detail view for both running and paused predecessors, and verifies that
+live/unknown writers, concurrent resume/results, and unreadable evidence cannot
+authorize replacement. Run `bash scripts/test.sh tests/test_stopped_issue_retry.py`.
+
+`tests/test_muse_retained_result.py` recovers a retained candidate through the
+production Issue resume route without another editing-model call and verifies
+that `llm.muse-retained-task-reconciliation` reaches the mounted Issue detail
+view. Its live MSP counterpart covers writer settlement and the result checkpoint;
+the mounted-view route includes 174 predecessors and a native omitted-output
+marker, while the durable-positive fixture includes all 375 markers from #5629.
+missing/contradictory predecessor evidence remains non-authorizing. Run
+`bash scripts/test.sh tests/test_muse_retained_result.py`.
+
+Explicit Issue session resumption emits `issue.local-session-resume` within the
+requested Issue execution. `tests/test_explicit_issue_resume.py` drives the
+production Muse continuation and verifies that its completion reaches the
+mounted Issue detail view; refusal and publication-only replay retain their
+actual outcomes without a fresh dispatch event. Run `bash scripts/test.sh
+tests/test_explicit_issue_resume.py` for this boundary.
+
+Codex retry receipt reconstruction can bind an accepted task to its pre-send
+reservation before CI repair delivery. Binding does not emit success; the existing
+`Codex Cloud Feedback` trace remains conditional on confirmed delivery, and
+rejected identities retain deferred diagnostics. The production reconstruction
+and CI delivery regressions and runnable command are recorded in
+`docs/dashboard-observability.md`; no renderer or trace schema changes are needed.
+
+Automatic submitted-parent processing emits `issue.hierarchy-admission` as
+`deferred` after persisting independent open-child obligations. Its facts list
+`child_issue_numbers` and `authorizes_execution=false`; it establishes queue
+handoff only. `test_daemon_parent_child_handoff_reaches_mounted_detail` verifies
+the real production emission through the mounted parent detail view.
+Shutdown before handoff emits the same deferred hierarchy stage with its reason
+and no list of handed-off children. The graceful-shutdown regression preserves
+the parent's retryable obligation after joining the running validation batch.
+
+Merge-operation resume executions retain the stored repository identity and refuse
+foreign work before trace creation. Failed or deferred refreshes keep those
+outcomes while retry deadlines prevent rapid repeated executions; pacing is not
+merge completion. The shared-store collision and restart-pacing regression commands
+are recorded in `docs/dashboard-observability.md`. The existing generic detail view
+and superseded-resumption regression remain applicable without schema changes.
+
+Accepted ordinary closure exposes GitHub thread completion separately from the
+FIXED/INVALID validation evidence. The production consumer emits the existing
+`pr.review-thread-closure` stage with confirmed/unfinished counts and exact failure
+phases, using `effect="accepted-ordinary-closure"`. Failed effects keep closure
+bookkeeping pending and appear as `BLOCKED` in the existing timeline. The
+parametrized production regression and runnable command are recorded in
+`docs/dashboard-observability.md`; no dashboard renderer or schema change is
+required.
+
+Canonical concern-ID delivery and unfinished ordinary thread closure are covered
+by `test_canonical_concern_ids_reach_ordinary_review_and_control_merge` in
+`tests/test_single_review_ordinary_closure_flow.py`. An unmatched concern ID keeps
+the existing `pr.review-thread-closure` event BLOCKED with the exact thread,
+independent-decision phase, and unattempted effect; a semantic PASS never emits
+merge completion for that run. Matching current evidence closes the thread and
+reaches merge; same-head reentry needs no additional reviewer. Scope lookup
+failure uses the existing review-wait stage. No trace schema or dashboard renderer
+change is required; see the runnable inventory in `docs/dashboard-observability.md`.
+
+Local PR conflict repair uses the existing `pr.mergeability-remediation` stage:
+confirmed repair publication is `COMPLETED` with `result=success`, and failed
+repair is `FAILED` with `result=failed`. A staged index or leftover conflict
+markers never justify completion or a degrading-merge verdict. The generic
+dashboard detail projection and structured schema remain unchanged.
+`tests/test_cloud_conflict_delegation.py::test_local_conflict_repair_emits_confirmed_remediation_outcome`
+checks both production outcomes; the real Git/private-workspace checks and run
+command are recorded in `docs/dashboard-observability.md`.
+
+Local Issue PR recovery uses the existing commit/push and PR-publication stages.
+Successful publication of existing commits is `COMPLETED`; an empty base diff
+is `SKIPPED` for commit/push and `BLOCKED` for PR publication, with a reason in
+the stage facts. Fetch, inspection, and push errors remain `FAILED`.
+`TestKeepLabelOnPRCreation` in `tests/test_issue_processor.py` exercises these
+production boundaries; see the Local Issue publication admission inventory in
+`docs/dashboard-observability.md` and
+`local-issue-pr-publication-recovery.md`.
+
+Dashboard observability is protected by deterministic tests in the ordinary PR
+shards and by a documented `scripts/test.sh` invocation. The maintained coverage
+inventory maps processing, validation, resumption, CI, merge, and asynchronous
+origins to concrete collected tests. Joined regressions execute production entry
+points, consume the real structured collector snapshot through the mounted detail
+view, and independently assert business outcomes. Negative controls reject missing
+emissions, scope reattribution, evidence coercion, and false completion while the
+generic renderer continues to accept new or repeated stages without a node map.
+
+Runtime owner-lock timeouts reach the mounted detail view as a deferred
+implementation-admission stage and a deferred execution outcome, including the
+operational reason. They do not imply implementation success or specification
+rejection. `test_owner_lock_timeout_defers_and_retries_with_mounted_evidence`
+holds the real owner lock, exercises the shared processing boundary, checks the
+mounted view and item identity, and verifies admission after the lock is released.
+
+Shared GitHub admission tickets remain operational capacity evidence. Queue waits
+and ticket release never create a dashboard execution or imply provider progress.
+The `admission_queue` refusal uses the existing typed `Deferred` result and durable
+pending-work handoff. Governor process-order regressions and the production wrapped
+reconciliation regression are recorded in `docs/dashboard-observability.md`; the
+processing trace schema and rendered outcome meanings remain unchanged.
+
+Parent relationship transport failures reach the mounted detail view through
+`issue.parent-reconciliation` as deferred, with the original reason and delivery
+certainty. `test_parent_transport_failure_reaches_mounted_detail` drives the real
+reconciliation wrapper and verifies that implementation never starts and the
+execution stays deferred. Indeterminate delivery remains visible as retained
+operational work rather than implementation completion.
+
+Initial implementation-clone tests emit `local.workspace-tests` before the
+provider runs. The shared BackendManager dispatch emits `llm.local-execution`
+immediately before calling a local client, with matching start logs and a
+completed/failed result on return/error. The mounted-view regression
+`test_local_llm_dispatch_reaches_mounted_detail_before_return` verifies pending
+visibility, caller identity, local aliases, continuation, error pairing and cloud
+exclusion. Dispatch is not a provider-liveness or implementation-success claim.
+Unexpected Muse approval or user-input requests emit
+`llm.muse-interactive-request` with a blocked outcome instead of remaining hidden
+until the invocation timeout. The mounted detail view presents these observed
+stages under the caller's execution identity. Initial-test completion never means
+implementation completion; a failed test baseline and a blocked provider request
+remain distinct. Raw command and approval-subject text is excluded from these
+facts. `test_muse_initial_tests_and_interactive_refusal_reach_mounted_detail`
+drives both real producers through an executable MSP host and checks the mounted
+view, outcomes, exact identity, exit code, and absence of sensitive subject text.
+
+Two inventory rows previously cited pre-existing tests that never actually
+exercised the diagnostic trace they were listed against: validation-publication
+resumption pointed at a durable-effect test that does not touch `TraceCollector`,
+and asynchronous PR adversarial validation pointed at a test that mocks out
+`_handle_pr_merge` (the function that emits `pr.adversarial-validation`) entirely.
+`tests/test_dashboard_observability.py::TestNewOriginCoverage` now drives both
+production handlers for real and reads their diagnostic trace back, and the
+inventory keeps the original citations alongside the new ones since they still
+cover the durable-effect/business-behavior contract. The same file's
+`TestOutcomeMatrixCoverage` also adds the previously-unexercised `known_empty`,
+`partial`, `throttled`, and `superseded` CI-availability values, ordinary-cloud
+routing to the Claude Routine and Codex Cloud backend types, corrective work
+accepted without a repair claim, and queued-vs-disabled-vs-blocked validation;
+`TestJoinedProductionToView` and `TestAdditionalNegativeAndMutationControls` add
+production-to-mounted-view coverage for PR/merge-operation resumption, an
+accepted handoff without PR publication, a validation job as its own execution,
+two concurrently processed Issues never sharing or swapping execution identity,
+and unavailable CI evidence reaching the mounted view as an explicit `unknown`
+outcome rather than a coerced boolean.
+
+Local review correction exposes the pending allowance generation through the
+existing repair-delegation stage's `local_phase=awaiting_validation` fact and
+continues to scoped verification of only unsettled covered targets. Its
+`effect=local-validation-scoped` facts include the generation, exact head,
+unverified count, and each unverified target's identity and reason. Incomplete
+verification is `BLOCKED`; publication or settlement failure is `FAILED`, with
+the local route, retained phase and reason visible in the generic detail table.
+The local repair generation revalidation inventory in
+`docs/dashboard-observability.md` records the regression commands; the trace
+schema and renderer remain unchanged.
+That inventory also covers already-resolved original repair roots while excluding
+unrelated findings. A production-to-mounted-view regression asserts that an
+omitted verification target remains pending and is visible with the same identity
+and reason in both the dashboard and the GitHub native review. Completed scoped
+verification remains a deferred processing result and does not imply merge approval.
+
+Interrupted local review correction emits `pr.local-repair-recovery` with
+`DEFERRED`, the attempt identity, dead owner PID, next local phase, and preserved
+workspace. `test_interrupted_local_repair_recovery_reaches_mounted_detail` in
+`tests/test_dashboard_observability.py` runs recovery through the production
+executor and generic mounted detail projection. It checks a real exited owner,
+exact event facts, and absence of a second recovery on completed replay. Recovery
+is admission evidence and does not imply correction or merge success.
+
+Local Issue workspace preparation fetches the configured remote base branch for
+new attempts and retries. The existing local completion and publication
+finalization stages retain their origins and outcome schema. The explicit-local
+completion regression now exercises stale shared HEAD, a retry attempt, and
+fetch failure through the production runner and mounted detail: failed fetch
+shows FAILED with no provider entry or publication, while successful publication
+is checked against the fetched remote parent commit. See the local Issue entries
+in `docs/dashboard-observability.md`; no renderer change is needed.
+
+Authenticated accepted-source release dispatch remains in the standalone management
+operation journal, outside Issue/PR trace collection. Its authenticated projection
+keeps workflow HEAD, selected source, verified source promotion and worker deployment
+separate, including after lost replies and restart. No dashboard deployment success
+is emitted. The production-boundary regression command and concrete neutrality
+assessment are recorded in `docs/dashboard-observability.md` and the action schema
+in `management-source-release-dispatch.md`.
+
+Prospective original management-attempt capture is a host diagnostic origin with
+no Issue/PR execution or dashboard job. Its structured Loguru boundary facts are
+covered by `test_original_admission_trace_retains_boundaries_without_recovery_success`
+in `tests/test_management_original_attempts.py`; the real producer preserves
+`evidence_only=true`, exact history/attempt/boundary and source locations. The
+production-to-view assessment in `docs/dashboard-observability.md` leaves the
+view/schema unchanged: enrollment, possible grants and unavailable legacy
+coverage cannot appear as recovery success. Run `bash scripts/test.sh
+--ci-tests-only tests/test_management_original_attempts.py`.

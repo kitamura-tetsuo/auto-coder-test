@@ -1,0 +1,200 @@
+"""Fail-safe Codex weekly quota checks for Codex Cloud submissions."""
+
+import base64
+import json
+import math
+import os
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Mapping, Optional, TypeGuard
+
+from .codex_app_server import read_account_data
+from .logger_config import get_logger
+
+logger = get_logger(__name__)
+
+WEEK_SECONDS = 7 * 24 * 60 * 60
+
+
+@dataclass(frozen=True)
+class CodexOAuthCredentials:
+    access_token: str = ""
+    account_id: str = ""
+
+
+@dataclass(frozen=True)
+class CodexResetCredits:
+    """Read-only reset-credit state returned with the Codex usage response."""
+
+    available_count: Optional[int] = None
+    status: str = "missing"
+
+
+@dataclass(frozen=True)
+class CodexWeeklyUsage:
+    remaining_percent: float = 0.0
+    reset_at: datetime = datetime.min.replace(tzinfo=timezone.utc)
+    days_until_reset: int = 0
+    minimum_remaining_percent: float = 5.0
+    reset_credits: CodexResetCredits = field(default_factory=CodexResetCredits)
+
+    @property
+    def has_remaining_quota(self) -> bool:
+        """Return whether the provider reports usable ordinary weekly quota."""
+        return self.remaining_percent > 0.0
+
+    @property
+    def meets_reserve_threshold(self) -> bool:
+        """Return whether quota meets the conservative surplus-policy reserve."""
+        return self.remaining_percent >= self.minimum_remaining_percent
+
+    @property
+    def can_start_task(self) -> bool:
+        """Retain the established surplus-policy decision for usage reporting."""
+        return self.meets_reserve_threshold
+
+    def allows_task(self, strategy: str = "surplus") -> bool:
+        """Apply the admission rule for the configured quota strategy."""
+        if strategy == "burst":
+            return self.has_remaining_quota
+        if strategy == "surplus":
+            return self.meets_reserve_threshold
+        raise ValueError(f"Unsupported quota selection strategy: {strategy}")
+
+
+def _codex_auth_path() -> Path:
+    """Return the Codex-managed auth file, respecting an isolated CODEX_HOME."""
+    codex_home = os.environ.get("CODEX_HOME")
+    return Path(codex_home).expanduser() / "auth.json" if codex_home else Path.home() / ".codex" / "auth.json"
+
+
+def _token_expiry(access_token: str) -> Optional[datetime]:
+    """Read a JWT expiry without validating or exposing the token."""
+    try:
+        payload = access_token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        decoded = json.loads(base64.urlsafe_b64decode(payload))
+        expiry = decoded.get("exp")
+        if isinstance(expiry, (int, float)):
+            return datetime.fromtimestamp(expiry, tz=timezone.utc)
+    except (IndexError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+    return None
+
+
+def load_codex_oauth_credentials(now: Optional[datetime] = None) -> Optional[CodexOAuthCredentials]:
+    """Load ChatGPT credentials managed by Codex, never the OpenAI API key."""
+    try:
+        raw = json.loads(_codex_auth_path().read_text(encoding="utf-8"))
+        tokens = raw.get("tokens")
+        if not isinstance(tokens, dict):
+            return None
+        access_token = tokens.get("access_token")
+        account_id = tokens.get("account_id")
+        if not isinstance(access_token, str) or not access_token or not isinstance(account_id, str) or not account_id:
+            return None
+        expiry = _token_expiry(access_token)
+        current_time = now or datetime.now(timezone.utc)
+        if expiry is not None and expiry <= current_time:
+            logger.warning("Codex ChatGPT OAuth credentials are expired; weekly usage check is unavailable")
+            return None
+        return CodexOAuthCredentials(access_token=access_token, account_id=account_id)
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+
+
+def _mapping(value: object) -> Optional[Mapping[str, object]]:
+    return value if isinstance(value, dict) else None
+
+
+def _finite_number(value: object) -> TypeGuard[int | float]:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def parse_codex_weekly_usage(payload: Mapping[str, object], now: Optional[datetime] = None) -> CodexWeeklyUsage:
+    """Parse the longest rate-limit window as the weekly Codex quota window."""
+    buckets = _mapping(payload.get("rateLimitsByLimitId"))
+    if payload.get("rateLimitsByLimitId") is not None and buckets is None:
+        raise ValueError("invalid Codex quota buckets")
+    rate_limit = _mapping(buckets.get("codex")) if buckets is not None else _mapping(payload.get("rateLimits"))
+    if rate_limit is not None and rate_limit.get("limitId") not in (None, "codex"):
+        raise ValueError("Codex quota bucket is unavailable")
+    if rate_limit is None:
+        raise ValueError("missing Codex rate limits")
+
+    windows = []
+    for name in ("primary", "secondary"):
+        window = _mapping(rate_limit.get(name))
+        if window is not None:
+            duration = window.get("windowDurationMins")
+            if _finite_number(duration):
+                windows.append((float(duration), window))
+    if not windows:
+        raise ValueError("missing rate-limit windows")
+
+    duration, weekly = max(windows, key=lambda item: item[0])
+    if duration < WEEK_SECONDS / 60:
+        raise ValueError("weekly rate-limit window is unavailable")
+    used_percent = weekly.get("usedPercent")
+    reset_timestamp = weekly.get("resetsAt")
+    if not _finite_number(used_percent) or not _finite_number(reset_timestamp):
+        raise ValueError("invalid weekly usage values")
+    if not 0 <= float(used_percent) <= 100:
+        raise ValueError("weekly usedPercent is out of range")
+
+    reset_at = datetime.fromtimestamp(float(reset_timestamp), tz=timezone.utc)
+    current_time = now or datetime.now(timezone.utc)
+    days_until_reset = max(0, int((reset_at - current_time).total_seconds() // 86400))
+    threshold = float((days_until_reset + 1) * 5)
+    credit_value = payload.get("rateLimitResetCredits")
+    credit_mapping = _mapping(credit_value)
+    if credit_mapping is None:
+        credit_status = "missing" if credit_value is None else "malformed"
+        reset_credits = CodexResetCredits(status=credit_status)
+    else:
+        available_count = credit_mapping.get("availableCount")
+        if isinstance(available_count, int) and not isinstance(available_count, bool) and available_count >= 0:
+            reset_credits = CodexResetCredits(available_count=available_count, status="available")
+        else:
+            reset_credits = CodexResetCredits(status="malformed")
+
+    return CodexWeeklyUsage(
+        remaining_percent=100.0 - float(used_percent),
+        reset_at=reset_at,
+        days_until_reset=days_until_reset,
+        minimum_remaining_percent=threshold,
+        reset_credits=reset_credits,
+    )
+
+
+def get_codex_account_type() -> Optional[str]:
+    """Distinguish confirmed API-key authentication from unavailable usage."""
+    try:
+        account = _mapping(read_account_data("account/read").get("account"))
+        account_type = account.get("type") if account is not None else None
+        return account_type if isinstance(account_type, str) else None
+    except (OSError, EOFError, ValueError, TypeError):
+        return None
+
+
+def get_codex_weekly_usage(now: Optional[datetime] = None) -> Optional[CodexWeeklyUsage]:
+    """Read weekly usage through Codex-managed authentication; fail closed."""
+    try:
+        return parse_codex_weekly_usage(read_account_data("account/rateLimits/read"), now=now)
+    except (OSError, EOFError, ValueError, TypeError, OverflowError) as error:
+        logger.warning(f"Codex app-server weekly usage check failed: {type(error).__name__}")
+        return None
+
+
+def codex_cloud_quota_allows_task(strategy: str = "surplus") -> bool:
+    """Check Codex Cloud admission using the selected quota policy."""
+    usage = get_codex_weekly_usage()
+    if usage is None:
+        return False
+    allows_task = usage.allows_task(strategy)
+    decision = "start" if allows_task else "skip"
+    credits = usage.reset_credits.available_count
+    credits_display = str(credits) if credits is not None else f"unavailable ({usage.reset_credits.status})"
+    logger.info(f"Codex weekly quota: remaining={usage.remaining_percent:.1f}%, " f"reset_at={usage.reset_at.isoformat()}, days_until_reset={usage.days_until_reset}, " f"required={usage.minimum_remaining_percent:.1f}%, strategy={strategy}, reset_credits={credits_display}, decision={decision}")
+    return allows_task

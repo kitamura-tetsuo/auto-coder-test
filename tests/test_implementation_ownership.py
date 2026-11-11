@@ -1,0 +1,1709 @@
+"""Production-boundary regressions for Issue #2061: bind Implementation
+generations to durable production ownership acquisition.
+
+Part 1 exercises :mod:`auto_coder.implementation_ownership` directly against
+real ``ImplementationSlotRepository``/``IssueStageRoutingStore`` instances
+(both file/DB backed) to pin down every REQ-001 through REQ-008 decision
+branch cheaply and precisely.
+
+Part 2 drives the real production admission boundary
+(``AutomationEngine._process_single_candidate_unified`` and
+``issue_processor.handle_stale_jules_issue_sessions``) so the REQ-010
+regressions demonstrate the handoff crossing its actual supported origins
+rather than directly constructing an owned routing record.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import concurrent.futures
+import json
+import threading
+import time
+from contextlib import ExitStack, nullcontext
+from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from auto_coder.automation_config import AutomationConfig, Candidate, CandidateProcessingResult, ExplicitTargetOutcome
+from auto_coder.automation_engine import AutomationEngine
+from auto_coder.cloud_manager import CloudManager
+from auto_coder.codex_cloud_client import CodexSubmissionOutcome, CodexSubmissionResult
+from auto_coder.execution_trace import Outcome, get_trace_collector
+from auto_coder.implementation_ownership import (
+    OwnershipStartDecision,
+    begin_implementation_ownership,
+    confirm_implementation_ownership,
+    evaluate_implementation_start,
+)
+from auto_coder.implementation_slots import (
+    ImplementationOwner,
+    ImplementationSlotRepository,
+    ImplementationSlotUnavailable,
+)
+from auto_coder.issue_dispatch import DispatchOutcome, IssueAttemptIdentity, IssueDispatchGuard
+from auto_coder.issue_implementation_service import IssueImplementationService
+from auto_coder.issue_job_finalizer import IssueJobFinalizer
+from auto_coder.issue_job_workspace import IssueJobSource, IssueJobWorkspaceProducer
+from auto_coder.issue_local_job import IssueLocalJobAdapter, issue_job_authorization_ports
+from auto_coder.issue_processor import handle_stale_jules_issue_sessions
+from auto_coder.issue_stage_routing import IssueStageRoutingStore
+from auto_coder.llm_backend_config import LLMBackendConfiguration
+from auto_coder.local_job_handoff import InvocationOutcome, LocalJobClaim, LocalJobKind, LocalJobState, LocalJobStore
+from auto_coder.local_job_runner import LocalJobExecutionResult, LocalJobRunner
+from auto_coder.retry_dispatch import RetryDispatchRepository
+from auto_coder.specification_analyzer import SpecificationAnalysisResult
+from auto_coder.specification_validation_lifecycle import SpecificationValidationLifecycle
+from auto_coder.stale_jules_recovery import capture_stale_jules_recovery, find_pending_stale_jules_recovery
+from auto_coder.util.gh_cache import GitHubClient
+from tests.test_issue_job_workspace import git, repository
+from tests.test_issue_stage_routing import REPO, _routing_engine
+
+ISSUE = ImplementationOwner("issue", 1)
+
+
+def _stores(tmp_path):
+    slots = ImplementationSlotRepository(REPO, 1, tmp_path / "slots.json")
+    routing = IssueStageRoutingStore(tmp_path / "routing.sqlite3")
+    return slots, routing
+
+
+# ---------------------------------------------------------------------------
+# Part 1: adapter decision unit coverage (REQ-001 through REQ-008)
+# ---------------------------------------------------------------------------
+
+
+def test_fresh_owner_starts_new_and_confirm_tombstones_generation(tmp_path):
+    """REQ-002, REQ-003: a fresh owner may start, and acquisition is the durable execution."""
+    slots, routing = _stores(tmp_path)
+    gate = evaluate_implementation_start(routing, slots, REPO, ISSUE, "g1")
+    assert gate.decision is OwnershipStartDecision.START_NEW and gate.may_start
+    begin_implementation_ownership(routing, REPO, ISSUE, gate)
+    assert not routing.is_implementation_owned(REPO, 1, "g1")
+
+    execution_id = slots.start_execution(ISSUE, generation="g1")
+    assert execution_id is not None
+    # Before the tombstone write, the execution alone already qualifies
+    # (REQ-003): a hypothetical crash here would still be recoverable.
+    assert slots.implementation_generation(ISSUE) == "g1"
+    assert not routing.is_implementation_owned(REPO, 1, "g1")
+
+    confirm_implementation_ownership(routing, REPO, ISSUE, "g1")
+    assert routing.is_implementation_owned(REPO, 1, "g1")
+
+
+def test_bare_idle_reservation_does_not_own_generation(tmp_path):
+    """REQ-002: a bare capacity reservation with no execution/session/PR is not an owned start."""
+    slots, routing = _stores(tmp_path)
+    assert slots.reserve_new(ISSUE)
+    assert not slots.has_qualifying_implementation_activity(ISSUE)
+    gate = evaluate_implementation_start(routing, slots, REPO, ISSUE, "g1")
+    assert gate.decision is OwnershipStartDecision.START_NEW
+
+
+def test_confirmed_non_start_continues_without_erasing_historical_ownership(tmp_path):
+    slots, routing = _stores(tmp_path)
+    execution = slots.start_execution(ISSUE, generation="g1")
+    assert execution is not None
+    confirm_implementation_ownership(routing, REPO, ISSUE, "g1")
+    slots.finish_execution(ISSUE, execution)
+    assert evaluate_implementation_start(routing, slots, REPO, ISSUE, "g1").decision is OwnershipStartDecision.ALREADY_OWNED
+    routing.record_implementation_not_started(REPO, 1, "g1", "workspace failed before provider call")
+    assert routing.is_implementation_owned(REPO, 1, "g1")
+    assert evaluate_implementation_start(routing, slots, REPO, ISSUE, "g1").decision is OwnershipStartDecision.CONTINUE
+    assert evaluate_implementation_start(routing, slots, REPO, ISSUE, "g2").decision is OwnershipStartDecision.SUPERSEDE
+    confirm_implementation_ownership(routing, REPO, ISSUE, "g1")
+    assert not routing.implementation_not_started(REPO, 1, "g1")
+    assert evaluate_implementation_start(routing, slots, REPO, ISSUE, "g1").decision is OwnershipStartDecision.ALREADY_OWNED
+
+
+def test_normal_admission_resumes_confirmed_non_start_without_only(tmp_path, monkeypatch):
+    snapshot = _standalone_snapshot(1, (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat())
+    config = AutomationConfig(repo_name=REPO)
+    config.issue_specification_validation = True
+    config.issue_decomposition_validation = False
+    engine, github = _ready_engine(tmp_path, monkeypatch, {1: snapshot}, config)
+    github.get_issue_comments_strict.return_value = []
+    reserved = MagicMock(
+        side_effect=[
+            CandidateProcessingResult(type="issue", number=1, success=False, actions=["not started"], error="all candidates confirmed not started", cloud_submission_not_started=True),
+            CandidateProcessingResult(type="issue", number=1, success=True, actions=["dispatched"]),
+        ]
+    )
+    engine._process_single_candidate_reserved = reserved
+    generation = engine._compute_implementation_generation(REPO, snapshot, None)
+    first = engine._process_single_candidate_unified(REPO, Candidate("issue", dict(snapshot), 0), config, origin="worker")
+    assert first.success is False
+    assert engine.issue_stage_routing.implementation_not_started(REPO, 1, generation)
+    assert engine.issue_stage_routing.is_implementation_owned(REPO, 1, generation)
+    snapshot_trace = get_trace_collector().get_snapshot(repository=REPO, item_type="issue", item_number=1)
+    receipts = [event for event in snapshot_trace.events if event.stage_id == "issue.implementation-not-started"]
+    assert len(receipts) == 1
+    assert receipts[0].outcome == Outcome.DEFERRED.value
+    assert receipts[0].facts == {"generation": generation, "reason": "all candidates confirmed not started", "provider_started": False}
+    result = engine._process_single_candidate_unified(REPO, Candidate("issue", dict(snapshot), 0), config, origin="worker")
+    assert result.success is True
+    assert reserved.call_count == 2
+    assert engine.issue_stage_routing.is_implementation_owned(REPO, 1, generation)
+    assert not engine.issue_stage_routing.implementation_not_started(REPO, 1, generation)
+
+
+def test_unknown_truthy_nonstart_does_not_authorize_a_second_dispatch(tmp_path, monkeypatch):
+    snapshot = _standalone_snapshot(1, (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat())
+    config = AutomationConfig(repo_name=REPO)
+    config.issue_specification_validation = True
+    config.issue_decomposition_validation = False
+    engine, github = _ready_engine(tmp_path, monkeypatch, {1: snapshot}, config)
+    github.get_issue_comments_strict.return_value = []
+    unknown_result = MagicMock(spec=CandidateProcessingResult, actions=[])
+    reserved = MagicMock(return_value=unknown_result)
+    engine._process_single_candidate_reserved = reserved
+    generation = engine._compute_implementation_generation(REPO, snapshot, None)
+    result = engine._process_single_candidate_unified(REPO, Candidate("issue", dict(snapshot), 0), config, origin="worker")
+    assert result is unknown_result
+    assert not engine.issue_stage_routing.implementation_not_started(REPO, 1, generation)
+    assert engine.issue_stage_routing.is_implementation_owned(REPO, 1, generation)
+    duplicate = engine._process_single_candidate_unified(REPO, Candidate("issue", dict(snapshot), 0), config, origin="worker")
+    assert duplicate.target_outcome is ExplicitTargetOutcome.DEFERRED
+    assert duplicate.actions == ["Deferred - implementation ownership already exists (issue:1)"]
+    assert reserved.call_count == 1
+
+
+def test_finishing_execution_does_not_erase_binding_before_tombstone(tmp_path):
+    """REQ-004: reclaiming/finishing a local execution must not lose the captured generation."""
+    slots, routing = _stores(tmp_path)
+    execution_id = slots.start_execution(ISSUE, generation="g1")
+    assert execution_id is not None
+    slots.finish_execution(ISSUE, execution_id)
+    assert not slots.has_qualifying_implementation_activity(ISSUE)
+    assert slots.implementation_generation(ISSUE) == "g1"
+
+    # Recovery (e.g. after a restart) must recompute CONTINUE from the
+    # captured binding, not treat the now-idle owner as a fresh attempt.
+    gate = evaluate_implementation_start(routing, slots, REPO, ISSUE, "g1")
+    assert gate.decision is OwnershipStartDecision.CONTINUE
+    confirm_implementation_ownership(routing, REPO, ISSUE, "g1")
+    assert routing.is_implementation_owned(REPO, 1, "g1")
+
+
+def test_idle_bound_and_tombstoned_owner_refuses_duplicate_start(tmp_path):
+    """REQ-006: once G is both durably tombstoned and fully idle (no retained
+    execution/session/PR), a duplicate wake must not start G again.
+
+    This is the case ``test_finishing_execution_does_not_erase_binding_before_tombstone``
+    does not cover: there, the tombstone is not yet durable, so CONTINUE
+    correctly re-establishes it. Once the tombstone *is* durable and nothing
+    is left retained, the owner is idle rather than mid-attempt, and the
+    same ``existing_generation == generation`` match must resolve to
+    ALREADY_OWNED instead of CONTINUE.
+    """
+    slots, routing = _stores(tmp_path)
+    execution_id = slots.start_execution(ISSUE, generation="g1")
+    assert execution_id is not None
+    confirm_implementation_ownership(routing, REPO, ISSUE, "g1")
+    slots.finish_execution(ISSUE, execution_id)
+    assert not slots.has_qualifying_implementation_activity(ISSUE)
+    assert slots.implementation_generation(ISSUE) == "g1"
+    assert routing.is_implementation_owned(REPO, 1, "g1")
+
+    gate = evaluate_implementation_start(routing, slots, REPO, ISSUE, "g1")
+    assert gate.decision is OwnershipStartDecision.ALREADY_OWNED
+    assert not gate.may_start
+
+    # Retained evidence for the same generation (e.g. a provider session
+    # still in flight) makes it a genuine continuation once again.
+    assert slots.record_provider_session(ISSUE, "still-running")
+    resumed_gate = evaluate_implementation_start(routing, slots, REPO, ISSUE, "g1")
+    assert resumed_gate.decision is OwnershipStartDecision.CONTINUE
+
+
+def test_ordinary_duplicate_reports_honest_unknown_evidence_and_trace(tmp_path, monkeypatch):
+    """#2484 REQ-001/005: production admission stays skipped when details are absent."""
+    snapshot = _standalone_snapshot(1, (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat())
+    config = AutomationConfig(repo_name=REPO)
+    config.issue_specification_validation = True
+    config.issue_decomposition_validation = False
+    engine, github = _ready_engine(tmp_path, monkeypatch, {1: snapshot}, config)
+    github.get_issue_comments_strict.return_value = []
+    reserved = MagicMock(return_value=CandidateProcessingResult(type="issue", number=1, success=True, actions=["dispatched"]))
+    engine._process_single_candidate_reserved = reserved
+
+    owner = ImplementationOwner("issue", 1)
+    generation = engine._compute_implementation_generation(REPO, snapshot, None)
+    execution = engine.implementation_slots.start_execution(owner, generation=generation)
+    assert execution is not None
+    engine.issue_stage_routing.record_implementation_owned(REPO, 1, generation)
+    engine.implementation_slots.finish_execution(owner, execution)
+    assert engine.implementation_slots.active_execution_ids(owner) == ()
+
+    duplicate = engine._process_single_candidate_unified(REPO, Candidate("issue", dict(snapshot), 0), config, origin="worker")
+
+    assert duplicate.target_outcome is ExplicitTargetOutcome.SKIPPED
+    assert len(duplicate.actions) == 1
+    assert "duplicate automatic-start suppression" in duplicate.actions[0]
+    assert "Current outcome=unknown" in duplicate.actions[0]
+    assert "--only https://github.com/owner/repo/issues/1 --force --retry" in duplicate.actions[0]
+    assert reserved.call_count == 0
+    trace = get_trace_collector().get_snapshot(repository=REPO, item_type="issue", item_number=1)
+    events = [event for event in trace.events if event.stage_id == "issue.implementation-duplicate-suppression"]
+    assert len(events) == 1
+    assert events[0].outcome == Outcome.SKIPPED.value
+    assert "historical durable start is not proof" in events[0].facts["explanation"]
+
+
+def test_duplicate_store_initialization_failure_keeps_retry_guidance(tmp_path, monkeypatch):
+    get_trace_collector().clear()
+    snapshot = _standalone_snapshot(1, (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat())
+    config = AutomationConfig(repo_name=REPO)
+    config.issue_specification_validation = True
+    config.issue_decomposition_validation = False
+    engine, github = _ready_engine(tmp_path, monkeypatch, {1: snapshot}, config)
+    github.get_issue_comments_strict.return_value = []
+    owner = ImplementationOwner("issue", 1)
+    generation = engine._compute_implementation_generation(REPO, snapshot, None)
+    execution = engine.implementation_slots.start_execution(owner, generation=generation)
+    assert execution is not None
+    engine.issue_stage_routing.record_implementation_owned(REPO, 1, generation)
+    engine.implementation_slots.finish_execution(owner, execution)
+    monkeypatch.setattr(engine, "_get_local_job_store", MagicMock(side_effect=RuntimeError("corrupt database")))
+
+    duplicate = engine._process_single_candidate_unified(REPO, Candidate("issue", dict(snapshot), 0), config, origin="worker")
+
+    assert duplicate.target_outcome is ExplicitTargetOutcome.SKIPPED
+    explanation = duplicate.actions[0]
+    assert "Supplementary outcome evidence is unavailable" in explanation
+    assert "--only https://github.com/owner/repo/issues/1 --force --retry" in explanation
+    assert "requests a distinct attempt" in explanation
+    assert "does not guarantee resumption" in explanation
+    assert "Inspect and reconcile" in explanation
+    trace = get_trace_collector().get_snapshot(repository=REPO, item_type="issue", item_number=1)
+    events = [event for event in trace.events if event.stage_id == "issue.implementation-duplicate-suppression"]
+    assert len(events) == 1
+    assert events[0].facts["explanation"] == explanation
+
+
+def test_failed_production_local_job_is_explained_on_ordinary_reprocessing(tmp_path, monkeypatch):
+    """#2484 REQ-006: cross admission, durable handoff, provider, retirement, and duplicate diagnostics."""
+    get_trace_collector().clear()
+    snapshot = _standalone_snapshot(1, (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat())
+    config = AutomationConfig(repo_name=REPO)
+    config.issue_specification_validation = True
+    config.issue_decomposition_validation = False
+    engine, github = _ready_engine(tmp_path, monkeypatch, {1: snapshot}, config)
+    github.get_issue_comments_strict.return_value = []
+    store = LocalJobStore(tmp_path / "jobs.sqlite3")
+    engine.local_job_store = store
+    llm_config = LLMBackendConfiguration.load_from_dict({"backends": {"controlled-local": {"backend_type": "codex", "model": "test"}}})
+
+    backend_creation = MagicMock(return_value=MagicMock())
+    monkeypatch.setattr("auto_coder.issue_processor._ordinary_issue_candidates", lambda _repo: ["controlled-local"])
+    monkeypatch.setattr("auto_coder.llm_backend_config.get_llm_config", lambda **_kwargs: llm_config)
+    monkeypatch.setattr("auto_coder.cli_helpers.build_backend_manager", backend_creation)
+    monkeypatch.setattr("auto_coder.issue_processor.get_current_attempt", lambda *_args: 0)
+    monkeypatch.setattr("auto_coder.issue_processor.get_commit_log", lambda *_args, **_kwargs: "baseline")
+    monkeypatch.setattr("auto_coder.automation_engine.resolve_authoritative_item_type", lambda *_args: "issue")
+
+    admitted = engine._process_single_candidate_unified(REPO, Candidate("issue", dict(snapshot), 0), config, origin="worker")
+
+    assert admitted.dispatch_result is not None
+    assert admitted.dispatch_result.outcome.value == "local_accepted", admitted.dispatch_result
+    job_id = admitted.dispatch_result.provider_reference
+    accepted = store.get(job_id)
+    assert accepted is not None and accepted.state is LocalJobState.PENDING
+    owner = ImplementationOwner("issue", 1)
+    assert accepted.implementation_execution_id
+    assert engine.implementation_slots.active_execution_ids(owner) == (accepted.implementation_execution_id,)
+    assert store.get_effect(job_id, accepted.execution_incarnation, "pr") is None
+    assert IssueLocalJobAdapter(
+        issue_job_authorization_ports(engine),
+        REPO,
+        store,
+        engine.implementation_slots,
+        tmp_path,
+    ).authorize_provider_entry(accepted)
+
+    class ControlledFailureAdapter:
+        calls = 0
+
+        def authorize_provider_entry(self, job):  # type: ignore[no-untyped-def]
+            return job.job_id == job_id
+
+        def invoke(self, job):  # type: ignore[no-untyped-def]
+            self.calls += 1
+            owner = ImplementationOwner("issue", job.target_number)
+            assert store.bind_workspace(
+                LocalJobClaim(job, True),
+                workspace_path=tmp_path.resolve(),
+                source_commit="source",
+                source_ref="refs/remotes/origin/main",
+                work_branch="issue-1-attempt-0",
+                publication_remote="origin",
+                owner_incarnation=engine.implementation_slots.owner_incarnation(owner),
+                owner_generation=engine.implementation_slots.implementation_generation(owner),
+            )
+            return LocalJobExecutionResult(
+                InvocationOutcome.FAILED,
+                "provider output",
+                "transport rejected Authorization: Bearer ghp_privatecredential; github_pat_123456789secret",
+            )
+
+    adapter = ControlledFailureAdapter()
+    runner = LocalJobRunner(
+        store,
+        engine.invocation_gate,
+        repository=REPO,
+        capacity=1,
+        adapters={LocalJobKind.ISSUE_IMPLEMENTATION: adapter},
+        job_ids=frozenset({job_id}),
+    )
+    try:
+        assert runner.poll() == 1
+        deadline = time.monotonic() + 5
+        while runner.active_count():
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+    finally:
+        runner.close(wait=True)
+
+    executed = store.get(job_id)
+    assert executed is not None
+    assert executed.state is LocalJobState.DOWNSTREAM_EFFECTS_PENDING
+    assert executed.invocation_outcome is InvocationOutcome.FAILED
+    assert executed.owner_generation is not None
+    executed_claim = LocalJobClaim(executed, True)
+    assert store.record_effect(executed_claim, "association", "completed", "77")
+    assert store.record_effect(executed_claim, "pr", "completed", "88")
+    finalizer = IssueJobFinalizer(store, engine.implementation_slots, lambda *_args: None, lambda *_args: None)
+    retired = finalizer.finalize(job_id)
+    assert retired.disposition == "failed"
+    assert store.get(job_id).state is LocalJobState.SETTLED  # type: ignore[union-attr]
+
+    owner = ImplementationOwner("issue", 1)
+    assert engine.implementation_slots.release_unbound_idle_owner(owner)
+    generation = engine._compute_implementation_generation(REPO, snapshot, None)
+    assert executed.owner_generation == generation
+    assert len(store.issue_job_evidence(REPO, 1)) == 1
+    assert engine.issue_stage_routing.is_implementation_owned(REPO, 1, generation)
+    duplicate = engine._process_single_candidate_unified(REPO, Candidate("issue", dict(snapshot), 0), config, origin="worker")
+
+    assert duplicate.target_outcome is ExplicitTargetOutcome.SKIPPED
+    assert "Current outcome=unknown" in duplicate.actions[0]
+    assert "History[attempt=0" in duplicate.actions[0]
+    assert "invocation=failed" in duplicate.actions[0]
+    assert "ghp_privatecredential" not in duplicate.actions[0]
+    assert "github_pat_123456789secret" not in duplicate.actions[0]
+    assert "Authorization: [REDACTED]" in duplicate.actions[0]
+    assert "publication=inconsistent" in duplicate.actions[0]
+    assert "publication=confirmed PR" not in duplicate.actions[0]
+    assert adapter.calls == 1
+    assert backend_creation.call_count == 1
+    assert engine.issue_stage_routing.is_implementation_owned(REPO, 1, generation)
+    trace = get_trace_collector().get_snapshot(repository=REPO, item_type="issue", item_number=1)
+    duplicate_events = [event for event in trace.events if event.stage_id == "issue.implementation-duplicate-suppression"]
+    assert len(duplicate_events) == 1
+    assert duplicate_events[0].outcome == Outcome.SKIPPED.value
+    assert duplicate_events[0].facts["explanation"] == duplicate.actions[0]
+
+
+def test_explicit_issue_acquires_and_dispatches_real_local_job(tmp_path, monkeypatch):
+    """Explicit entry must traverse unified ownership and durable local dispatch."""
+    snapshot = _standalone_snapshot(1, (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat())
+    config = AutomationConfig(repo_name=REPO)
+    config.issue_specification_validation = True
+    config.issue_decomposition_validation = False
+    engine, github = _ready_engine(tmp_path, monkeypatch, {1: snapshot}, config)
+    github.get_issue_comments_strict.return_value = []
+    store = LocalJobStore(tmp_path / "explicit-jobs.sqlite3")
+    engine.local_job_store = store
+    llm_config = LLMBackendConfiguration.load_from_dict({"backends": {"controlled-local": {"backend_type": "codex", "model": "test"}}})
+    monkeypatch.setattr("auto_coder.issue_processor._ordinary_issue_candidates", lambda _repo: ["controlled-local"])
+    monkeypatch.setattr("auto_coder.llm_backend_config.get_llm_config", lambda **_kwargs: llm_config)
+    monkeypatch.setattr("auto_coder.cli_helpers.build_backend_manager", lambda **_kwargs: MagicMock())
+    monkeypatch.setattr("auto_coder.issue_processor.get_current_attempt", lambda *_args: 0)
+    monkeypatch.setattr("auto_coder.issue_processor.get_commit_log", lambda *_args, **_kwargs: "baseline")
+    monkeypatch.setattr("auto_coder.automation_engine.resolve_authoritative_item_type", lambda *_args: "issue")
+    candidate = Candidate("issue", dict(snapshot), 0)
+    monkeypatch.setattr(engine, "_check_and_handle_closed_branch", lambda _repo: True)
+    monkeypatch.setattr(engine, "_create_candidate_from_single", lambda *_args, **_kwargs: candidate)
+    monkeypatch.setattr(engine, "_preflight_explicit_issue_relationships", lambda *_args, **_kwargs: dict(snapshot))
+    monkeypatch.setattr(engine, "_validate_submitted_parent_generation_for_child", lambda *_args, **_kwargs: None)
+    completion = MagicMock()
+    monkeypatch.setattr(engine, "_complete_explicit_local_issue", completion)
+
+    result = engine.process_single(REPO, "issue", 1, explicit_only=True)
+
+    completion.assert_called_once()
+    dispatched = completion.call_args.args[1]
+    assert dispatched.dispatch_result is not None
+    assert dispatched.dispatch_result.outcome.value == "local_accepted"
+    job = store.get(dispatched.dispatch_result.provider_reference)
+    assert job is not None and job.state is LocalJobState.PENDING
+    owner = ImplementationOwner("issue", 1)
+    assert job.implementation_execution_id
+    assert engine.implementation_slots.active_execution_ids(owner) == (job.implementation_execution_id,)
+    generation = engine.implementation_slots.implementation_generation(owner)
+    assert generation is not None
+    assert engine.issue_stage_routing.is_implementation_owned(REPO, 1, generation)
+    assert IssueLocalJobAdapter(issue_job_authorization_ports(engine), REPO, store, engine.implementation_slots, tmp_path).authorize_provider_entry(job)
+    assert result["target_type"] == "issue"
+    assert result["target_number"] == 1
+
+
+def test_ordinary_local_issue_stays_owned_until_its_published_pr_is_validated_and_observed_merged(tmp_path, monkeypatch, _use_real_commands):
+    """#2528 REQ-002: one production identity crosses admission through retirement."""
+    from auto_coder.ci_observation import (
+        CIConclusion,
+        CIObservationSnapshot,
+        ObservationAvailability,
+        ObservationRequest,
+        ObservationSubject,
+        WorkflowExecutionIdentity,
+        WorkflowObservation,
+    )
+    from auto_coder.implementation_reclamation_scheduler import run_due_reclamation_checks
+    from auto_coder.pr_processor import PRProcessingOutcome
+    from auto_coder.util.github_action import GitHubActionsStatusResult
+
+    snapshot = _standalone_snapshot(1, (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat())
+    config = AutomationConfig(repo_name=REPO)
+    config.MAX_CONCURRENT_IMPLEMENTATIONS = 3
+    config.AUTO_MERGE = True
+    config.issue_specification_validation = True
+    config.issue_decomposition_validation = False
+    config.pr_review_thread_gate = False
+    engine, github = _ready_engine(tmp_path, monkeypatch, {1: snapshot}, config)
+    engine.implementation_slots = ImplementationSlotRepository(REPO, 3, engine.implementation_slots.storage_path)
+    github.get_issue_comments_strict.return_value = []
+    jobs = LocalJobStore(tmp_path / "joined-jobs.sqlite3")
+    engine.local_job_store = jobs
+    llm_config = LLMBackendConfiguration.load_from_dict({"backends": {"controlled-local": {"backend_type": "codex", "model": "test"}}})
+    monkeypatch.setattr("auto_coder.issue_processor._ordinary_issue_candidates", lambda _repo: ["controlled-local"])
+    monkeypatch.setattr("auto_coder.llm_backend_config.get_llm_config", lambda **_kwargs: llm_config)
+    monkeypatch.setattr("auto_coder.cli_helpers.build_backend_manager", lambda **_kwargs: MagicMock())
+    monkeypatch.setattr("auto_coder.issue_processor.get_current_attempt", lambda *_args: 0)
+    monkeypatch.setattr("auto_coder.issue_processor.get_commit_log", lambda *_args, **_kwargs: "baseline")
+    monkeypatch.setattr("auto_coder.automation_engine.resolve_authoritative_item_type", lambda *_args: "issue")
+
+    admitted = engine._process_single_candidate_unified(REPO, Candidate("issue", dict(snapshot), 0), config, origin="worker")
+    assert admitted.dispatch_result is not None
+    assert admitted.dispatch_result.outcome is DispatchOutcome.LOCAL_ACCEPTED
+    job_id = admitted.dispatch_result.provider_reference
+    admitted_job = jobs.get(job_id)
+    owner = ImplementationOwner("issue", 1)
+    assert admitted_job is not None and admitted_job.state is LocalJobState.PENDING
+    assert engine.implementation_slots.active_execution_ids(owner) == (admitted_job.implementation_execution_id,)
+
+    git(tmp_path, "config", "--global", "user.email", "test@example.com")
+    git(tmp_path, "config", "--global", "user.name", "Test")
+    source, _head = repository(tmp_path)
+    remote = tmp_path / "joined-publication.git"
+    git(tmp_path, "init", "--bare", str(remote))
+    git(source, "remote", "set-url", "origin", str(remote))
+    git(source, "push", "origin", "main")
+    claim = jobs.claim(job_id, "joined-controlled-provider")
+    assert claim is not None
+
+    def implement(workspace, _prompt):
+        (workspace / "joined.txt").write_text("implemented\n", encoding="utf-8")
+        return "ACTION_SUMMARY: implemented and verified"
+
+    checkpoint = IssueJobWorkspaceProducer(jobs, tmp_path / "joined-workspaces", engine.implementation_slots).execute(
+        claim,
+        IssueJobSource(REPO, source, "main", "issue-1"),
+        implement,
+    )
+    observed_prs = {}
+
+    def lookup(_repository, branch):
+        return observed_prs.get(branch)
+
+    def create(record, _summary):
+        observed_prs[record.work_branch] = {
+            "number": 77,
+            "state": "open",
+            "merged": False,
+            "body": "Closes #1",
+            "head": {"ref": record.work_branch, "sha": "published-head"},
+            "base": {"ref": "main", "sha": "base-head"},
+            "labels": [],
+            "user": {"login": "local-agent"},
+        }
+
+    published = IssueJobFinalizer(jobs, engine.implementation_slots, lookup, create).finalize(checkpoint.job_id)
+    assert published.disposition == "published"
+    assert published.pr_number == 77
+    pr_data = observed_prs[checkpoint.work_branch]
+    owner_observation = next(item for item in engine.implementation_slots.snapshot().owners if item.owner == owner)
+    assert owner_observation.implementation_prs == (77,)
+    assert engine.implementation_slots.active_owners() == (owner,)
+
+    unrelated = ImplementationOwner("issue", 2)
+    assert engine.implementation_slots.reserve_new(unrelated)
+    validation = {"conclusion": CIConclusion.PENDING}
+
+    def ci_status(*_args, **_kwargs):
+        current = validation["conclusion"]
+        attempt = 1 if current is CIConclusion.PENDING else 2
+        observation = CIObservationSnapshot(
+            ObservationSubject("https://api.github.test", REPO, 77, "published-head"),
+            ObservationRequest("github-actions", "checks+workflows"),
+            f"joined-{attempt}",
+            0,
+            ObservationAvailability.KNOWN,
+            (
+                WorkflowObservation(
+                    WorkflowExecutionIdentity("pr-tests", "701", attempt),
+                    current,
+                    "PR Tests",
+                    workflow_path=".github/workflows/pr-tests.yml",
+                ),
+            ),
+        )
+        return GitHubActionsStatusResult(
+            success=current is CIConclusion.SUCCESS,
+            ids=[701],
+            in_progress=current is CIConclusion.PENDING,
+            observation=observation,
+        )
+
+    github.get_pull_request.side_effect = lambda *_args: dict(pr_data)
+    github.get_pr_review_threads_strict.return_value = []
+    github.get_pr_comments.return_value = []
+    with ExitStack() as stack:
+        collection_label = stack.enter_context(patch("auto_coder.automation_engine.LabelManager"))
+        label = stack.enter_context(patch("auto_coder.label_manager.LabelManager"))
+        stack.enter_context(patch("auto_coder.util.github_action._check_github_actions_status", side_effect=ci_status))
+        stack.enter_context(patch("auto_coder.pr_processor._check_github_actions_status", side_effect=ci_status))
+        stack.enter_context(patch("auto_coder.util.github_action.check_github_actions_and_exit_if_in_progress", return_value=True))
+        stack.enter_context(patch("auto_coder.pr_processor.check_github_actions_and_exit_if_in_progress", return_value=True))
+        unsafe = stack.enter_context(patch("auto_coder.pr_processor._reject_unsafe_codex_cloud_pr"))
+        stack.enter_context(patch("auto_coder.pr_processor._close_empty_pr", return_value=MagicMock(closed=False, actions=[], issue_numbers=[])))
+        stack.enter_context(patch("auto_coder.pr_processor._close_stale_jules_pr", return_value=MagicMock(closed=False, actions=[], issue_numbers=[])))
+        stack.enter_context(patch("auto_coder.pr_processor._should_skip_waiting_for_jules", return_value=False))
+        stack.enter_context(patch("auto_coder.pr_processor._is_jules_pr", return_value=False))
+        stack.enter_context(patch("auto_coder.pr_processor._is_dependabot_pr", return_value=False))
+        stack.enter_context(patch("auto_coder.pr_processor._get_mergeable_state", return_value={"mergeable": True, "merge_state_status": "clean"}))
+        stack.enter_context(patch("auto_coder.pr_processor._is_pr_review_thread_gate_enabled", return_value=False))
+        stack.enter_context(patch("auto_coder.pr_processor._is_pr_adversarial_validation_enabled", return_value=False))
+        stack.enter_context(patch("auto_coder.pr_processor.ci_observation_merge_authority", return_value=nullcontext(True)))
+        merge = stack.enter_context(patch("auto_coder.pr_processor._merge_pr", return_value=True))
+        collection_label.return_value.__enter__.return_value = True
+        label.return_value.__enter__.return_value = True
+        unsafe.side_effect = lambda _client, _repo, candidate, _config: MagicMock(closed=False, metadata_error=None, actions=[], authoritative_pr_data=candidate)
+
+        waiting = engine._process_single_candidate_unified(REPO, Candidate("pr", dict(pr_data), 0), config, origin="worker")
+        assert waiting.outcome is PRProcessingOutcome.DEFERRED
+        merge.assert_not_called()
+        assert set(engine.implementation_slots.active_owners()) == {owner, unrelated}
+
+        validation["conclusion"] = CIConclusion.SUCCESS
+        merged = engine._process_single_candidate_unified(REPO, Candidate("pr", dict(pr_data), 0), config, origin="worker")
+        assert merged.outcome is PRProcessingOutcome.SUCCESS
+        merge.assert_called_once()
+
+    # A successful merge command is not retirement evidence. Only the later
+    # supported terminal-PR observation may reclaim this exact lifetime.
+    assert set(engine.implementation_slots.active_owners()) == {owner, unrelated}
+    pr_data.update({"state": "closed", "merged": True})
+    github.get_pull_request_metadata_strict.return_value = dict(pr_data)
+    github.get_connected_prs.return_value = [77]
+    github.get_open_pull_requests_strict.return_value = []
+    engine._reconcile_terminal_pr_resumption(REPO, dict(pr_data))
+    assert (
+        run_due_reclamation_checks(
+            engine.implementation_slots,
+            github_client=github,
+            now=time.time() + 1,
+            routing=engine.issue_stage_routing,
+        )
+        == 1
+    )
+
+    assert owner not in engine.implementation_slots.active_owners()
+    assert unrelated in engine.implementation_slots.active_owners()
+
+
+def test_ordinary_cloud_handoff_reopens_accepted_dispatch_and_provider_owner(tmp_path, monkeypatch):
+    """Normal cloud entry retains both its accepted receipt and provider owner."""
+    snapshot = _standalone_snapshot(1, (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat())
+    config = AutomationConfig(repo_name=REPO)
+    config.issue_specification_validation = True
+    config.issue_decomposition_validation = False
+    engine, github = _ready_engine(tmp_path, monkeypatch, {1: snapshot}, config)
+    github.get_issue_comments_strict.return_value = []
+    llm_config = LLMBackendConfiguration.load_from_dict({"backends": {"controlled-jules": {"backend_type": "jules", "api_key": "test-key"}}})
+    monkeypatch.setattr("auto_coder.issue_processor._ordinary_issue_candidates", lambda _repo: ["controlled-jules"])
+    monkeypatch.setattr("auto_coder.llm_backend_config.get_llm_config", lambda **_kwargs: llm_config)
+    monkeypatch.setattr("auto_coder.issue_processor.get_current_attempt", lambda *_args: 0)
+    monkeypatch.setattr("auto_coder.issue_processor.get_commit_log", lambda *_args, **_kwargs: "baseline")
+    monkeypatch.setattr("auto_coder.automation_engine.resolve_authoritative_item_type", lambda *_args: "issue")
+    monkeypatch.setattr("auto_coder.jules_client.JulesClient.start_session", lambda *_args, **_kwargs: "session-retained")
+
+    result = engine._process_single_candidate_unified(
+        REPO,
+        Candidate("issue", dict(snapshot), 0),
+        config,
+        origin="worker",
+    )
+
+    assert result.dispatch_result is not None
+    assert result.dispatch_result.outcome is DispatchOutcome.REMOTE_ACCEPTED
+    assert result.dispatch_result.provider == "jules"
+    assert result.dispatch_result.provider_reference == "session-retained"
+    owner = ImplementationOwner("issue", 1)
+    assert engine.implementation_slots.active_execution_ids(owner) == ()
+
+    reopened_dispatch = IssueDispatchGuard().inspect(IssueAttemptIdentity("owner", "repo", 1, "0"))
+    assert reopened_dispatch is not None
+    assert reopened_dispatch.outcome is DispatchOutcome.REMOTE_ACCEPTED
+    assert reopened_dispatch.provider == "jules"
+    assert reopened_dispatch.provider_reference == "session-retained"
+    reopened_slots = ImplementationSlotRepository(
+        REPO,
+        1,
+        engine.implementation_slots.storage_path,
+        engine.implementation_slots.retired_storage_path,
+    )
+    assert reopened_slots.has_provider_sessions(owner)
+    assert reopened_slots.active_execution_ids(owner) == ()
+
+
+def test_busy_with_different_generation_defers_without_owning_new_one(tmp_path):
+    """REQ-006: retained evidence under an older generation defers a distinct new one."""
+    slots, routing = _stores(tmp_path)
+    execution_id = slots.start_execution(ISSUE, generation="g1")
+    assert execution_id is not None
+    assert slots.record_provider_session(ISSUE, "session-1")
+    slots.finish_execution(ISSUE, execution_id)
+    assert slots.has_qualifying_implementation_activity(ISSUE)  # provider session retained
+
+    gate = evaluate_implementation_start(routing, slots, REPO, ISSUE, "g2")
+    assert gate.decision is OwnershipStartDecision.BUSY_OTHER_GENERATION
+    assert not gate.may_start
+    begin_implementation_ownership(routing, REPO, ISSUE, gate)
+    assert not routing.is_implementation_owned(REPO, 1, "g1")
+    assert not routing.is_implementation_owned(REPO, 1, "g2")
+
+
+def test_supersession_tombstones_old_generation_before_rebinding(tmp_path):
+    """REQ-001, REQ-004, REQ-006, AS-003: G's fact survives being superseded by G2."""
+    slots, routing = _stores(tmp_path)
+    first_execution = slots.start_execution(ISSUE, generation="g1")
+    assert first_execution is not None
+    confirm_implementation_ownership(routing, REPO, ISSUE, "g1")
+    slots.finish_execution(ISSUE, first_execution)
+    assert not slots.has_qualifying_implementation_activity(ISSUE)
+
+    gate = evaluate_implementation_start(routing, slots, REPO, ISSUE, "g2")
+    assert gate.decision is OwnershipStartDecision.SUPERSEDE
+    assert gate.superseded_generation == "g1"
+    begin_implementation_ownership(routing, REPO, ISSUE, gate)
+    assert routing.is_implementation_owned(REPO, 1, "g1")
+
+    second_execution = slots.start_execution(ISSUE, generation="g2")
+    assert second_execution is not None
+    assert slots.implementation_generation(ISSUE) == "g2"
+    confirm_implementation_ownership(routing, REPO, ISSUE, "g2")
+    assert routing.is_implementation_owned(REPO, 1, "g2")
+
+    # Exact reversion back to G1 must not be treated as a fresh start: the
+    # local record now says G2, so routing's own recovered tombstone for G1
+    # is the only thing standing between reversion and a duplicate start.
+    reverted_gate = evaluate_implementation_start(routing, slots, REPO, ISSUE, "g1")
+    assert reverted_gate.decision is OwnershipStartDecision.ALREADY_OWNED
+    assert not reverted_gate.may_start
+
+
+def test_missing_generation_binding_fails_closed_for_that_owner_only(tmp_path):
+    """REQ-008: retained legacy evidence with no captured generation blocks all new starts."""
+    slots, routing = _stores(tmp_path)
+    # A record predating this feature (or otherwise corrupted): qualifying
+    # evidence with no ``implementation_generation`` field at all.
+    assert slots.reserve(ISSUE, implementation_pr=42)
+    assert slots.has_qualifying_implementation_activity(ISSUE)
+    assert slots.implementation_generation(ISSUE) is None
+
+    gate = evaluate_implementation_start(routing, slots, REPO, ISSUE, "g1")
+    assert gate.decision is OwnershipStartDecision.AMBIGUOUS_BINDING
+    assert not gate.may_start
+
+    # An unrelated owner is unaffected (target-scoped fail-closed).
+    other = ImplementationOwner("issue", 2)
+    other_gate = evaluate_implementation_start(routing, slots, REPO, other, "g1")
+    assert other_gate.decision is OwnershipStartDecision.START_NEW
+
+
+def test_unavailable_evidence_raises_instead_of_deciding(tmp_path):
+    """AS-004: unreadable durable state must defer, never be treated as owned or not."""
+    slots, routing = _stores(tmp_path)
+    slots.storage_path.parent.mkdir(parents=True, exist_ok=True)
+    slots.storage_path.write_text("not json", encoding="utf-8")
+    with pytest.raises(ImplementationSlotUnavailable):
+        evaluate_implementation_start(routing, slots, REPO, ISSUE, "g1")
+    assert not routing.is_implementation_owned(REPO, 1, "g1")
+
+
+def test_already_owned_after_full_release_stays_suppressed(tmp_path):
+    """REQ-006: full release (PR merged, owner retired) does not clear the tombstone."""
+    slots, routing = _stores(tmp_path)
+    execution_id = slots.start_execution(ISSUE, generation="g1")
+    assert execution_id is not None
+    confirm_implementation_ownership(routing, REPO, ISSUE, "g1")
+    slots.finish_execution(ISSUE, execution_id)
+    assert slots.release_unbound_idle_owner(ISSUE)
+    assert slots.implementation_generation(ISSUE) is None
+
+    gate = evaluate_implementation_start(routing, slots, REPO, ISSUE, "g1")
+    assert gate.decision is OwnershipStartDecision.ALREADY_OWNED
+    assert not gate.may_start
+
+
+# ---------------------------------------------------------------------------
+# Part 2: production-boundary regressions
+# ---------------------------------------------------------------------------
+
+
+def _standalone_snapshot(number: int, created_at: str) -> dict:
+    body = f"## Objective\n\nShip #{number}.\n\n## Requirements\n\nREQ-001: Ship #{number}."
+    return {
+        "id": number * 100 + 1,
+        "number": number,
+        "title": f"Standalone {number}",
+        "body": body,
+        "state": "open",
+        "created_at": created_at,
+        "labels": [{"name": "implementation-ready"}],
+        "user": {"id": 1},
+    }
+
+
+def _ready_engine(tmp_path, monkeypatch, snapshots, config):
+    """A ``_routing_engine`` with the real admission path restored (REQ-010)."""
+    engine, github = _routing_engine(tmp_path, monkeypatch, snapshots, [], config)
+    engine._process_single_candidate = AutomationEngine._process_single_candidate.__get__(engine)
+    for number in snapshots:
+        identity_body = snapshots[number]["body"]
+        engine._specification_validators.setdefault(
+            REPO,
+            SpecificationValidationLifecycle(REPO, "policy", tmp_path / "ready.json", lambda *_args: SpecificationAnalysisResult("READY")),
+        )
+    engine.implementation_slots = ImplementationSlotRepository(REPO, 1, tmp_path / "slots.json")
+    return engine, github
+
+
+@pytest.mark.asyncio
+async def test_duplicate_wake_never_dispatches_twice_for_the_same_generation(tmp_path, monkeypatch):
+    """AS-005/REQ-006 at the real admission boundary: a second wake for the same
+    unchanged Issue must not start implementation again once acquired."""
+    created_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    snapshots = {1: _standalone_snapshot(1, created_at)}
+    config = AutomationConfig(repo_name=REPO)
+    config.issue_specification_validation = True
+    config.issue_decomposition_validation = False
+    engine, github = _ready_engine(tmp_path, monkeypatch, snapshots, config)
+    reserved = MagicMock(return_value=CandidateProcessingResult(type="issue", number=1, success=True, actions=["dispatched"]))
+    engine._process_single_candidate_reserved = reserved
+    github.get_issue_comments_strict.return_value = []
+
+    worker = asyncio.create_task(engine._worker_loop(REPO, 0, "issue"))
+    await engine.invalidate_entity(REPO, "issue", 1)
+    await asyncio.wait_for(engine.queue.join(), timeout=5)
+    assert reserved.call_count == 1
+    owner = ImplementationOwner("issue", 1)
+    generation = engine.implementation_slots.implementation_generation(owner)
+    assert generation is not None
+    assert engine.issue_stage_routing.is_implementation_owned(REPO, 1, generation)
+
+    # Duplicate wake for the exact same (unchanged) Issue: routing must
+    # suppress a second production start rather than dispatching again.
+    await engine.invalidate_entity(REPO, "issue", 1)
+    await asyncio.wait_for(engine.queue.join(), timeout=5)
+    assert reserved.call_count == 1
+
+    worker.cancel()
+    await asyncio.gather(worker, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_daemon_invalidation_lazily_accepts_local_job_before_startup(tmp_path, monkeypatch):
+    """A pre-start daemon worker hands off locally instead of invoking inline."""
+    created_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    snapshot = _standalone_snapshot(1, created_at)
+    config = AutomationConfig(repo_name=REPO)
+    config.issue_specification_validation = True
+    config.issue_decomposition_validation = False
+    engine, github = _ready_engine(tmp_path, monkeypatch, {1: snapshot}, config)
+    github.get_issue_comments_strict.return_value = []
+    llm_config = LLMBackendConfiguration.load_from_dict({"backends": {"controlled-local": {"backend_type": "codex", "model": "test"}}})
+    monkeypatch.setattr("auto_coder.issue_processor._ordinary_issue_candidates", lambda _repo: ["controlled-local"])
+    monkeypatch.setattr("auto_coder.llm_backend_config.get_llm_config", lambda **_kwargs: llm_config)
+    monkeypatch.setattr("auto_coder.cli_helpers.build_backend_manager", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr("auto_coder.issue_processor.get_current_attempt", lambda *_args: 0)
+    monkeypatch.setattr("auto_coder.issue_processor.get_commit_log", lambda *_args, **_kwargs: "baseline")
+    monkeypatch.setattr("auto_coder.automation_engine.resolve_authoritative_item_type", lambda *_args: "issue")
+    monkeypatch.setattr("auto_coder.issue_dispatch.default_issue_dispatch_db_path", lambda: tmp_path / "dispatch.sqlite3")
+    monkeypatch.setattr("auto_coder.local_job_handoff.default_local_job_db_path", lambda: tmp_path / "jobs.sqlite3")
+
+    assert engine.local_job_store is None
+    worker = asyncio.create_task(engine._worker_loop(REPO, 0, "issue"))
+    try:
+        await engine.invalidate_entity(REPO, "issue", 1)
+        await asyncio.wait_for(engine.queue.join(), timeout=5)
+    finally:
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+
+    store = engine.local_job_store
+    assert store is not None
+    jobs = [job for job in store.discover_unsettled() if job.repository == REPO and job.target_number == 1]
+    assert len(jobs) == 1
+    assert jobs[0].state is LocalJobState.PENDING
+    assert engine.queue.empty()
+
+
+def test_explicit_retry_after_completed_execution_starts_distinct_attempt(tmp_path, monkeypatch):
+    """An explicit request is the narrow exception to G's start tombstone."""
+    created_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    snapshot = _standalone_snapshot(1, created_at)
+    config = AutomationConfig(repo_name=REPO)
+    config.issue_specification_validation = True
+    config.issue_decomposition_validation = False
+    engine, github = _ready_engine(tmp_path, monkeypatch, {1: snapshot}, config)
+    engine._process_single_candidate_reserved = MagicMock(return_value=CandidateProcessingResult(type="issue", number=1, success=True, actions=["dispatched"]))
+    github.get_issue_comments_strict.return_value = []
+    owner = ImplementationOwner("issue", 1)
+
+    # Admit G to owned (execution + tombstone), then finish the execution
+    # without releasing the owner: retained binding, no qualifying activity,
+    # tombstone durable.
+    generation = engine._compute_implementation_generation(REPO, snapshot, None)
+    execution_id = engine.implementation_slots.start_execution(owner, generation=generation)
+    assert execution_id is not None
+    engine.issue_stage_routing.record_implementation_owned(REPO, 1, generation)
+    engine.implementation_slots.finish_execution(owner, execution_id)
+    assert engine.implementation_slots.active_execution_ids(owner) == ()
+    assert not engine.implementation_slots.has_qualifying_implementation_activity(owner)
+
+    candidate = Candidate(type="issue", data=dict(snapshot), priority=0)
+    result = engine._process_single_candidate_unified(
+        REPO,
+        candidate,
+        engine.config,
+        explicit_only=True,
+        force=True,
+        retry=True,
+        retry_request_id="cli-request-1",
+        origin="explicit-single-target",
+    )
+
+    assert result.success
+    reserved = engine._process_single_candidate_reserved.call_args
+    authority = reserved.kwargs["retry_authority"]
+    assert reserved.kwargs["manual_retry"] is True
+    assert authority.request_id == "cli-request-1"
+    assert authority.generation == generation
+    assert authority.status == "owned"
+    assert authority.attempt_id
+    assert engine.implementation_slots.active_execution_ids(owner) == ()
+    assert engine.implementation_slots.implementation_generation(owner) == generation
+    assert engine.issue_stage_routing.is_implementation_owned(REPO, 1, generation)
+
+
+def test_tracking_incomplete_cloud_retry_reentry_retains_receipt_and_exact_settlement(tmp_path, monkeypatch):
+    """A production retry re-entry reuses its accepted receipt and caller lifetimes."""
+    snapshot = _standalone_snapshot(1, (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat())
+    config = AutomationConfig(repo_name=REPO)
+    config.issue_specification_validation = True
+    config.issue_decomposition_validation = False
+    engine, github = _ready_engine(tmp_path, monkeypatch, {1: snapshot}, config)
+    github.get_issue_comments_strict.return_value = []
+    alias = "controlled-cloud"
+    llm_config = LLMBackendConfiguration.load_from_dict({"backends": {alias: {"backend_type": "codex-cloud", "model": "test"}}})
+    client = MagicMock(environment_id="environment-1")
+    client.submit_task.return_value = CodexSubmissionResult(
+        CodexSubmissionOutcome.ACCEPTED,
+        "task-retained",
+        "https://example.test/tasks/task-retained",
+    )
+    monkeypatch.setattr("auto_coder.issue_processor._ordinary_issue_candidates", lambda _repo: [alias])
+    monkeypatch.setattr("auto_coder.llm_backend_config.get_llm_config", lambda **_kwargs: llm_config)
+    monkeypatch.setattr("auto_coder.codex_cloud_client.get_llm_config", lambda **_kwargs: llm_config)
+    monkeypatch.setattr("auto_coder.codex_cloud_client.CodexCloudClient", MagicMock(return_value=client))
+    monkeypatch.setattr("auto_coder.issue_processor.get_current_attempt", lambda *_args: 0)
+    monkeypatch.setattr(
+        "auto_coder.issue_processor.increment_attempt",
+        lambda *_args, attempt_number=None, **_kwargs: attempt_number or 1,
+    )
+    monkeypatch.setattr("auto_coder.issue_processor.get_commit_log", lambda *_args, **_kwargs: "baseline")
+    monkeypatch.setattr("auto_coder.automation_engine.resolve_authoritative_item_type", lambda *_args: "issue")
+    monkeypatch.setattr("auto_coder.issue_dispatch.default_issue_dispatch_db_path", lambda: tmp_path / "dispatch.sqlite3")
+    monkeypatch.setattr(CloudManager, "promote_retry_binding", MagicMock(side_effect=OSError("projection unavailable")))
+
+    owner = ImplementationOwner("issue", 1)
+    finish_calls = []
+    real_finish = engine.implementation_slots.finish_execution
+
+    def observed_finish(finished_owner, execution_id):  # type: ignore[no-untyped-def]
+        assert finished_owner == owner
+        finish_calls.append(execution_id)
+        real_finish(finished_owner, execution_id)
+
+    monkeypatch.setattr(engine.implementation_slots, "finish_execution", observed_finish)
+
+    def process():  # type: ignore[no-untyped-def]
+        return engine._process_single_candidate_unified(
+            REPO,
+            Candidate("issue", dict(snapshot), 0),
+            config,
+            explicit_only=True,
+            force=True,
+            retry=True,
+            retry_request_id="tracking-incomplete-retry",
+            origin="explicit-single-target",
+        )
+
+    first = process()
+    retained = RetryDispatchRepository(REPO).get("tracking-incomplete-retry")
+    assert retained is not None
+    first_identity = (retained.external_id, retained.creation_id)
+    assert retained.external_id == "task-retained"
+    assert retained.tracking_complete is False
+    assert first.dispatch_result is not None
+    assert first.dispatch_result.provider_reference == retained.external_id
+    dispatch_incarnation = first.dispatch_result.claim_incarnation
+    assert dispatch_incarnation
+
+    replay = process()
+    replayed = RetryDispatchRepository(REPO).get("tracking-incomplete-retry")
+    assert replayed is not None
+    assert (replayed.external_id, replayed.creation_id) == first_identity
+    assert replayed.tracking_complete is False
+    assert replay.dispatch_result is not None
+    assert replay.dispatch_result.provider_reference == retained.external_id
+    assert replay.dispatch_result.claim_incarnation == dispatch_incarnation
+    assert client.submit_task.call_count == 1
+    assert engine.implementation_slots.has_provider_sessions(owner)
+    authority = engine.issue_stage_routing.retry_request("tracking-incomplete-retry")
+    assert authority is not None and authority.ownership_reference
+    assert finish_calls == [authority.ownership_reference, authority.ownership_reference]
+    assert engine.implementation_slots.active_execution_ids(owner) == ()
+
+
+def test_retry_flag_gate_and_same_request_competition_cross_production_candidate_boundary(tmp_path, monkeypatch):
+    """#2523 REQ-006: only the complete manual flag conjunction creates R,
+    and competing production admissions for the same R retain one identity."""
+    created_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    snapshot = _standalone_snapshot(1, created_at)
+    config = AutomationConfig(repo_name=REPO)
+    config.issue_specification_validation = True
+    config.issue_decomposition_validation = False
+    engine, github = _ready_engine(tmp_path, monkeypatch, {1: snapshot}, config)
+    github.get_issue_comments_strict.return_value = []
+    owner = ImplementationOwner("issue", 1)
+    generation = engine._compute_implementation_generation(REPO, snapshot, None)
+    original = engine.implementation_slots.start_execution(owner, generation=generation)
+    assert original is not None
+    engine.issue_stage_routing.record_implementation_owned(REPO, 1, generation)
+    engine.implementation_slots.finish_execution(owner, original)
+    downstream_authorities = []
+
+    def downstream(*_args, **kwargs):
+        downstream_authorities.append(kwargs.get("retry_authority"))
+        return CandidateProcessingResult(type="issue", number=1, success=True, actions=["checkpoint only"])
+
+    engine._process_single_candidate_reserved = downstream
+    candidate = Candidate(type="issue", data=dict(snapshot), priority=0)
+
+    force_only = engine._process_single_candidate_unified(REPO, candidate, config, explicit_only=True, force=True, retry=False, origin="explicit-single-target")
+    assert force_only.target_outcome is ExplicitTargetOutcome.SKIPPED
+    assert engine.issue_stage_routing.retry_requests(REPO, 1) == ()
+    assert downstream_authorities == []
+
+    request_id = "production-same-request"
+    # Hold both production calls after the service has durably accepted R but
+    # before either can project it into slot ownership.  A bare thread-pool
+    # race can otherwise complete the first call before the second is ever
+    # scheduled and therefore prove only sequential replay.
+    import auto_coder.issue_retry_admission as retry_admission
+
+    real_acquire = retry_admission.acquire_explicit_retry
+    acquisition_paused = threading.Event()
+    release_acquisition = threading.Event()
+    acquisition_entry_lock = threading.Lock()
+    acquisition_entries = 0
+
+    def checkpointed_acquire(*args, **kwargs):
+        nonlocal acquisition_entries
+        with acquisition_entry_lock:
+            acquisition_entries += 1
+            entry = acquisition_entries
+        if entry == 1:
+            acquisition_paused.set()
+            assert release_acquisition.wait(timeout=5), "test did not release retry ownership projection"
+        return real_acquire(*args, **kwargs)
+
+    monkeypatch.setattr(retry_admission, "acquire_explicit_retry", checkpointed_acquire)
+    real_get_slots = engine._get_implementation_slots
+    candidate_threads_at_ownership_boundary = set()
+    candidate_boundary_lock = threading.Lock()
+    both_candidates_ready = threading.Event()
+
+    def checkpointed_get_slots(*args, **kwargs):
+        slots = real_get_slots(*args, **kwargs)
+        with candidate_boundary_lock:
+            candidate_threads_at_ownership_boundary.add(threading.get_ident())
+            if len(candidate_threads_at_ownership_boundary) == 2:
+                both_candidates_ready.set()
+        assert both_candidates_ready.wait(timeout=5), "both candidates did not reach the ownership boundary"
+        return slots
+
+    monkeypatch.setattr(engine, "_get_implementation_slots", checkpointed_get_slots)
+    real_start_execution = engine.implementation_slots.start_execution
+    retry_slot_acquisitions = 0
+    retry_slot_lock = threading.Lock()
+
+    def counted_start_execution(*args, **kwargs):
+        nonlocal retry_slot_acquisitions
+        if kwargs.get("retry_request_id") == request_id:
+            with retry_slot_lock:
+                retry_slot_acquisitions += 1
+        return real_start_execution(*args, **kwargs)
+
+    monkeypatch.setattr(engine.implementation_slots, "start_execution", counted_start_execution)
+
+    def process_retry():
+        return engine._process_single_candidate_unified(
+            REPO,
+            Candidate(type="issue", data=dict(snapshot), priority=0),
+            config,
+            explicit_only=True,
+            force=True,
+            retry=True,
+            retry_request_id=request_id,
+            origin="explicit-single-target",
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        futures = (executor.submit(process_retry), executor.submit(process_retry))
+        assert both_candidates_ready.wait(timeout=5)
+        assert acquisition_paused.wait(timeout=5)
+        assert not futures[0].done() and not futures[1].done()
+        accepted = engine.issue_stage_routing.retry_request(request_id)
+        assert accepted is not None and accepted.status == "pending"
+        assert accepted.request_id == request_id and accepted.attempt_id
+        assert accepted.generation == generation
+        assert downstream_authorities == []
+        release_acquisition.set()
+        results = tuple(future.result(timeout=5) for future in futures)
+
+    assert len(candidate_threads_at_ownership_boundary) == 2
+    assert acquisition_entries == 2
+    assert retry_slot_acquisitions == 1
+    assert all(result.success for result in results)
+    assert len(downstream_authorities) == 2
+    assert all(authority is not None for authority in downstream_authorities)
+    identities = {
+        (
+            authority.request_id,
+            authority.attempt_id,
+            authority.generation,
+            authority.predecessor_captured,
+            authority.predecessor_provider,
+            authority.predecessor_task_id,
+            authority.predecessor_backend_name,
+            authority.ownership_reference,
+        )
+        for authority in downstream_authorities
+    }
+    assert len(identities) == 1
+    assert identities.pop()[0] == request_id
+    stored = engine.issue_stage_routing.retry_request(request_id)
+    assert stored is not None and stored.status == "owned"
+    assert engine.issue_stage_routing.retry_requests(REPO, 1) == (stored,)
+    reopened_routing = IssueStageRoutingStore(tmp_path / "routing.sqlite3")
+    reopened_slots = ImplementationSlotRepository(
+        REPO,
+        1,
+        engine.implementation_slots.storage_path,
+        engine.implementation_slots.retired_storage_path,
+    )
+    assert reopened_routing.retry_request(request_id) == stored
+    assert reopened_slots.implementation_generation(owner) == stored.generation
+    assert reopened_slots.active_execution_ids(owner) == ()
+
+
+def test_manual_retry_generation_change_checkpoint_has_zero_downstream_entries(tmp_path, monkeypatch):
+    """#2523 REQ-006: the final production generation checkpoint rejects a
+    request captured for G when the authoritative candidate has advanced to G2."""
+    created_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    old_snapshot = _standalone_snapshot(1, created_at)
+    new_snapshot = dict(old_snapshot, title="Changed after retry capture")
+    config = AutomationConfig(repo_name=REPO)
+    config.issue_specification_validation = True
+    config.issue_decomposition_validation = False
+    engine, github = _ready_engine(tmp_path, monkeypatch, {1: new_snapshot}, config)
+    github.get_issue_comments_strict.return_value = []
+    old_generation = engine._compute_implementation_generation(REPO, old_snapshot, None)
+    pending = engine.issue_stage_routing.accept_retry_request("generation-checkpoint", REPO, 1, old_generation)
+    downstream = MagicMock()
+    engine._process_single_candidate_reserved = downstream
+
+    result = engine._process_single_candidate_unified(
+        REPO,
+        Candidate(type="issue", data=dict(new_snapshot), priority=0),
+        config,
+        explicit_only=True,
+        force=True,
+        retry=True,
+        retry_request_id=pending.request_id,
+        origin="explicit-single-target",
+    )
+
+    assert result.success is False
+    assert result.error is not None and "different inputs" in result.error
+    downstream.assert_not_called()
+    retained = engine.issue_stage_routing.retry_request(pending.request_id)
+    assert retained == pending
+    assert engine.implementation_slots.active_execution_ids(ImplementationOwner("issue", 1)) == ()
+
+
+def test_automatic_stale_jules_recovery_defers_until_predecessor_retires(tmp_path, monkeypatch):
+    """Issue #2286 REQ-003: ordinary admission must not start a durably
+    recorded automatic stale-Jules recovery while the predecessor Jules
+    PR/session evidence is still retained on the owner record, even though no
+    local execution is live -- unlike ``acquire_explicit_retry`` itself,
+    which only refuses on a still-*live* execution."""
+    created_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    snapshot = _standalone_snapshot(1, created_at)
+    config = AutomationConfig(repo_name=REPO)
+    config.issue_specification_validation = True
+    config.issue_decomposition_validation = False
+    engine, github = _ready_engine(tmp_path, monkeypatch, {1: snapshot}, config)
+    reserved = MagicMock(return_value=CandidateProcessingResult(type="issue", number=1, success=True, actions=["dispatched"]))
+    engine._process_single_candidate_reserved = reserved
+    github.get_issue_comments_strict.return_value = []
+    owner = ImplementationOwner("issue", 1)
+
+    generation = engine._compute_implementation_generation(REPO, snapshot, None)
+    execution_id = engine.implementation_slots.start_execution(owner, generation=generation, implementation_pr=9001)
+    assert execution_id is not None
+    engine.issue_stage_routing.record_implementation_owned(REPO, 1, generation)
+    engine.implementation_slots.finish_execution(owner, execution_id)
+    # No live local execution, but the stale PR is still retained on the
+    # owner record -- retirement has not run yet.
+    assert engine.implementation_slots.has_qualifying_implementation_activity(owner)
+
+    authority = capture_stale_jules_recovery(engine.issue_stage_routing, REPO, 1, 9001, generation)
+    assert authority is not None
+
+    candidate = Candidate(type="issue", data=dict(snapshot), priority=0)
+    result = engine._process_single_candidate_unified(REPO, candidate, engine.config, origin="capacity-refill-intake")
+
+    reserved.assert_not_called()
+    assert result.target_outcome == ExplicitTargetOutcome.DEFERRED
+    pending = find_pending_stale_jules_recovery(engine.issue_stage_routing, REPO, 1)
+    assert pending is not None
+    assert pending.status == "pending"
+
+
+def test_automatic_stale_jules_recovery_acquires_once_predecessor_is_free(tmp_path, monkeypatch):
+    """Issue #2286 REQ-004: once the predecessor owner record is free (the
+    periodic reclamation scheduler already retired it), ordinary admission
+    reuses the durable automatic recovery grant to cross the owned-start
+    tombstone for exactly one successor attempt, without a CLI ``--retry``."""
+    created_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    snapshot = _standalone_snapshot(1, created_at)
+    config = AutomationConfig(repo_name=REPO)
+    config.issue_specification_validation = True
+    config.issue_decomposition_validation = False
+    engine, github = _ready_engine(tmp_path, monkeypatch, {1: snapshot}, config)
+    reserved = MagicMock(return_value=CandidateProcessingResult(type="issue", number=1, success=True, actions=["dispatched"]))
+    engine._process_single_candidate_reserved = reserved
+    github.get_issue_comments_strict.return_value = []
+    owner = ImplementationOwner("issue", 1)
+
+    generation = engine._compute_implementation_generation(REPO, snapshot, None)
+    execution_id = engine.implementation_slots.start_execution(owner, generation=generation)
+    assert execution_id is not None
+    assert engine.implementation_slots.record_provider_session(owner, "temporary-predecessor")
+    engine.issue_stage_routing.record_implementation_owned(REPO, 1, generation)
+    engine.implementation_slots.finish_execution(owner, execution_id)
+
+    authority = capture_stale_jules_recovery(engine.issue_stage_routing, REPO, 1, 9001, generation)
+    assert authority is not None
+
+    candidate = Candidate(type="issue", data=dict(snapshot), priority=0)
+    waiting = engine._process_single_candidate_unified(REPO, candidate, engine.config, origin="capacity-refill-intake")
+
+    assert waiting.target_outcome is ExplicitTargetOutcome.DEFERRED
+    reserved.assert_not_called()
+    retained = engine.issue_stage_routing.retry_request(authority.request_id)
+    assert retained == authority
+
+    # The authoritative retirement boundary clears the temporary blocker;
+    # the same controller and production candidate origin must resume R.
+    assert engine.implementation_slots.finish_provider_session(owner, "temporary-predecessor")
+    result = engine._process_single_candidate_unified(REPO, Candidate(type="issue", data=dict(snapshot), priority=0), engine.config, origin="capacity-refill-intake")
+
+    assert result.success
+    reserved.assert_called_once()
+    assert reserved.call_args.kwargs["manual_retry"] is True
+    granted = reserved.call_args.kwargs["retry_authority"]
+    assert granted.request_id == authority.request_id
+    assert granted.status == "owned"
+    assert engine.implementation_slots.implementation_generation(owner) == generation
+    assert engine.issue_stage_routing.is_implementation_owned(REPO, 1, generation)
+    assert find_pending_stale_jules_recovery(engine.issue_stage_routing, REPO, 1) is None
+
+
+def test_stale_recovery_hierarchy_outage_retains_refill_and_exact_request(tmp_path, monkeypatch):
+    """#2523 REQ-005/REQ-006: a temporary failure inside the real slot
+    acquisition remains retryable and cannot strand the durable recovery R."""
+    created_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    snapshot = _standalone_snapshot(1, created_at)
+    config = AutomationConfig(repo_name=REPO)
+    config.issue_specification_validation = True
+    config.issue_decomposition_validation = False
+    engine, _github = _ready_engine(tmp_path, monkeypatch, {1: snapshot}, config)
+    generation = engine._compute_implementation_generation(REPO, snapshot, None)
+    authority = capture_stale_jules_recovery(engine.issue_stage_routing, REPO, 1, 9001, generation)
+    assert authority is not None
+
+    class AcquisitionHierarchyAdapter(GitHubClient):
+        """Minimal production-compatible reader with one acquisition outage."""
+
+        def __init__(self):
+            self.fail_hierarchy = True
+
+        def get_issue_dispatch_snapshot_strict(self, _repository, _number):
+            return dict(snapshot)
+
+        def get_direct_sub_issues_strict(self, _repository, _number):
+            return []
+
+        def get_open_sub_issues_strict(self, _repository, _number):
+            return []
+
+        def get_parent_issue_details_strict(self, _repository, _number):
+            return None
+
+        def get_parent_issue_number_strict(self, _repository, _number):
+            return None
+
+        def get_issue_hierarchy_generation_strict(self, _repository, _number):
+            if self.fail_hierarchy:
+                raise RuntimeError("temporary hierarchy outage")
+            return "hierarchy-generation-1"
+
+    adapter = AcquisitionHierarchyAdapter()
+    engine.github = adapter
+    # Keep unrelated relationship discovery outside this acquisition-focused
+    # oracle; the real slots repository still consumes the adapter above.
+    monkeypatch.setattr(engine, "_standalone_relationship_is_current", lambda *_args: True)
+    downstream = MagicMock(return_value=CandidateProcessingResult(type="issue", number=1, success=True, actions=["dispatched"]))
+    engine._process_single_candidate_reserved = downstream
+    candidate = Candidate(type="issue", data=dict(snapshot), priority=0)
+
+    failed = engine._process_single_candidate_unified(REPO, candidate, config, origin="capacity-refill-intake")
+
+    assert failed.success is False
+    assert failed.refill_retry_required is True
+    assert failed.error is not None and "authoritative hierarchy" in failed.error
+    downstream.assert_not_called()
+    retained = engine.issue_stage_routing.retry_request(authority.request_id)
+    assert retained is not None
+    assert (retained.request_id, retained.attempt_id, retained.generation) == (
+        authority.request_id,
+        authority.attempt_id,
+        authority.generation,
+    )
+    assert retained.predecessor_captured is True
+    assert retained.status == "pending"
+    assert engine.implementation_slots.active_execution_ids(ImplementationOwner("issue", 1)) == ()
+
+    # The same engine/controller retries its retained refill obligation after
+    # the authoritative read recovers; no slot transition or new wake occurs.
+    adapter.fail_hierarchy = False
+    resumed = engine._process_single_candidate_unified(
+        REPO,
+        Candidate(type="issue", data=dict(snapshot), priority=0),
+        config,
+        origin="capacity-refill-intake",
+    )
+
+    assert resumed.success is True
+    downstream.assert_called_once()
+    granted = downstream.call_args.kwargs["retry_authority"]
+    assert (granted.request_id, granted.attempt_id, granted.generation) == (
+        authority.request_id,
+        authority.attempt_id,
+        authority.generation,
+    )
+    assert granted.status == "owned"
+
+
+def test_automatic_stale_jules_recovery_invalidated_on_generation_change(tmp_path, monkeypatch):
+    """Issue #2286 REQ-005: a specification change underneath a still-pending
+    automatic grant permanently invalidates it; ordinary admission then
+    proceeds with no special retry semantics at all."""
+    created_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    snapshot = _standalone_snapshot(1, created_at)
+    config = AutomationConfig(repo_name=REPO)
+    config.issue_specification_validation = True
+    config.issue_decomposition_validation = False
+    engine, github = _ready_engine(tmp_path, monkeypatch, {1: snapshot}, config)
+    reserved = MagicMock(return_value=CandidateProcessingResult(type="issue", number=1, success=True, actions=["dispatched"]))
+    engine._process_single_candidate_reserved = reserved
+    github.get_issue_comments_strict.return_value = []
+
+    stale_generation = "a-generation-that-no-longer-matches"
+    authority = capture_stale_jules_recovery(engine.issue_stage_routing, REPO, 1, 9001, stale_generation)
+    assert authority is not None
+
+    candidate = Candidate(type="issue", data=dict(snapshot), priority=0)
+    result = engine._process_single_candidate_unified(REPO, candidate, engine.config, origin="capacity-refill-intake")
+
+    assert result.success
+    reserved.assert_called_once()
+    assert reserved.call_args.kwargs.get("manual_retry") is not True
+    stored = engine.issue_stage_routing.retry_request(authority.request_id)
+    assert stored is not None
+    assert stored.status == "invalidated"
+
+
+def test_malformed_generation_binding_fails_closed_at_production_boundary_target_scoped(tmp_path, monkeypatch):
+    """REQ-008/AS-007 at the real admission boundary: retained implementation
+    evidence with a malformed (non-string) generation binding blocks a new
+    start for that owner only -- while an unrelated owner is unaffected.
+
+    A pre-existing owner record for the *same* Issue is already refused by
+    an earlier, unrelated "implementation ownership already exists" gate in
+    ``_process_single_candidate_unified_impl`` unless the caller is an
+    explicit manual retry (``explicit_only``+``force``+``retry``), so this
+    drives admission the same way ``test_manual_retry_*`` in
+    ``test_specification_validation_lifecycle.py`` does -- the real supported
+    "retry/resumption" origin from REQ-009 -- to actually reach the
+    generation-ownership adapter this Issue adds.
+    """
+    created_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    snapshot1 = _standalone_snapshot(1, created_at)
+    snapshot2 = _standalone_snapshot(2, created_at)
+    config = AutomationConfig(repo_name=REPO)
+    config.issue_specification_validation = True
+    config.issue_decomposition_validation = False
+    engine, github = _ready_engine(tmp_path, monkeypatch, {1: snapshot1, 2: snapshot2}, config)
+    # Capacity for two independent owners, so #2's admission below is never
+    # blocked by #1's occupied slot -- this test is about generation-binding
+    # fail-closure, not normal capacity contention.
+    engine.implementation_slots = ImplementationSlotRepository(REPO, 2, tmp_path / "slots.json")
+    engine._process_single_candidate_reserved = MagicMock(return_value=CandidateProcessingResult(type="issue", number=0, success=True, actions=["dispatched"]))
+    github.get_issue_comments_strict.return_value = []
+
+    owner1 = ImplementationOwner("issue", 1)
+    # A record with retained implementation-mutating evidence (an
+    # implementation PR) but a malformed, non-string generation binding --
+    # the shape REQ-008 requires production admission to refuse rather than
+    # guess.
+    assert engine.implementation_slots.reserve(owner1, implementation_pr=999)
+    slots_path = engine.implementation_slots.storage_path
+    raw_state = json.loads(slots_path.read_text())
+    raw_state[owner1.key]["implementation_generation"] = 12345
+    slots_path.write_text(json.dumps(raw_state))
+
+    candidate1 = Candidate(type="issue", data=dict(snapshot1), priority=0)
+    result1 = engine._process_single_candidate_unified(REPO, candidate1, engine.config, explicit_only=True, force=True, retry=True, origin="explicit-single-target")
+
+    engine._process_single_candidate_reserved.assert_not_called()
+    assert result1.error is not None
+    assert not result1.success
+    assert engine.implementation_slots.active_execution_ids(owner1) == ()
+    # The malformed value is untouched -- never coerced or silently rebound
+    # to whatever generation admission just computed as "current".
+    unchanged_state = json.loads(slots_path.read_text())
+    assert unchanged_state[owner1.key]["implementation_generation"] == 12345
+
+    # An unrelated owner (#2, no pre-existing record) is unaffected: it
+    # starts and is durably owned normally through ordinary admission.
+    candidate2 = Candidate(type="issue", data=dict(snapshot2), priority=0)
+    result2 = engine._process_single_candidate_unified(REPO, candidate2, engine.config, origin="worker")
+    assert result2.success
+    owner2 = ImplementationOwner("issue", 2)
+    generation2 = engine.implementation_slots.implementation_generation(owner2)
+    assert generation2 is not None
+    assert engine.issue_stage_routing.is_implementation_owned(REPO, 2, generation2)
+
+
+def test_ambiguous_provider_outcome_resolves_three_ways_at_production_boundary(tmp_path, monkeypatch):
+    """REQ-003 through REQ-005/AS-004 at the real admission boundary.
+
+    On the current production Issue-implementation path, ownership is
+    already acquired at the local-execution boundary before any provider
+    call is attempted (REQ-003), so an "ambiguous transport" outcome is
+    exercised here as three distinct authoritative states that a later,
+    re-entrant admission for the same generation discovers in the durable
+    ``ImplementationSlotRepository`` evidence -- the same evidence a real
+    reconciliation pass reads to decide the identical three outcomes. As in
+    the REQ-008 test above, reaching this owner's already-retained evidence
+    through the real admission boundary requires the manual-retry origin.
+    """
+    created_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    snapshot = _standalone_snapshot(1, created_at)
+    config = AutomationConfig(repo_name=REPO)
+    config.issue_specification_validation = True
+    config.issue_decomposition_validation = False
+    owner = ImplementationOwner("issue", 1)
+
+    # (a) Confirmed acquisition: a retained provider session for G survives
+    # even though the local execution that first acquired it is gone; a
+    # retry is recognized as a continuation of G, not a fresh routing start.
+    engine_a, github_a = _ready_engine(tmp_path / "a", monkeypatch, {1: dict(snapshot)}, config)
+    reserved_a = MagicMock(return_value=CandidateProcessingResult(type="issue", number=1, success=True, actions=["dispatched"]))
+    engine_a._process_single_candidate_reserved = reserved_a
+    github_a.get_issue_comments_strict.return_value = []
+
+    # Cross the real production acquisition boundary first (ordinary
+    # admission) rather than directly constructing the owned routing record.
+    initial_candidate = Candidate(type="issue", data=dict(snapshot), priority=0)
+    initial_result = engine_a._process_single_candidate_unified(REPO, initial_candidate, engine_a.config, origin="worker")
+    assert initial_result.success
+    generation = engine_a.implementation_slots.implementation_generation(owner)
+    assert generation is not None
+    assert engine_a.issue_stage_routing.is_implementation_owned(REPO, 1, generation)
+
+    # Simulate the provider now retaining this attempt after the local
+    # execution that originally acquired it has finished.
+    assert engine_a.implementation_slots.record_provider_session(owner, "ambiguous-session")
+    for execution_id in engine_a.implementation_slots.active_execution_ids(owner):
+        engine_a.implementation_slots.finish_execution(owner, execution_id)
+    assert engine_a.implementation_slots.active_execution_ids(owner) == ()
+
+    candidate_a = Candidate(type="issue", data=dict(snapshot), priority=0)
+    result_a = engine_a._process_single_candidate_unified(REPO, candidate_a, engine_a.config, explicit_only=True, force=True, retry=True, origin="explicit-single-target")
+    assert result_a.success
+    assert reserved_a.call_count == 2  # the initial dispatch, plus this legitimate continuation
+    # G's binding and tombstone are unchanged -- recognized as the same
+    # already-owned attempt, never rebound or duplicated as a new G2.
+    assert engine_a.implementation_slots.implementation_generation(owner) == generation
+    assert engine_a.issue_stage_routing.is_implementation_owned(REPO, 1, generation)
+
+    # (b) Confirmed non-acquisition: nothing was ever actually retained for
+    # this owner (a bare idle reservation only, since released) -- G is
+    # fully retryable through ordinary (non-retry) admission.
+    engine_b, github_b = _ready_engine(tmp_path / "b", monkeypatch, {1: dict(snapshot)}, config)
+    reserved_b = MagicMock(return_value=CandidateProcessingResult(type="issue", number=1, success=True, actions=["dispatched"]))
+    engine_b._process_single_candidate_reserved = reserved_b
+    github_b.get_issue_comments_strict.return_value = []
+    assert engine_b.implementation_slots.reserve_new(owner)
+    assert engine_b.implementation_slots.release_unbound_idle_owner(owner)
+
+    candidate_b = Candidate(type="issue", data=dict(snapshot), priority=0)
+    result_b = engine_b._process_single_candidate_unified(REPO, candidate_b, engine_b.config, origin="worker")
+    assert result_b.success
+    assert reserved_b.call_count == 1
+    generation_b = engine_b.implementation_slots.implementation_generation(owner)
+    assert generation_b is not None
+    assert engine_b.issue_stage_routing.is_implementation_owned(REPO, 1, generation_b)
+
+    # (c) Evidence unavailable: an unreadable generation binding for this
+    # owner defers both a new start and a tombstone rather than treating
+    # absent/unreadable evidence as either oracle. (A whole-file JSON
+    # corruption is deliberately not used here: it would also break the
+    # unrelated, pre-existing ``has_provider_sessions`` read this same
+    # admission path performs earlier, which is outside this Issue's scope.)
+    engine_c, github_c = _ready_engine(tmp_path / "c", monkeypatch, {1: dict(snapshot)}, config)
+    reserved_c = MagicMock(return_value=CandidateProcessingResult(type="issue", number=1, success=True, actions=["dispatched"]))
+    engine_c._process_single_candidate_reserved = reserved_c
+    github_c.get_issue_comments_strict.return_value = []
+    assert engine_c.implementation_slots.reserve(owner, implementation_pr=999)
+    slots_path_c = engine_c.implementation_slots.storage_path
+    raw_state_c = json.loads(slots_path_c.read_text())
+    raw_state_c[owner.key]["implementation_generation"] = 12345
+    slots_path_c.write_text(json.dumps(raw_state_c))
+
+    candidate_c = Candidate(type="issue", data=dict(snapshot), priority=0)
+    result_c = engine_c._process_single_candidate_unified(REPO, candidate_c, engine_c.config, explicit_only=True, force=True, retry=True, origin="explicit-single-target")
+    assert not result_c.success
+    assert result_c.error is not None
+    assert reserved_c.call_count == 0
+    assert not engine_c.issue_stage_routing.is_implementation_owned(REPO, 1, generation)
+
+
+@pytest.mark.asyncio
+async def test_capacity_deferred_generation_remains_retryable_until_acquired(tmp_path, monkeypatch):
+    """AS-001 at the real admission boundary: deferral before any execution is
+    durable leaves the generation fully retryable; it becomes owned once
+    capacity actually admits it."""
+    created_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    snapshots = {1: _standalone_snapshot(1, created_at)}
+    config = AutomationConfig(repo_name=REPO)
+    config.issue_specification_validation = True
+    config.issue_decomposition_validation = False
+    engine, github = _ready_engine(tmp_path, monkeypatch, snapshots, config)
+    engine._process_single_candidate_reserved = MagicMock(return_value=CandidateProcessingResult(type="issue", number=1, success=True, actions=["dispatched"]))
+    github.get_issue_comments_strict.return_value = []
+
+    # Occupy the single normal slot with an unrelated owner first.
+    other_owner = ImplementationOwner("issue", 99)
+    assert engine.implementation_slots.reserve_new(other_owner)
+
+    worker = asyncio.create_task(engine._worker_loop(REPO, 0, "issue"))
+    await engine.invalidate_entity(REPO, "issue", 1)
+    await asyncio.wait_for(engine.queue.join(), timeout=5)
+
+    owner = ImplementationOwner("issue", 1)
+    assert engine.implementation_slots.implementation_generation(owner) is None
+    expected_generation = None
+    pending = engine.issue_stage_routing.pending(REPO, "implementation")
+    assert len(pending) == 1
+    expected_generation = pending[0].generation
+    assert not engine.issue_stage_routing.is_implementation_owned(REPO, 1, expected_generation)
+
+    # Free the slot and let capacity refill (simulated here as another
+    # invalidation, matching how the real capacity-refill loop re-enters
+    # this exact admission boundary) admit the still-retryable generation.
+    assert engine.implementation_slots.release_unbound_idle_owner(other_owner)
+    await engine.invalidate_entity(REPO, "issue", 1)
+    await asyncio.wait_for(engine.queue.join(), timeout=5)
+    assert engine.implementation_slots.implementation_generation(owner) == expected_generation
+    assert engine.issue_stage_routing.is_implementation_owned(REPO, 1, expected_generation)
+
+    worker.cancel()
+    await asyncio.gather(worker, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_family_supersession_and_exact_reversion_do_not_rebind_old_ownership(tmp_path, monkeypatch):
+    """AS-003 at the real admission boundary: editing then exactly reverting a
+    child's family must not resurrect its already-owned generation."""
+    created_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    parent_body = "## Objective\n\nCoordinate delivery."
+    child_body = "Parent-Issue: #10\n\n## Objective\n\nShip child.\n\n## Requirements\n\nREQ-001: Ship child."
+    snapshots = {
+        10: {"id": 100, "number": 10, "title": "P", "body": parent_body, "state": "open", "created_at": created_at, "labels": [{"name": "implementation-ready"}]},
+        11: {"id": 110, "number": 11, "title": "A", "body": child_body, "state": "open", "created_at": created_at, "labels": [], "parent_issue_number": 10},
+    }
+    config = AutomationConfig(repo_name=REPO)
+    config.issue_specification_validation = True
+    config.issue_decomposition_validation = False
+    engine, github = _routing_engine(tmp_path, monkeypatch, snapshots, [11], config)
+    engine._process_single_candidate = AutomationEngine._process_single_candidate.__get__(engine)
+    engine._specification_validators[REPO] = SpecificationValidationLifecycle(REPO, "policy", tmp_path / "ready.json", lambda *_args: SpecificationAnalysisResult("READY"))
+    engine.implementation_slots = ImplementationSlotRepository(REPO, 1, tmp_path / "slots.json")
+    engine._process_single_candidate_reserved = MagicMock(return_value=CandidateProcessingResult(type="issue", number=11, success=True, actions=["dispatched"]))
+    github.get_issue_comments_strict.return_value = []
+
+    worker = asyncio.create_task(engine._worker_loop(REPO, 0, "issue"))
+    await engine.invalidate_entity(REPO, "issue", 11)
+    await asyncio.wait_for(engine.queue.join(), timeout=5)
+    owner = ImplementationOwner("issue", 11)
+    original_generation = engine.implementation_slots.implementation_generation(owner)
+    assert original_generation is not None
+    assert engine.issue_stage_routing.is_implementation_owned(REPO, 11, original_generation)
+
+    # Release the local execution/PR evidence (as a real completed/abandoned
+    # attempt would) while keeping the routing tombstone, then edit the
+    # child so its Implementation generation changes.
+    assert engine.implementation_slots.release_unbound_idle_owner(owner)
+    snapshots[11] = {**snapshots[11], "title": "A - edited"}
+    await engine.invalidate_entity(REPO, "issue", 11)
+    await asyncio.wait_for(engine.queue.join(), timeout=5)
+    superseded_generation = engine.implementation_slots.implementation_generation(owner)
+    assert superseded_generation is not None and superseded_generation != original_generation
+    assert engine.issue_stage_routing.is_implementation_owned(REPO, 11, original_generation)
+    assert engine.issue_stage_routing.is_implementation_owned(REPO, 11, superseded_generation)
+
+    # Exact reversion: restore the original title and re-release evidence.
+    assert engine.implementation_slots.release_unbound_idle_owner(owner)
+    snapshots[11] = {**snapshots[11], "title": "A"}
+    await engine.invalidate_entity(REPO, "issue", 11)
+    await asyncio.wait_for(engine.queue.join(), timeout=5)
+    # The reverted generation is still suppressed by its recovered tombstone;
+    # the owner record must not have been rebound to the old generation.
+    assert engine.implementation_slots.implementation_generation(owner) != original_generation
+
+    worker.cancel()
+    await asyncio.gather(worker, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_stale_jules_recovery_continues_same_generation_without_new_routing_start(tmp_path, monkeypatch):
+    """AS-005/REQ-007/REQ-009: stale-provider recovery is a continuation of the
+    already-acquired attempt, never a second routing start for the same
+    generation."""
+    created_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    snapshots = {1: _standalone_snapshot(1, created_at)}
+    config = AutomationConfig(repo_name=REPO)
+    config.issue_specification_validation = True
+    config.issue_decomposition_validation = False
+    engine, github = _ready_engine(tmp_path, monkeypatch, snapshots, config)
+    engine._process_single_candidate_reserved = MagicMock(return_value=CandidateProcessingResult(type="issue", number=1, success=True, actions=["dispatched"]))
+    github.get_issue_comments_strict.return_value = []
+
+    worker = asyncio.create_task(engine._worker_loop(REPO, 0, "issue"))
+    await engine.invalidate_entity(REPO, "issue", 1)
+    await asyncio.wait_for(engine.queue.join(), timeout=5)
+    worker.cancel()
+    await asyncio.gather(worker, return_exceptions=True)
+
+    owner = ImplementationOwner("issue", 1)
+    generation = engine.implementation_slots.implementation_generation(owner)
+    assert generation is not None
+    assert engine.issue_stage_routing.is_implementation_owned(REPO, 1, generation)
+    assert engine.implementation_slots.record_provider_session(owner, "jules-session-1")
+    for execution_id in engine.implementation_slots.active_execution_ids(owner):
+        engine.implementation_slots.finish_execution(owner, execution_id)
+    # This owner record now has no execution left, only a retained provider
+    # session, mirroring what a real Jules dispatch leaves behind.
+
+    stale_session = {
+        "name": f"sessions/jules-session-1",
+        "createTime": (datetime.now(timezone.utc) - timedelta(hours=100)).isoformat(),
+    }
+    jules_client = MagicMock()
+    jules_client.list_sessions.return_value = [stale_session]
+    cloud_manager = MagicMock()
+    cloud_manager.get_issue_by_session.return_value = 1
+    monkeypatch.setattr("auto_coder.issue_processor.JulesClient", lambda: jules_client)
+    monkeypatch.setattr("auto_coder.issue_processor.CloudManager", lambda _repo: cloud_manager)
+    monkeypatch.setattr("auto_coder.issue_processor.resolve_authoritative_item_type", lambda *_a, **_k: "issue")
+    monkeypatch.setattr("auto_coder.issue_processor.is_session_stopped", lambda _sid: False)
+    monkeypatch.setattr("auto_coder.issue_processor.get_session_pull_request", lambda _session: None)
+    monkeypatch.setattr("auto_coder.issue_processor._stop_jules_session_for_issue", lambda *_a, **_k: True)
+    monkeypatch.setattr("auto_coder.issue_processor._take_issue_actions", lambda *_a, **_k: ["fallback dispatched"])
+    github.get_issue_dispatch_snapshot_strict.side_effect = lambda _repo, _number: dict(snapshots[1])
+    github.get_issue.side_effect = lambda _repo, _number: dict(snapshots[1])
+    github.get_issue_details.side_effect = lambda issue: dict(issue)
+    github.has_linked_pr.return_value = False
+
+    finish_calls: list[str] = []
+    real_finish = engine.implementation_slots.finish_execution
+
+    def observe_finish(finished_owner, execution_id):  # type: ignore[no-untyped-def]
+        assert finished_owner == owner
+        finish_calls.append(execution_id)
+        return real_finish(finished_owner, execution_id)
+
+    monkeypatch.setattr(engine.implementation_slots, "finish_execution", observe_finish)
+    service_entries: list[int] = []
+    real_execute = IssueImplementationService.execute
+
+    def observe_service(service, request, ports):  # type: ignore[no-untyped-def]
+        service_entries.append(request.target_number)
+        return real_execute(service, request, ports)
+
+    monkeypatch.setattr(IssueImplementationService, "execute", observe_service)
+    monkeypatch.setattr("auto_coder.cli_helpers.create_high_score_backend_manager", lambda: MagicMock(name="high-score-policy"))
+    monkeypatch.setattr("auto_coder.attempt_manager.increment_attempt", lambda *_args: 2)
+
+    actions = engine.handle_stale_jules_issue_sessions(REPO)
+    assert "fallback dispatched" in actions
+    assert service_entries == [1]
+    assert len(finish_calls) == 1
+    assert finish_calls[0]
+    # Still the same generation, still owned exactly once: no new routing
+    # arrival/tombstone was fabricated for a "new" attempt.
+    assert engine.implementation_slots.implementation_generation(owner) == generation
+    assert engine.issue_stage_routing.is_implementation_owned(REPO, 1, generation)
+    assert engine.issue_stage_routing.pending(REPO, "implementation") == ()
+    assert engine.implementation_slots.validation_identity(owner) is not None

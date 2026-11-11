@@ -1,0 +1,1809 @@
+"""
+BackendManager: Manages multiple backends in rotation, handling usage limits and
+automatic switching when the same current_test_file appears 3 consecutive times in apply_workspace_test_fix.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import os
+import re
+import threading
+import time
+import uuid
+import weakref
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+from .automation_config import AutomationConfig
+from .backend_provider_manager import BackendProviderManager
+from .backend_session_manager import BackendSessionManager, BackendSessionState, create_session_state
+from .backend_state_manager import BackendStateManager
+from .exceptions import (
+    AutoCoderRetryableBackendError,
+    AutoCoderTimeoutError,
+    AutoCoderUsageLimitError,
+    LocalWriterSettlementError,
+    SessionWorkspaceCompatibilityError,
+)
+from .invocation_admission import (
+    InvocationHandle,
+    ci_repair_designated,
+    current_invocation_gate,
+    current_invocation_target,
+    set_pending_invocation_handle,
+)
+from .invocation_process_supervisor import CgroupV2Owner, InvocationProcessSupervisor
+from .llm_backend_config import LLMBackendConfiguration, get_llm_config
+from .llm_client_base import LLMBackendManagerBase
+from .local_execution_boundary import EvidenceStatus, bind_local_execution_boundary
+from .local_llm_observability import observe_local_llm_call
+from .local_session_continuation import LiveRootReuseDecision, LocalContinuationError, LocalResultLifecycleAuthority, RetainedLocalSession
+from .logger_config import get_logger, log_calls
+from .progress_footer import ProgressStage
+from .review_audit import ReviewInteractionRecord
+from .review_capture.context import bind_interaction_id, get_active_review_context
+from .review_capture.recorder import get_review_audit_store
+from .shutdown_context import new_work_allowed
+from .shutdown_interrupt import mark_invocation_active
+from .utils import bind_supervised_command_execution
+from .worktree_utils import (
+    LocalPreparationNotStartedError,
+    LocalWorkspaceOwnership,
+    WorkspacePreparationError,
+    bind_retained_local_workspace,
+    current_local_caller_checkpoint,
+    current_local_caller_identity,
+    get_current_local_workspace,
+    isolated_local_llm_worktree,
+    record_implementation_workspace_tests_skipped,
+    refresh_local_workspace_binding,
+    run_implementation_workspace_tests,
+    sync_worktree_changes_back,
+)
+
+logger = get_logger(__name__)
+
+
+def _dispose_local_sessions(sessions: dict[str, RetainedLocalSession]) -> None:
+    """Release abandoned manager leases without deleting active writer roots."""
+    for session_id, retained in tuple(sessions.items()):
+        if retained.predecessor.writer_completion is not EvidenceStatus.ESTABLISHED:
+            continue
+        try:
+            retained.dispose()
+            del sessions[session_id]
+        except LocalContinuationError as exc:
+            logger.warning("Could not release abandoned local session: {}", exc)
+
+
+CLOUD_BACKEND_TYPES = frozenset({"claude-routine", "codex-cloud", "jules"})
+
+# Global singleton instance for general LLM operations
+_llm_instance: Optional[BackendManager] = None
+_noedit_instance: Optional[BackendManager] = None
+_instance_lock = threading.Lock()
+_initialization_lock = threading.Lock()
+
+# Explicit exports for mypy
+__all__ = [
+    "BackendManager",
+    "get_llm_backend_manager",
+    "run_llm_prompt",
+    "get_llm_backend_and_model",
+    "get_llm_backend_provider_and_model",
+    "LLMBackendManager",
+    # New names (preferred)
+    "get_noedit_backend_manager",
+    "run_llm_noedit_prompt",
+    "get_noedit_backend_and_model",
+    # Deprecated names (kept for backward compatibility)
+    "get_message_backend_manager",
+    "run_llm_message_prompt",
+    "get_message_backend_and_model",
+    # Utility functions
+    "parse_llm_output_as_json",
+]
+
+
+def parse_llm_output_as_json(output: str) -> Any:
+    """
+    Parse LLM output as JSON and extract content.
+
+    This standalone helper function handles various JSON output formats:
+    - Pure JSON (dict or list)
+    - Text followed by JSON (e.g., "Here's the result: {...}")
+    - JSON followed by text (e.g., "{...}\n\nAdditional info")
+    - Text, JSON, and more text (e.g., "Result: {...}\nEnd")
+    - Responses that include the prompt content before the final JSON block
+    - Markdown code blocks (e.g., "```json\n{...}\n```")
+
+    For list outputs (conversation history), extracts the content from the last message.
+    For dict outputs, returns the dict directly.
+
+    Args:
+        output: The raw LLM output string to parse
+
+    Returns:
+        The extracted content (dict or string from the last message in a list)
+
+    Raises:
+        ValueError: If the output cannot be parsed as JSON
+    """
+
+    def _extract_content(parsed: Any) -> Any:
+        """Extract the relevant content from parsed JSON."""
+        if isinstance(parsed, list):
+            if not parsed:
+                raise ValueError("Parsed JSON is an empty list")
+            last_message = parsed[-1]
+            if isinstance(last_message, dict):
+                for key in ("content", "message", "text", "response"):
+                    if key in last_message:
+                        return last_message[key]
+                return last_message
+            return last_message
+        if isinstance(parsed, dict):
+            return parsed
+        return parsed
+
+    # First, try to handle markdown code blocks (common in LLM responses)
+    stripped_output = output.strip()
+    if "```json" in stripped_output:
+        try:
+            json_match = stripped_output.split("```json")[1].split("```")[0].strip()
+            parsed = json.loads(json_match)
+            return _extract_content(parsed)
+        except (json.JSONDecodeError, IndexError):
+            pass
+    elif "```" in stripped_output:
+        try:
+            json_match = stripped_output.split("```")[1].split("```")[0].strip()
+            parsed = json.loads(json_match)
+            return _extract_content(parsed)
+        except (json.JSONDecodeError, IndexError):
+            pass
+
+    # Try to parse the entire output (covers primitive JSON values)
+    try:
+        parsed_full = json.loads(stripped_output)
+        return _extract_content(parsed_full)
+    except json.JSONDecodeError:
+        pass
+
+    # Fall back to scanning for the last valid JSON block in the output
+    decoder = json.JSONDecoder()
+    json_candidates: List[Any] = []
+    search_pos = 0
+
+    while search_pos < len(output):
+        match = re.search(r"[\\[{]", output[search_pos:])
+        if not match:
+            break
+        start = search_pos + match.start()
+        try:
+            parsed_partial, end = decoder.raw_decode(output[start:])
+            json_candidates.append(parsed_partial)
+            search_pos = start + end
+        except json.JSONDecodeError:
+            search_pos = start + 1
+
+    if not json_candidates:
+        raise ValueError(f"Failed to parse output as JSON: No JSON object could be decoded\nOutput: {output}")
+
+    # Use the last successfully parsed JSON block (handles prompt + JSON scenarios)
+    parsed_json = _extract_content(json_candidates[-1])
+
+    # Special handling for agent runner output which wraps result in a "result" field
+    # and sometimes that result is a string containing JSON that needs to be parsed again
+    if isinstance(parsed_json, dict) and "result" in parsed_json:
+        inner_result = parsed_json["result"]
+        # If inner result is a string, try to parse it as JSON
+        if isinstance(inner_result, str):
+            try:
+                # Check for markdown code blocks in the inner string
+                if "```json" in inner_result:
+                    inner_json_match = inner_result.split("```json")[1].split("```")[0].strip()
+                    return json.loads(inner_json_match)
+                elif "```" in inner_result:
+                    inner_json_match = inner_result.split("```")[1].split("```")[0].strip()
+                    return json.loads(inner_json_match)
+                else:
+                    # Try direct parsing
+                    return json.loads(inner_result.strip())
+            except (json.JSONDecodeError, IndexError):
+                # If parsing fails, return the original parsed_json
+                pass
+        # If inner result is already a dict/list, return it
+        elif isinstance(inner_result, (dict, list)):
+            return inner_result
+
+    return parsed_json
+
+
+class BackendManager(LLMBackendManagerBase):
+    """Wrapper for managing LLM clients in circular rotation.
+
+    - Provides _run_llm_cli(prompt) (client compatibility)
+    - run_test_fix_prompt(prompt, current_test_file) is an extension for apply_workspace_test_fix:
+      If the same model and current_test_file are given 3 consecutive times, rotate to the next backend.
+      If a different current_test_file comes, reset to the default backend.
+    - Each client is expected to throw AutoCoderUsageLimitError when reaching usage limits,
+      and this triggers switching to the next backend for automatic retry.
+    """
+
+    @staticmethod
+    def _production_local_supervisor() -> InvocationProcessSupervisor:
+        """Build the Linux writer owner from explicit deployment credentials."""
+        uid_text = os.environ.get("AUTO_CODER_LOCAL_WORKER_UID", "")
+        gid_text = os.environ.get("AUTO_CODER_LOCAL_WORKER_GID", "")
+        try:
+            uid = int(uid_text)
+            gid = int(gid_text)
+        except ValueError:
+            uid = None
+            gid = None
+        return InvocationProcessSupervisor(owner=CgroupV2Owner(worker_uid=uid, worker_gid=gid))
+
+    def __init__(
+        self,
+        default_backend: str,
+        default_client: Any,
+        factories: Dict[str, Callable[[], Any]],
+        order: Optional[List[str]] = None,
+        provider_manager: Optional[BackendProviderManager] = None,
+        automatic_session_resume: bool = True,
+        local_supervisor_factory: Optional[Callable[[], InvocationProcessSupervisor]] = None,
+    ) -> None:
+        # Backend order (circular)
+        self._all_backends = order[:] if order else list(factories.keys())
+        # Rotate default to front
+        if default_backend in self._all_backends:
+            while self._all_backends[0] != default_backend:
+                self._all_backends.append(self._all_backends.pop(0))
+        else:
+            self._all_backends.insert(0, default_backend)
+        # Client cache (lazy generation)
+        self._factories = factories
+        self._clients: Dict[str, Optional[Any]] = {k: None for k in self._all_backends}
+        self._clients[default_backend] = default_client
+        self._current_idx = 0
+        self._default_backend = default_backend
+        self._automatic_session_resume = automatic_session_resume
+        self._local_supervisor_factory = local_supervisor_factory or self._production_local_supervisor
+
+        # Track recent prompt/model/backend for apply_workspace_test_fix
+        self._last_prompt: Optional[str] = None
+        # Initialize _last_backend to current backend for testing purposes
+        self._last_backend: Optional[str] = default_backend
+        # Also record the most recently used model name to leave correct information in test CSV
+        # Initialize from default client if available
+        self._last_model: Optional[str] = getattr(default_client, "model_name", None)
+        # If model_name is not available from client, try to get it from the client directly
+        if self._last_model is None and hasattr(default_client, "get_last_backend_and_model"):
+            # Some clients might have this method to get backend info
+            try:
+                backend, model = default_client.get_last_backend_and_model()
+                self._last_model = model
+            except Exception:
+                self._last_model = None
+        # Track current_test_file (switch if same file continues 3 times)
+        self._last_test_file: Optional[str] = None
+        self._same_test_file_count: int = 0
+
+        # Track session ID of the last executed backend
+        self._last_session_id: Optional[str] = None
+        # Sessions produced by an accepted editable generation whose private
+        # root has since been released cannot be resumed in a newly cloned root.
+        self._released_local_workspace_sessions: set[str] = set()
+        self._retained_local_sessions: dict[str, RetainedLocalSession] = {}
+        self._session_finalizer = weakref.finalize(self, _dispose_local_sessions, self._retained_local_sessions)
+        self._local_result_lifecycle = LocalResultLifecycleAuthority()
+
+        # Whether the most recent continue_session() call actually resumed the
+        # requested session, or fell back to a fresh session/backend. Callers
+        # that require session continuity (e.g. adversarial evidence-completion
+        # rounds) must check this before trusting the response.
+        self._last_continue_session_resumed: bool = False
+
+        # Provider manager for backend provider metadata
+        # Implements provider rotation logic for switching between different provider implementations
+        # for the same backend (e.g., qwen-open-router vs qwen-azure vs qwen-direct)
+        self._provider_manager: BackendProviderManager = provider_manager or BackendProviderManager.get_default_manager()
+
+        # State manager for persistence of backend state (e.g., for auto-reset functionality)
+        self._state_manager = BackendStateManager()
+        # Session state manager for resuming sessions across executions
+        self._session_state_manager = BackendSessionManager()
+        if self._automatic_session_resume:
+            self._restore_session_state()
+
+    @property
+    def provider_manager(self) -> BackendProviderManager:
+        """
+        Get the provider manager for this backend manager.
+
+        Returns:
+            BackendProviderManager: The provider manager instance
+
+        Note: The provider manager implements provider rotation logic, including
+        automatic failover when AutoCoderUsageLimitError occurs, environment
+        variable handling for provider-specific configuration, and tracking of
+        last used providers for debugging and telemetry.
+        """
+        return self._provider_manager
+
+    def _restore_session_state(self) -> None:
+        """
+        Restore last session information from persisted state.
+
+        This enables session resume across process restarts when the same backend
+        is invoked consecutively and supports resume options.
+        """
+        try:
+            session_state = self._session_state_manager.load_state()
+            if session_state.last_backend and session_state.last_session_id and session_state.last_backend in self._all_backends:
+                self._last_backend = session_state.last_backend
+                self._last_session_id = session_state.last_session_id
+                logger.debug(
+                    "Restored session state for backend '%s' with session id present",
+                    session_state.last_backend,
+                )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("Failed to restore session state: %s", exc)
+
+    def _save_session_state(self, backend_name: str, session_id: Optional[str]) -> None:
+        """
+        Persist session metadata for the provided backend.
+
+        Args:
+            backend_name: Backend whose session should be saved
+            session_id: Session identifier or None to clear
+        """
+        if not self._automatic_session_resume:
+            return
+        try:
+            state: BackendSessionState = create_session_state(backend_name, session_id)
+            self._session_state_manager.save_state(state)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("Failed to save session state for backend '%s': %s", backend_name, exc)
+
+    # ---------- Basic Operations ----------
+    def _current_backend_name(self) -> str:
+        return self._all_backends[self._current_idx]
+
+    def _get_or_create_client(self, name: str) -> Any:
+        cli = self._clients.get(name)
+        if cli is not None:
+            return cli
+        # Lazy generation
+        fac = self._factories.get(name)
+        if fac is None:
+            raise RuntimeError(f"No factory for backend: {name}")
+        try:
+            cli = fac()
+            self._clients[name] = cli
+            return cli
+        except Exception as e:
+            # Skip if unable to generate (proceed to next)
+            raise RuntimeError(f"Failed to initialize backend '{name}': {e}")
+
+    def _switch_to_index(self, idx: int) -> None:
+        self._current_idx = idx % len(self._all_backends)
+        try:
+            # Model switching linkage: restore to default
+            cli = self._get_or_create_client(self._current_backend_name())
+            try:
+                cli.switch_to_default_model()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def switch_to_next_backend(self) -> None:
+        """Switch to the next backend in the rotation.
+
+        This method rotates to the next backend and saves the new state
+        for persistence and auto-reset functionality.
+
+        The backend state is saved with the current timestamp to track
+        when the switch occurred, enabling the auto-reset feature to
+        reset back to the default backend after 2 hours.
+        """
+        self._switch_to_index(self._current_idx + 1)
+        # Reset session ID when switching backends
+        self._last_session_id = None
+        self._save_session_state(self._current_backend_name(), self._last_session_id)
+        # Save the new backend state
+        current_backend = self._current_backend_name()
+        current_time = time.time()
+        self._state_manager.save_state(current_backend, current_time)
+
+    def switch_to_default_backend(self) -> None:
+        """Switch to the default backend.
+
+        This method resets the backend to the configured default and saves
+        the new state for persistence and auto-reset functionality.
+
+        The backend state is saved with the current timestamp to track
+        when the switch occurred, enabling the auto-reset feature to
+        maintain consistency across application restarts.
+
+        This is typically called when:
+        - A different test file is encountered
+        - Auto-reset is triggered after 2 hours
+        - Manual reset is needed
+        """
+        # To the default position
+        try:
+            idx = self._all_backends.index(self._default_backend)
+        except ValueError:
+            idx = 0
+        self._switch_to_index(idx)
+        # Reset session ID when switching backends
+        self._last_session_id = None
+        self._save_session_state(self._current_backend_name(), self._last_session_id)
+        # Save the new backend state
+        current_backend = self._current_backend_name()
+        current_time = time.time()
+        self._state_manager.save_state(current_backend, current_time)
+
+    def _switch_to_backend_by_name(self, backend_name: str) -> None:
+        """Switch to a specific backend by name.
+
+        This method finds the index of the specified backend and switches to it.
+        If the backend is not found, it raises a ValueError.
+
+        Args:
+            backend_name: Name of the backend to switch to
+
+        Raises:
+            ValueError: If the backend name is not found in the list of backends
+        """
+        try:
+            idx = self._all_backends.index(backend_name)
+            self._switch_to_index(idx)
+            # Reset session ID when switching backends
+            self._last_session_id = None
+            self._save_session_state(self._current_backend_name(), self._last_session_id)
+            # Save the new backend state
+            current_backend = self._current_backend_name()
+            current_time = time.time()
+            self._state_manager.save_state(current_backend, current_time)
+        except ValueError:
+            raise ValueError(f"Backend '{backend_name}' not found in configured backends: {self._all_backends}")
+
+    def check_and_reset_backend_if_needed(self) -> None:
+        """
+        Check if an auto-reset is needed based on the saved state.
+
+        This method loads the saved backend state and checks if:
+        1. The current backend is different from the default backend
+        2. More than 2 hours (7200 seconds) have passed since the last switch
+
+        If both conditions are met, it resets to the default backend.
+        Otherwise, it syncs the current index to match the saved state.
+
+        The auto-reset logic prevents getting stuck on a non-default backend
+        for extended periods, which could happen if an error occurs during
+        backend switching or if the application is left running for a long time.
+        """
+        # Load the saved state
+        state = self._state_manager.load_state()
+
+        # If no state file exists, nothing to do
+        if not state:
+            return
+
+        # Extract state information
+        saved_backend = state.get("current_backend")
+        last_switch_timestamp = state.get("last_switch_timestamp")
+
+        # Validate state data
+        if not saved_backend or not last_switch_timestamp:
+            return
+
+        if not isinstance(saved_backend, str):
+            return
+
+        if not isinstance(last_switch_timestamp, float):
+            return
+
+        # Ignore unknown backends to avoid index errors
+        try:
+            saved_backend_index = self._all_backends.index(saved_backend)
+        except ValueError:
+            logger.debug(f"Saved backend '{saved_backend}' not found in current backend list")
+            return
+
+        # Check if we should reset to default backend
+        time_since_switch = time.time() - last_switch_timestamp
+        if saved_backend != self._default_backend and time_since_switch >= 7200:  # 2 hours
+            # Auto-reset to default backend when non-default was active too long
+            current_backend = self._current_backend_name()
+            logger.info(f"Auto-resetting backend to default after {time_since_switch:.0f} seconds. " f"Saved backend: {saved_backend}, Current backend: {current_backend}")
+            self.switch_to_default_backend()
+            return
+
+        # Otherwise, sync to the saved backend if different
+        if saved_backend_index != self._current_idx:
+            logger.debug(f"Syncing backend index to match saved state: {self._current_idx} -> {saved_backend_index}")
+            self._current_idx = saved_backend_index
+
+    def _get_current_provider_name(self, backend_name: str) -> Optional[str]:
+        """
+        Get the current provider name for a backend.
+
+        Args:
+            backend_name: Name of the backend
+
+        Returns:
+            Current provider name, or None if no providers configured
+        """
+        return self._provider_manager.get_current_provider_name(backend_name)
+
+    # ---------- Direct Compatibility Methods ----------
+    @log_calls  # type: ignore[misc]
+    def _run_llm_cli(self, prompt: str, is_noedit: Optional[bool] = None) -> str:
+        """Normal execution (circular retry on usage limit with provider rotation)."""
+        from .utils import TemporaryEnvironment
+
+        # Ordinary execution is never evidence that the caller requested an
+        # explicit continuation.  In particular, a prior successful
+        # continue_session() call must not leak its continuity result into a
+        # later fresh call.
+        self._last_continue_session_resumed = False
+        requested_noedit = bool(getattr(self, "_is_noedit", False)) if is_noedit is None else is_noedit
+
+        # Check if we need to auto-reset the backend based on saved state
+        self.check_and_reset_backend_if_needed()
+
+        attempts = 0
+        tried: set[int] = set()
+        last_error: Optional[Exception] = None
+        # Track retry attempts per backend
+        retry_attempts: Dict[str, int] = {}
+
+        while attempts < len(self._all_backends):
+            if not new_work_allowed():
+                if last_error is not None:
+                    raise last_error
+                raise AutoCoderRetryableBackendError("LLM execution deferred because graceful shutdown is draining")
+            backend_name = self._current_backend_name()
+            current_idx = self._current_idx
+
+            # Check if this backend index has already been tried (for rotation tracking)
+            # But allow retries of the same backend if configured and not exhausted
+            if current_idx in tried:
+                # Check if we should retry this backend before rotating
+                backend_config = get_llm_config().get_backend_config(backend_name)
+                if backend_config and backend_config.usage_limit_retry_count > 0:
+                    # retry_attempts tracks retries already done, check if we can do one more
+                    current_retries = retry_attempts.get(backend_name, 0)
+                    if current_retries < backend_config.usage_limit_retry_count:
+                        # Will retry this backend, don't add to tried yet
+                        pass
+                    else:
+                        # Retries exhausted, rotate to next backend
+                        self.switch_to_next_backend()
+                        continue
+                else:
+                    # No retry config or retries exhausted, rotate
+                    self.switch_to_next_backend()
+                    continue
+            else:
+                # First time trying this backend, add to tried
+                tried.add(current_idx)
+
+            try:
+                cli = self._get_or_create_client(backend_name)
+            except Exception as exc:  # pragma: no cover - defensive guard
+                last_error = exc
+                self.switch_to_next_backend()
+                attempts += 1
+                continue
+
+            config_backend = getattr(cli, "config_backend", None)
+            backend_type = str(getattr(config_backend, "backend_type", "") or backend_name).lower()
+            should_resume = backend_type in CLOUD_BACKEND_TYPES and self._automatic_session_resume and backend_name == self._last_backend and bool(self._last_session_id)
+            try:
+                try:
+                    result = self._execute_backend_with_providers(
+                        backend_name=backend_name,
+                        cli=cli,
+                        prompt=prompt,
+                        backend_attempt_number=attempts + 1,
+                        temp_env_cls=TemporaryEnvironment,
+                        session_id=self._last_session_id if should_resume else None,
+                        requested_noedit=requested_noedit,
+                    )
+                except (
+                    AutoCoderUsageLimitError,
+                    AutoCoderTimeoutError,
+                    AutoCoderRetryableBackendError,
+                    LocalWriterSettlementError,
+                ):
+                    raise
+                except (ValueError, RuntimeError, NotImplementedError) as exc:
+                    if not should_resume:
+                        raise
+                    if isinstance(exc, SessionWorkspaceCompatibilityError) and self._last_session_id in self._released_local_workspace_sessions:
+                        raise
+                    logger.warning("Could not resume implementation session on backend '%s'; starting fresh: %s", backend_name, exc)
+                    self._last_session_id = None
+                    self._save_session_state(backend_name, None)
+                    if hasattr(cli, "clear_last_session_id"):
+                        cli.clear_last_session_id()
+                    if not new_work_allowed():
+                        raise
+                    result = self._execute_backend_with_providers(
+                        backend_name=backend_name,
+                        cli=cli,
+                        prompt=prompt,
+                        backend_attempt_number=attempts + 1,
+                        temp_env_cls=TemporaryEnvironment,
+                        requested_noedit=requested_noedit,
+                    )
+                # Check if we should switch to next backend after successful execution
+                backend_config = get_llm_config().get_backend_config(backend_name)
+                if backend_config and backend_config.always_switch_after_execution:
+                    self.switch_to_next_backend()
+                return result
+            except AutoCoderUsageLimitError as exc:
+                last_error = exc
+                # Check if we should retry this backend
+                backend_config = get_llm_config().get_backend_config(backend_name)
+                if backend_config and backend_config.usage_limit_retry_count > 0:
+                    current_retries = retry_attempts.get(backend_name, 0)
+                    if current_retries < backend_config.usage_limit_retry_count:
+                        # Retry the same backend
+                        retry_attempts[backend_name] = current_retries + 1
+                        wait_seconds = backend_config.usage_limit_retry_wait_seconds
+                        time.sleep(wait_seconds)
+                        # Don't switch to next backend, retry on the same one
+                        continue
+
+                # If we reach here, either no retry config or retries exhausted
+                self.switch_to_next_backend()
+                attempts += 1
+                continue
+            except AutoCoderTimeoutError as exc:
+                last_error = exc
+                logger.warning(f"Timeout error on backend '{backend_name}', switching to next backend")
+                self.switch_to_next_backend()
+                attempts += 1
+                continue
+            except Exception as exc:
+                last_error = exc
+                break
+
+        if last_error:
+            raise last_error
+        raise RuntimeError("No backend available to run prompt")
+
+    def get_last_session_id(self) -> Optional[str]:
+        """Return the provider-issued identity from the last successful call."""
+        return self._last_session_id
+
+    def has_retained_local_session(self, session_id: str) -> bool:
+        """Whether this manager still owns the private root for a local session."""
+        return session_id in self._retained_local_sessions
+
+    def authorize_local_session_continuation(self, session_id: str, decision: LiveRootReuseDecision) -> None:
+        """Attach the result-lifecycle authority's exact reuse decision."""
+        retained = self._retained_local_sessions.get(session_id)
+        if retained is None:
+            raise LocalContinuationError("no retained controller-owned binding exists for this session")
+        retained.authorize_reuse(decision)
+
+    def authorize_retained_local_session_reuse(self, session_id: str) -> LiveRootReuseDecision:
+        """Ask the controller result-lifecycle owner for exact one-turn authority."""
+        retained = self._retained_local_sessions.get(session_id)
+        if retained is None:
+            raise LocalContinuationError("no retained controller-owned binding exists for this session")
+        decision = self._local_result_lifecycle.authorize_reuse(retained, caller_checkpoint=retained.binding.file_snapshot_checksum)
+        retained.authorize_reuse(decision)
+        return decision
+
+    def release_local_session(self, session_id: str, *, preserve_reuse: bool = False) -> None:
+        """Release only the named session lease and its exact private root."""
+        retained = self._retained_local_sessions.get(session_id)
+        if retained is not None and retained.dispose(preserve_reuse=preserve_reuse):
+            del self._retained_local_sessions[session_id]
+            self._released_local_workspace_sessions.add(session_id)
+
+    def get_current_backend_identity(self) -> Tuple[str, str, str]:
+        """Return the current alias, resolved type, and model for registry keys."""
+        backend_name = self._current_backend_name()
+        client = self._get_or_create_client(backend_name)
+        config = getattr(client, "config_backend", None)
+        if config is None:
+            try:
+                config = get_llm_config().get_backend_config(backend_name)
+            except Exception:
+                config = None
+        backend_type = str(getattr(config, "backend_type", "") or backend_name)
+        return backend_name, backend_type, str(getattr(client, "model_name", "") or "")
+
+    def continue_session(self, session_id: str, prompt: str, is_noedit: bool = False) -> str:
+        """Ask the current client to continue an opaque session explicitly.
+
+        Every explicit continuation is fail-closed. A fresh task or another
+        backend cannot truthfully substitute for the requested session.
+        """
+        self._last_continue_session_resumed = False
+        if not session_id.strip():
+            raise ValueError("Session ID must be nonempty for explicit continuation")
+        backend_name = self._current_backend_name()
+        client = self._get_or_create_client(backend_name)
+        if session_id in self._released_local_workspace_sessions:
+            raise SessionWorkspaceCompatibilityError("local continuation refused because its original private workspace and generation checkpoint are no longer retained")
+        config_backend = getattr(client, "config_backend", None)
+        backend_type = str(getattr(config_backend, "backend_type", "") or backend_name).lower()
+        is_local_backend = backend_type not in CLOUD_BACKEND_TYPES
+        if is_local_backend and getattr(client, "supports_retained_local_continuation", False) is not True:
+            raise LocalContinuationError("selected local adapter cannot prove retained-workspace continuation compatibility")
+        if is_local_backend and session_id not in self._retained_local_sessions:
+            raise LocalContinuationError("local continuation refused because no retained controller-owned binding and generation authority exist for this session")
+        self._is_noedit = is_noedit
+        try:
+            # Re-use _execute_backend_with_providers to capture interaction
+            output = self._execute_backend_with_providers(
+                backend_name=backend_name,
+                cli=client,
+                prompt=prompt,
+                backend_attempt_number=1,
+                temp_env_cls=contextlib.nullcontext,
+                session_id=session_id,
+                requested_noedit=is_noedit,
+            )
+            self._last_continue_session_resumed = True
+            return str(output)
+        except SessionWorkspaceCompatibilityError:
+            self._last_continue_session_resumed = False
+            raise
+        except LocalWriterSettlementError:
+            self._last_continue_session_resumed = False
+            raise
+        except (AutoCoderUsageLimitError, AutoCoderTimeoutError):
+            self._last_continue_session_resumed = False
+            raise
+        except Exception as exc:
+            if not isinstance(exc, (ValueError, RuntimeError, NotImplementedError)):
+                raise
+            raise
+
+    def run_prompt(self, prompt: str) -> str:
+        """
+        Execute LLM with the given prompt.
+        Alias for _run_llm_cli for compatibility.
+        """
+        return self._run_llm_cli(prompt)
+
+    def _admit_invocation(self, *, is_noedit: bool, has_session: bool) -> Optional[InvocationHandle]:
+        """Admit one qualifying invocation at the final boundary, or refuse.
+
+        Returns None when no daemon lifetime has installed a gate (e.g. a
+        standalone command), leaving behavior unchanged. When a gate is
+        installed and refuses admission (DRAINING/STOPPED/FORCED), this
+        raises before the controlled provider action runs so the caller's
+        existing retry/rotation handling applies uniformly.
+        """
+        gate = current_invocation_gate()
+        if gate is None:
+            return None
+        target_ctx = current_invocation_target()
+        if target_ctx is not None:
+            repository, target, stage = target_ctx.repository, target_ctx.target, target_ctx.stage
+        else:
+            repository, target = "unknown", "unknown"
+            stage = "noedit" if is_noedit else ("continuation" if has_session else "implementation")
+        handle = gate.try_admit(repository=repository, target=target, stage=stage)
+        if handle is None:
+            raise AutoCoderRetryableBackendError("LLM invocation refused because graceful shutdown is draining")
+        return handle
+
+    def _settle_admitted_invocation(self, handle: Optional[InvocationHandle], *, success: bool, checkpoint_started: bool = False) -> None:
+        """Move an admitted invocation from IN_FLIGHT into its post-response state.
+
+        A failed invocation carries no reusable result, so it settles
+        immediately. A successful one settles immediately too unless the
+        caller bound ``defer_checkpoint=True`` (see
+        ``invocation_admission.InvocationTarget``), in which case the handle
+        is handed to the caller via ``take_pending_invocation_handle`` so it
+        can confirm settlement only after its own durable write commits.
+        """
+        if handle is None:
+            return
+        if not checkpoint_started:
+            handle.begin_checkpointing("result" if success else "terminal_failure")
+        target_ctx = current_invocation_target()
+        if success and target_ctx is not None and target_ctx.defer_checkpoint:
+            set_pending_invocation_handle(handle)
+            return
+        handle.confirm_settled()
+
+    def _execute_backend_with_providers(
+        self,
+        backend_name: str,
+        cli: Any,
+        prompt: str,
+        backend_attempt_number: int,
+        temp_env_cls: Callable[[Dict[str, str]], Any],
+        session_id: Optional[str] = None,
+        requested_noedit: bool = False,
+    ) -> str:
+        """
+        Execute a backend client while honoring provider rotation rules.
+
+        Args:
+            backend_name: Name of the backend being executed
+            cli: Backend client instance
+            prompt: Prompt to execute
+            backend_attempt_number: 1-based attempt number for logging context
+            temp_env_cls: Context manager factory (injected for easier testing)
+        """
+        backend_has_providers = self._provider_manager.has_providers(backend_name)
+        provider_count = self._provider_manager.get_provider_count(backend_name)
+        provider_attempts = 0
+
+        while True:
+            provider_name = self._get_current_provider_name(backend_name)
+            env_vars = self._provider_manager.create_env_context(backend_name) if backend_has_providers else {}
+            provider_context = f"{backend_name}"
+            if provider_name:
+                provider_context += f" (provider: {provider_name})"
+            message = f"Running LLM: {provider_context}, attempt {backend_attempt_number}"
+
+            env_context = temp_env_cls(env_vars) if env_vars else contextlib.nullcontext()
+
+            with ProgressStage(message), env_context:
+                review_ctx = get_active_review_context()
+                interaction_id = uuid.uuid4().hex
+                start_dt = datetime.now(timezone.utc)
+                start_time_iso = start_dt.isoformat()
+                start_ns = time.perf_counter_ns()
+
+                interaction_rec = None
+                if review_ctx:
+                    config_backend = getattr(cli, "config_backend", None)
+                    backend_type = str(getattr(config_backend, "backend_type", "") or backend_name)
+                    requested_model = getattr(cli, "model_name", None) or getattr(cli, "model", None)
+
+                    interaction_rec = ReviewInteractionRecord(
+                        interaction_id=interaction_id,
+                        review_id=review_ctx.review_id,
+                        start_time=start_time_iso,
+                        end_time=None,
+                        duration_ms=None,
+                        backend_alias=backend_name,
+                        backend_type=backend_type,
+                        provider_alias=provider_name,
+                        requested_model=requested_model,
+                        reported_model=None,
+                        invocation_mode="fresh" if session_id is None else "continuation",
+                        session_identity=session_id,
+                        completion_status="unrecorded",
+                    )
+                    try:
+                        get_review_audit_store().record_interaction(repository=review_ctx.repository, interaction=interaction_rec)
+                    except Exception as e:
+                        logger.warning(f"Failed to record review interaction start: {e}")
+
+                # Determine if this is a no-edit operation
+                # Resolve the effective mode before workspace/boundary selection.
+                # Clients constructed for no-edit retain that restriction even
+                # when an alias or caller omits an explicit true argument.
+                client_is_noedit = getattr(cli, "use_noedit_options", False) is True
+                is_noedit = requested_noedit or client_is_noedit
+                # Atomically register this controlled provider action before it
+                # runs, at the final invocation boundary shared by every
+                # backend/provider rotation attempt (Issue #2009, REQ-001/002).
+                invocation_handle = self._admit_invocation(is_noedit=is_noedit, has_session=session_id is not None)
+                provider_started = False
+                checkpoint_started = False
+                try:
+                    completed_turn_evidence = None
+                    workspace_ownership = None
+                    local_boundary = None
+                    retained_session: Optional[RetainedLocalSession] = None
+                    config_backend = getattr(cli, "config_backend", None)
+                    backend_type = str(getattr(config_backend, "backend_type", "") or backend_name)
+                    is_local = backend_type.lower() not in CLOUD_BACKEND_TYPES
+                    if is_local and session_id is None:
+                        # Retire unused history, preserving an explicit pending
+                        # reuse decision across unrelated fresh tasks.
+                        for previous_id in tuple(self._retained_local_sessions):
+                            previous = self._retained_local_sessions[previous_id]
+                            if previous.predecessor.writer_completion is not EvidenceStatus.ESTABLISHED:
+                                raise LocalWriterSettlementError("cannot replace retained workspace while writer settlement is uncertain")
+                            self.release_local_session(previous_id, preserve_reuse=True)
+                    if is_local and session_id is None and hasattr(cli, "clear_last_session_id"):
+                        # Provider metadata from an earlier local call is not
+                        # the identity of this fresh invocation.  Clear only
+                        # the client's last-result cache; retained workspace
+                        # and lifecycle authority remain keyed independently.
+                        cli.clear_last_session_id()
+                    if session_id is not None and is_local and session_id in self._released_local_workspace_sessions:
+                        raise SessionWorkspaceCompatibilityError("local continuation refused because its original private workspace and generation checkpoint are no longer retained")
+                    supports_retained = getattr(cli, "supports_retained_local_continuation", False) is True
+                    if session_id is not None and is_local and supports_retained and (session_id in self._retained_local_sessions or session_id in self._released_local_workspace_sessions):
+                        retained_session = self._retained_local_sessions.get(session_id)
+                        if retained_session is None:
+                            raise LocalContinuationError("local continuation has no retained controller-owned binding")
+                        retained_session.admit(
+                            backend_name=backend_name,
+                            session_id=session_id,
+                            caller_identity=current_local_caller_identity(),
+                            caller_checkpoint=current_local_caller_checkpoint(retained_session.binding),
+                            lifecycle=self._local_result_lifecycle,
+                        )
+                    workspace_ownership = retained_session.binding.ownership if retained_session is not None else (LocalWorkspaceOwnership() if is_local else None)
+                    if retained_session is not None:
+                        assert workspace_ownership is not None
+                        workspace_ownership.begin_execution()
+                    worktree_ctx: contextlib.AbstractContextManager[Any]
+                    if retained_session is not None:
+                        worktree_ctx = bind_retained_local_workspace(retained_session.binding, is_noedit=is_noedit)
+                    else:
+                        from .local_job_handoff import LocalJobKind
+                        from .muse_background_observation import current_muse_job_observation
+
+                        durable_job = current_muse_job_observation()
+                        persistent_root = (
+                            Path(durable_job.job.workspace_path).parent / "provider-workspaces"
+                            if durable_job is not None and durable_job.job.kind in {LocalJobKind.ISSUE_IMPLEMENTATION, LocalJobKind.PR_CI_FAILURE, LocalJobKind.PR_MERGE_CONFLICT} and backend_type.lower() == "muse" and not is_noedit
+                            else None
+                        )
+                        worktree_ctx = (
+                            isolated_local_llm_worktree(
+                                is_noedit=is_noedit,
+                                ownership=workspace_ownership,
+                                require_handoff_authorization=not is_noedit,
+                                persistent_root=persistent_root,
+                            )
+                            if is_local
+                            else contextlib.nullcontext()
+                        )
+                    with worktree_ctx:
+                        workspace_binding = get_current_local_workspace()
+                        defer_local_tests = os.environ.get("AUTO_CODER_DEFER_LOCAL_TESTS") == "1"
+                        if is_local and not is_noedit and defer_local_tests:
+                            from .prompt_loader import render_prompt
+
+                            prompt = prompt + "\n\n" + render_prompt("operator.deferred_local_tests")
+                        if is_local and workspace_binding is not None and not is_noedit and retained_session is None:
+                            if defer_local_tests:
+                                record_implementation_workspace_tests_skipped(workspace_binding, "operator_deferred_until_merge")
+                            elif ci_repair_designated():
+                                record_implementation_workspace_tests_skipped(workspace_binding)
+                            else:
+                                run_implementation_workspace_tests(workspace_binding, AutomationConfig().TEST_SCRIPT_PATH)
+                        boundary_ctx = (
+                            bind_local_execution_boundary(
+                                workspace_binding,
+                                backend_type=backend_type,
+                                editable=not is_noedit,
+                            )
+                            if workspace_binding is not None
+                            else contextlib.nullcontext()
+                        )
+                        with boundary_ctx as local_boundary, bind_interaction_id(interaction_id):
+                            supervised_ctx: contextlib.AbstractContextManager[None] = contextlib.nullcontext()
+                            if local_boundary is not None and getattr(cli, "supports_supervised_local_turn", False) is True:
+                                supervised_ctx = bind_supervised_command_execution(self._local_supervisor_factory(), local_boundary)
+                            # Issue #2010 REQ-004: only the controlled provider
+                            # action itself (and any subprocess/tool tree it
+                            # spawns) is marked protected, so graceful draining's
+                            # cooperative interruption never kills it, while any
+                            # unrelated command run outside this block remains
+                            # interruptible.
+                            try:
+                                with mark_invocation_active(), supervised_ctx:
+                                    provider_started = True
+                                    observation_ctx = (
+                                        observe_local_llm_call(
+                                            backend=backend_name,
+                                            backend_type=backend_type,
+                                            provider=provider_name,
+                                            model=getattr(cli, "model_name", None) or getattr(cli, "model", None),
+                                            invocation_id=workspace_binding.invocation_id if workspace_binding is not None else interaction_id,
+                                            continuation=session_id is not None,
+                                            is_noedit=is_noedit,
+                                        )
+                                        if is_local
+                                        else contextlib.nullcontext()
+                                    )
+                                    with observation_ctx:
+                                        if session_id:
+                                            out = cli.continue_session(session_id=session_id, prompt=prompt, is_noedit=is_noedit)
+                                        else:
+                                            out = cli._run_llm_cli(prompt, is_noedit=is_noedit)
+                                    if invocation_handle is not None:
+                                        invocation_handle.begin_checkpointing("result")
+                                        checkpoint_started = True
+                            except BaseException as exc:
+                                if local_boundary is not None:
+                                    local_boundary.record_backend_failure(local_boundary.binding.invocation_id, type(exc).__name__)
+                                raise
+                            if local_boundary is not None:
+                                # A normal provider return proves only its backend
+                                # outcome. Runtime enforcement/supervision facts stay
+                                # unknown until their later authoritative producers
+                                # are integrated; legacy execution remains usable but
+                                # is not certified as confined.
+                                local_boundary.record_backend_success(local_boundary.binding.invocation_id)
+                                local_boundary.record_provider_session(
+                                    local_boundary.binding.invocation_id,
+                                    getattr(cli, "get_last_session_id", lambda: None)(),
+                                )
+                                turn_evidence = local_boundary.evidence()
+                                completed_turn_evidence = turn_evidence
+                                if retained_session is None and supports_retained and turn_evidence.provider_session_id and workspace_ownership is not None:
+                                    if turn_evidence.provider_session_id in self._retained_local_sessions:
+                                        raise LocalContinuationError("fresh provider session identity collides with a reserved local workspace")
+                                    workspace_ownership.retain_session()
+                                    retained = RetainedLocalSession(
+                                        backend_name=backend_name,
+                                        provider_session_id=turn_evidence.provider_session_id,
+                                        binding=local_boundary.binding,
+                                        predecessor=turn_evidence,
+                                        caller_identity=current_local_caller_identity(local_boundary.binding.caller_root),
+                                        workspace_identity=(local_boundary.binding.workspace.stat().st_dev, local_boundary.binding.workspace.stat().st_ino),
+                                        workspace_fd=os.open(local_boundary.binding.workspace, os.O_RDONLY),
+                                    )
+                                    self._retained_local_sessions[turn_evidence.provider_session_id] = retained
+                                    self._released_local_workspace_sessions.discard(turn_evidence.provider_session_id)
+                                if not is_noedit and workspace_ownership is not None:
+                                    handoff_evidence = local_boundary.evidence()
+                                    if handoff_evidence.handoff_authorized:
+                                        workspace_ownership.authorize_handoff(
+                                            handoff_evidence.invocation_id,
+                                            handoff_evidence.turn_id,
+                                            local_boundary.binding.invocation_id,
+                                        )
+                                        if not supports_retained and session_id is None and handoff_evidence.provider_session_id:
+                                            self._released_local_workspace_sessions.add(handoff_evidence.provider_session_id)
+                        if workspace_ownership is not None:
+                            workspace_ownership.release_execution()
+
+                    end_dt = datetime.now(timezone.utc)
+                    completed_session_id = getattr(cli, "get_last_session_id", lambda: None)()
+                    completed_retained = self._retained_local_sessions.get(completed_session_id) if completed_session_id else None
+                    if completed_retained is not None:
+                        if retained_session is not None:
+                            if completed_turn_evidence is None:
+                                raise LocalContinuationError("continued turn produced no controller-owned evidence")
+                            if completed_turn_evidence.writer_completion is not EvidenceStatus.ESTABLISHED:
+                                raise LocalWriterSettlementError("continued turn writer settlement is uncertain")
+                            if completed_turn_evidence.editable:
+                                if not completed_turn_evidence.handoff_authorized:
+                                    raise LocalContinuationError("continued turn lacks authorized result-handoff evidence")
+                                sync_worktree_changes_back(completed_retained.binding.workspace, completed_retained.binding.caller_root, completed_retained.binding)
+                        advanced_binding = refresh_local_workspace_binding(completed_retained.binding)
+                        if retained_session is not None:
+                            assert completed_turn_evidence is not None
+                            completed_retained.finish(completed_turn_evidence)
+                        completed_retained.advance_binding(advanced_binding)
+                        if completed_turn_evidence is not None:
+                            self._local_result_lifecycle.record_generation(completed_turn_evidence)
+                    end_time_iso = end_dt.isoformat()
+                    duration_ms = (time.perf_counter_ns() - start_ns) // 1_000_000
+
+                    self._last_backend = backend_name
+                    self._last_model = getattr(cli, "model_name", None)
+                    self._provider_manager.mark_provider_used(backend_name, provider_name)
+                    # Track session ID from the client
+                    self._last_session_id = cli.get_last_session_id()
+                    # Persist session state to allow resume on subsequent executions
+                    self._save_session_state(backend_name, self._last_session_id)
+                    self._settle_admitted_invocation(invocation_handle, success=True, checkpoint_started=checkpoint_started)
+                    if review_ctx and interaction_rec:
+                        interaction_rec.end_time = end_time_iso
+                        interaction_rec.duration_ms = duration_ms
+                        interaction_rec.completion_status = "RETURNED"
+                        reported_model = getattr(cli, "model_name", None)
+                        if reported_model and reported_model != interaction_rec.requested_model:
+                            interaction_rec.reported_model = reported_model
+                        interaction_rec.session_identity = self._last_session_id or interaction_rec.session_identity
+                        try:
+                            get_review_audit_store().record_interaction(repository=review_ctx.repository, interaction=interaction_rec)
+                        except Exception as e:
+                            logger.warning(f"Failed to record review interaction success: {e}")
+                    return out
+                except Exception as exc:
+                    # A returned result can still fail during handoff or session
+                    # persistence. Keep that checkpoint protected and preserve
+                    # its original exception instead of beginning it twice.
+                    try:
+                        if retained_session is not None and local_boundary is not None:
+                            retained_session.fail(local_boundary.evidence())
+                    except Exception as cleanup_error:
+                        logger.warning("Could not invalidate failed retained session: {}", cleanup_error)
+                    try:
+                        if checkpoint_started and invocation_handle is not None:
+                            invocation_handle.record_checkpoint_attempt_failed(str(exc))
+                            set_pending_invocation_handle(invocation_handle)
+                        else:
+                            self._settle_admitted_invocation(invocation_handle, success=False)
+                    except Exception as cleanup_error:
+                        logger.warning("Could not record invocation failure: {}", cleanup_error)
+                    # The client owns whether a failed invocation established a
+                    # usable session. Mirror that result on failure as well as
+                    # success so a fail-closed client cannot leave an earlier
+                    # manager-level session looking like the failed call's result.
+                    try:
+                        if provider_started:
+                            self._last_session_id = getattr(cli, "get_last_session_id", lambda: None)()
+                        else:
+                            clear_last_session_id = getattr(cli, "clear_last_session_id", None)
+                            if callable(clear_last_session_id):
+                                clear_last_session_id()
+                            self._last_session_id = None
+                        self._save_session_state(backend_name, self._last_session_id)
+                    except Exception as cleanup_error:
+                        logger.warning("Could not persist failed invocation session state: {}", cleanup_error)
+                    end_dt = datetime.now(timezone.utc)
+                    end_time_iso = end_dt.isoformat()
+                    duration_ms = (time.perf_counter_ns() - start_ns) // 1_000_000
+
+                    if review_ctx and interaction_rec:
+                        interaction_rec.end_time = end_time_iso
+                        interaction_rec.duration_ms = duration_ms
+                        interaction_rec.completion_status = "RAISED"
+                        try:
+                            get_review_audit_store().record_interaction(repository=review_ctx.repository, interaction=interaction_rec)
+                        except Exception as e:
+                            logger.warning(f"Failed to record review interaction failure: {e}")
+
+                    if isinstance(exc, AutoCoderUsageLimitError) and not checkpoint_started:
+                        if backend_has_providers and provider_count > 1 and provider_attempts < provider_count - 1:
+                            if not new_work_allowed():
+                                raise
+                            rotated = self._provider_manager.advance_to_next_provider(backend_name)
+                            if rotated:
+                                provider_attempts += 1
+                                continue
+
+                    if not provider_started and isinstance(exc, WorkspacePreparationError):
+                        raise LocalPreparationNotStartedError(str(exc)) from exc
+                    # Reraise exception if we don't handle it here.
+                    raise
+                finally:
+                    # Includes preparation failure and BaseException interruption.
+                    # Unknown descendant writers retain their execution lease.
+                    if workspace_ownership is not None and (not provider_started or (local_boundary is not None and local_boundary.evidence().writer_completion is EvidenceStatus.ESTABLISHED)):
+                        workspace_ownership.release_execution()
+                    if retained_session is not None and local_boundary is not None and retained_session.active_turn_id is not None:
+                        retained_session.fail(local_boundary.evidence())
+
+    # ---------- For apply_workspace_test_fix ----------
+    @log_calls  # type: ignore[misc]
+    def run_test_fix_prompt(self, prompt: str, current_test_file: Optional[str] = None) -> str:
+        """Execution for apply_workspace_test_fix.
+        - If the same current_test_file is given 3 consecutive times, switch to the next backend
+        - If a different current_test_file comes, reset to default
+        - Then call _run_llm_cli (further rotation on usage limit)
+        """
+        # Get current backend and model name
+        current_backend = self._current_backend_name()
+
+        if self._last_test_file is None or current_test_file != self._last_test_file:
+            # test_file changed -> reset to default (this is the 1st time)
+            self.switch_to_default_backend()
+            self._same_test_file_count = 1
+        else:
+            # Same test_file
+            if self._last_backend == current_backend:
+                # If the same backend continued twice before, switch before the 3rd execution
+                if self._same_test_file_count >= 2:
+                    self.switch_to_next_backend()
+                    self._same_test_file_count = 1
+                else:
+                    self._same_test_file_count += 1
+            else:
+                # Backend has changed, reset counter (this is the 1st time)
+                self._same_test_file_count = 1
+
+        # Execute with provider-aware telemetry so logs show which provider is being used.
+        active_backend = self._current_backend_name()
+        provider_for_stage = self._get_current_provider_name(active_backend)
+        stage_label = f"Running LLM: {active_backend}"
+        if provider_for_stage:
+            stage_label += f" (provider: {provider_for_stage})"
+
+        with ProgressStage(stage_label):
+            try:
+                # This is not a no-edit operation
+                out: str = self._run_llm_cli(prompt, is_noedit=False)
+            except AutoCoderTimeoutError as exc:
+                logger.warning(f"Timeout error on backend '{active_backend}', switching to next backend")
+                self.switch_to_next_backend()
+                # Try again with the next backend
+                with ProgressStage(f"Running LLM: {self._current_backend_name()}"):
+                    out = self._run_llm_cli(prompt, is_noedit=False)
+
+        # Update state
+        self._last_prompt = prompt
+        self._last_test_file = current_test_file
+        self._last_backend = self._current_backend_name()
+        return out
+
+    def get_last_backend_and_model(self) -> Tuple[Optional[str], Optional[str]]:
+        """Return the backend/model used for the most recent execution."""
+
+        # Get current backend (last used or current)
+        backend = self._last_backend or self._current_backend_name()
+
+        # Get model from last execution or from current client
+        model = self._last_model
+        if model is None:
+            try:
+                # Get model from current backend client
+                current_backend = self._current_backend_name()
+                cli = self._get_or_create_client(current_backend)
+                model = getattr(cli, "model_name", None)
+            except Exception:
+                model = None
+        return backend, model
+
+    def get_last_interaction_log_path(self) -> Optional[str]:
+        """Return the structured interaction log path for the last backend."""
+        backend, _ = self.get_last_backend_and_model()
+        if not backend:
+            return None
+
+        client = self._clients.get(backend)
+        output_logger = getattr(client, "output_logger", None)
+        log_path = getattr(output_logger, "log_path", None)
+        if log_path is None:
+            return None
+        return str(log_path)
+
+    def get_last_backend_provider_and_model(self) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        """
+        Return the backend/provider/model used for the most recent execution.
+
+        Returns:
+            Tuple of (backend_name, provider_name, model_name).
+            Provider name may be None if no provider was used or no provider configured.
+        """
+        backend, model = self.get_last_backend_and_model()
+        provider = self._provider_manager.get_last_used_provider_name(backend) if backend else None
+
+        return backend, provider, model
+
+    def parse_llm_output_as_json(self, output: str) -> Any:
+        """
+        Parse LLM output as JSON and extract content.
+
+        This helper method delegates to the standalone parse_llm_output_as_json function.
+        Kept for backward compatibility with code that uses the instance method.
+
+        Args:
+            output: The raw LLM output string to parse
+
+        Returns:
+            The extracted content (dict or string from the last message in a list)
+
+        Raises:
+            ValueError: If the output cannot be parsed as JSON
+        """
+        return parse_llm_output_as_json(output)
+
+    # ---------- Compatibility Helpers ----------
+    def switch_to_conflict_model(self) -> None:
+        try:
+            cli = self._get_or_create_client(self._current_backend_name())
+            if hasattr(cli, "switch_to_conflict_model") and callable(getattr(cli, "switch_to_conflict_model")):
+                cli.switch_to_conflict_model()
+        except Exception:
+            pass
+
+    def switch_to_default_model(self) -> None:
+        try:
+            cli = self._get_or_create_client(self._current_backend_name())
+            cli.switch_to_default_model()
+        except Exception:
+            pass
+
+    def close(self) -> None:
+        """Call client's close if available."""
+        for _, cli in list(self._clients.items()):
+            try:
+                if cli:
+                    cli.close()
+            except Exception:
+                pass
+        for session_id in tuple(self._retained_local_sessions):
+            retained = self._retained_local_sessions[session_id]
+            if retained.predecessor.writer_completion is EvidenceStatus.ESTABLISHED:
+                try:
+                    self.release_local_session(session_id)
+                except LocalContinuationError as exc:
+                    logger.warning("Could not release local session at shutdown: {}", exc)
+
+    def check_mcp_server_configured(self, server_name: str) -> bool:
+        """Check if a specific MCP server is configured for the current backend.
+
+        Args:
+            server_name: Name of the MCP server to check (e.g., 'test-watcher', 'mcp-pdb')
+
+        Returns:
+            True if the MCP server is configured, False otherwise
+        """
+        cli = self._get_or_create_client(self._current_backend_name())
+        return cli.check_mcp_server_configured(server_name)  # type: ignore[no-any-return]
+
+    def add_mcp_server_config(self, server_name: str, command: str, args: list[str]) -> bool:
+        """Add MCP server configuration for the current backend.
+
+        Args:
+            server_name: Name of the MCP server (e.g., 'test-watcher', 'mcp-pdb')
+            command: Command to run the MCP server (e.g., 'uv', '/path/to/script.sh')
+            args: Arguments for the command (e.g., ['run', 'main.py'] or [])
+
+        Returns:
+            True if configuration was added successfully, False otherwise
+        """
+        cli = self._get_or_create_client(self._current_backend_name())
+        return cli.add_mcp_server_config(server_name, command, args)  # type: ignore[no-any-return]
+
+    def ensure_mcp_server_configured(self, server_name: str, command: str, args: list[str]) -> bool:
+        """Ensure a specific MCP server is configured for all backends, adding it if necessary.
+
+        This method checks if the server is configured for each backend,
+        and if not, adds the configuration.
+
+        Args:
+            server_name: Name of the MCP server (e.g., 'test-watcher', 'mcp-pdb')
+            command: Command to run the MCP server (e.g., 'uv', '/path/to/script.sh')
+            args: Arguments for the command (e.g., ['run', 'main.py'] or [])
+
+        Returns:
+            True if the MCP server is configured (or was successfully added) for all backends, False otherwise
+        """
+        all_success = True
+        for backend_name in self._all_backends:
+            try:
+                cli = self._get_or_create_client(backend_name)
+                # Use the client's ensure_mcp_server_configured method
+                # which handles check and add internally
+                if not cli.ensure_mcp_server_configured(server_name, command, args):
+                    all_success = False
+
+            except Exception:
+                all_success = False
+
+        return all_success
+
+
+class LLMBackendManager:
+    """
+    Singleton manager for general-purpose LLM backend operations.
+
+    This singleton manages the general backend for all LLM operations except
+    commit messages (PR processing, test fixes, code generation, etc.).
+
+    Thread-safe singleton implementation ensures only one instance exists
+    across all threads in the application.
+
+    Usage Pattern:
+    -----------
+    1. First call: Provide initialization parameters (default_backend, default_client, factories)
+       ```python
+       manager = LLMBackendManager.get_llm_instance(
+           default_backend="antigravity",
+           default_client=client,
+           factories={"antigravity": lambda: client}
+       )
+       ```
+
+    2. Subsequent calls: Call without parameters to get the same instance
+       ```python
+       manager = LLMBackendManager.get_llm_instance()
+       # Returns the same instance created above
+       ```
+
+    3. Using convenience functions (recommended):
+       ```python
+       from auto_coder.backend_manager import get_llm_backend_manager, run_llm_prompt
+
+       # Using TOML configuration file (new approach)
+       from auto_coder.cli_helpers import build_backend_manager_from_config
+       manager = build_backend_manager_from_config()
+       response = run_llm_prompt("Your prompt here")
+       ```
+
+    Important Notes:
+    --------------
+    - Initialization parameters are required ONLY on the first call
+    - The singleton is thread-safe and can be accessed from multiple threads
+    - Use force_reinitialize=True to reconfigure with new parameters
+    - Call manager.close() during application shutdown for cleanup
+    - Configuration can now be read from a TOML file at ~/.auto-coder/llm_config.toml
+    """
+
+    _instance: Optional[BackendManager] = None
+    _noedit_instance: Optional[BackendManager] = None
+    _init_params: Optional[Dict[str, Any]] = None
+    _lock = threading.Lock()
+
+    @classmethod
+    def get_llm_instance(
+        cls,
+        default_backend: Optional[str] = None,
+        default_client: Optional[Any] = None,
+        factories: Optional[Dict[str, Callable[[], Any]]] = None,
+        order: Optional[List[str]] = None,
+        force_reinitialize: bool = False,
+    ) -> BackendManager:
+        """
+        Get or create the singleton LLM backend manager instance.
+
+        This class method returns the singleton instance for general-purpose LLM operations.
+        On first call, initialization parameters must be provided. Subsequent calls
+        can omit parameters to retrieve the existing instance.
+
+        Args:
+            default_backend: Name of the default backend
+            default_client: Default client instance
+            factories: Dictionary of backend name to factory function
+            order: Optional list specifying backend order
+            force_reinitialize: Force reinitialization with new parameters (default: False)
+
+        Returns:
+            BackendManager: The singleton instance for general LLM operations
+
+        Raises:
+            RuntimeError: If called without initialization parameters on first call
+        """
+        # Fast path: check if instance exists and is initialized
+        with cls._lock:
+            # Check if we need to initialize
+            if cls._instance is None or force_reinitialize:
+                # Validate initialization parameters
+                if default_backend is None or default_client is None or factories is None:
+                    if cls._instance is None or force_reinitialize:
+                        raise RuntimeError("LLMBackendManager.get_llm_instance() must be called with " "initialization parameters (default_backend, default_client, factories) " "on first use or when force_reinitialize=True")
+                else:
+                    # If force_reinitialize and instance exists, close it first
+                    if force_reinitialize and cls._instance is not None:
+                        try:
+                            cls._instance.close()
+                        except Exception:
+                            pass  # Best effort cleanup
+
+                    # Create new instance (or reuse if force_reinitialize)
+                    if cls._instance is None or force_reinitialize:
+                        cls._instance = BackendManager(
+                            default_backend=default_backend,
+                            default_client=default_client,
+                            factories=factories,
+                            order=order,
+                        )
+                        cls._init_params = {
+                            "default_backend": default_backend,
+                            "default_client": default_client,
+                            "factories": factories,
+                            "order": order,
+                        }
+            elif default_backend is not None or default_client is not None or factories is not None:
+                # Parameters provided but instance already exists (and not forcing reinit)
+                # This is allowed - we just ignore the parameters and return existing instance
+                pass
+
+            return cls._instance
+
+    @classmethod
+    def reset_singleton(cls) -> None:
+        """
+        Reset the singleton instance.
+
+        This should only be used in tests or when you need to completely
+        reinitialize the singleton with new parameters.
+
+        Thread-safe: Uses locks to ensure reset happens atomically.
+        """
+        with cls._lock:
+            if cls._instance is not None:
+                try:
+                    cls._instance.close()
+                except Exception:
+                    pass  # Best effort cleanup
+            cls._instance = None
+            cls._init_params = None
+
+    @classmethod
+    def is_initialized(cls) -> bool:
+        """
+        Check if the singleton instance has been initialized.
+
+        Returns:
+            bool: True if instance exists, False otherwise
+        """
+        with cls._lock:
+            return cls._instance is not None
+
+    @classmethod
+    def reset_noedit_singleton(cls) -> None:
+        """
+        Reset the no-edit/message singleton instance.
+
+        A caller that determines no synchronous no-edit candidate is
+        configured for the current effective configuration (rather than
+        simply not calling ``get_noedit_instance`` at all) uses this so a
+        stale instance bound to a previous repository or configuration in
+        the same process is not silently served to later callers.
+
+        Thread-safe: Uses locks to ensure reset happens atomically.
+        """
+        with cls._lock:
+            if cls._noedit_instance is not None:
+                try:
+                    cls._noedit_instance.close()
+                except Exception:
+                    pass  # Best effort cleanup
+            cls._noedit_instance = None
+
+    @classmethod
+    def is_noedit_initialized(cls) -> bool:
+        """
+        Check if the no-edit/message singleton instance has been initialized.
+
+        Returns:
+            bool: True if instance exists, False otherwise
+        """
+        with cls._lock:
+            return cls._noedit_instance is not None
+
+    @classmethod
+    def get_noedit_instance(
+        cls,
+        default_backend: Optional[str] = None,
+        default_client: Optional[Any] = None,
+        factories: Optional[Dict[str, Callable[[], Any]]] = None,
+        order: Optional[List[str]] = None,
+        force_reinitialize: bool = False,
+    ) -> BackendManager:
+        """
+        Get or create the singleton backend manager instance for non-editing operations.
+
+        Args:
+            default_backend: Name of the default backend
+            default_client: Default client instance
+            factories: Dictionary of backend name to factory function
+            order: Optional list specifying backend order
+            force_reinitialize: Force reinitialization with new parameters (default: False)
+
+        Returns:
+            BackendManager: The singleton instance for non-editing operations (commit messages, PR messages)
+
+        Raises:
+            RuntimeError: If called without initialization parameters on first call
+        """
+        # Fast path: check if instance exists and is initialized
+        with cls._lock:
+            # Check if we need to initialize
+            if cls._noedit_instance is None or force_reinitialize:
+                # Validate initialization parameters
+                if default_backend is None or default_client is None or factories is None:
+                    if cls._noedit_instance is None or force_reinitialize:
+                        raise RuntimeError("LLMBackendManager.get_noedit_instance() must be called with " "initialization parameters (default_backend, default_client, factories) " "on first use or when force_reinitialize=True")
+                else:
+                    # If force_reinitialize and instance exists, close it first
+                    if force_reinitialize and cls._noedit_instance is not None:
+                        try:
+                            cls._noedit_instance.close()
+                        except Exception:
+                            pass  # Best effort cleanup
+
+                    # Create new instance (or reuse if force_reinitialize)
+                    if cls._noedit_instance is None or force_reinitialize:
+                        cls._noedit_instance = BackendManager(
+                            default_backend=default_backend,
+                            default_client=default_client,
+                            factories=factories,
+                            order=order,
+                        )
+            elif default_backend is not None or default_client is not None or factories is not None:
+                # Parameters provided but instance already exists (and not forcing reinit)
+                # This is allowed - we just ignore the parameters and return existing instance
+                pass
+
+            return cls._noedit_instance
+
+
+# Global convenience functions for non-editing backend operations
+
+
+def get_noedit_backend_manager(
+    default_backend: Optional[str] = None,
+    default_client: Optional[Any] = None,
+    factories: Optional[Dict[str, Callable[[], Any]]] = None,
+    order: Optional[List[str]] = None,
+    force_reinitialize: bool = False,
+) -> BackendManager:
+    """
+    Get the global non-editing backend manager singleton instance.
+
+    This is a convenience function that delegates to LLMBackendManager.get_noedit_instance().
+    Use this when you need to access the non-editing backend manager from anywhere in your code.
+
+    Args:
+        default_backend: Name of the default backend
+        default_client: Default client instance
+        factories: Dictionary of backend name to factory function
+        order: Optional list specifying backend order
+        force_reinitialize: Force reinitialization with new parameters (default: False)
+
+    Returns:
+        BackendManager: The singleton instance for non-editing operations (commit messages, PR messages)
+
+    Raises:
+        RuntimeError: If called without initialization parameters on first call
+    """
+    return LLMBackendManager.get_noedit_instance(
+        default_backend=default_backend,
+        default_client=default_client,
+        factories=factories,
+        order=order,
+        force_reinitialize=force_reinitialize,
+    )
+
+
+def get_message_backend_manager(
+    default_backend: Optional[str] = None,
+    default_client: Optional[Any] = None,
+    factories: Optional[Dict[str, Callable[[], Any]]] = None,
+    order: Optional[List[str]] = None,
+    force_reinitialize: bool = False,
+) -> BackendManager:
+    """Deprecated: Use get_noedit_backend_manager() instead."""
+    logger.warning("get_message_backend_manager() is deprecated, use get_noedit_backend_manager()", opt={"depth": 1})
+    return get_noedit_backend_manager(
+        default_backend=default_backend,
+        default_client=default_client,
+        factories=factories,
+        order=order,
+        force_reinitialize=force_reinitialize,
+    )
+
+
+def run_llm_noedit_prompt(prompt: str) -> str:
+    """
+    Run a prompt using the global non-editing backend manager.
+
+    This is a convenience function that provides a simple way to execute non-editing
+    tasks (commit messages, PR messages) using the global non-editing backend manager singleton.
+
+    Args:
+        prompt: The prompt to send to the LLM
+
+    Returns:
+        str: The response from the LLM
+
+    Raises:
+        RuntimeError: If the non-editing backend manager hasn't been initialized
+    """
+    manager = LLMBackendManager.get_noedit_instance()
+    if manager is None:
+        raise RuntimeError("Non-editing backend manager not initialized. " "Call get_noedit_backend_manager() with initialization parameters first.")
+    # Mark this as a no-edit operation so clients use options_for_noedit
+    return manager._run_llm_cli(prompt, is_noedit=True)  # type: ignore[no-any-return]
+
+
+def run_llm_message_prompt(prompt: str) -> str:
+    """Deprecated: Use run_llm_noedit_prompt() instead."""
+    logger.warning("run_llm_message_prompt() is deprecated, use run_llm_noedit_prompt()", opt={"depth": 1})
+    return run_llm_noedit_prompt(prompt)
+
+
+def get_noedit_backend_and_model() -> Tuple[Optional[str], Optional[str]]:
+    """
+    Get the backend and model used for the most recent non-editing operation.
+
+    Returns:
+        Tuple[Optional[str], Optional[str]]: (backend_name, model_name) or (None, None) if not available
+    """
+    manager = LLMBackendManager.get_noedit_instance()
+    if manager is None:
+        return None, None  # type: ignore[unreachable]
+    return manager.get_last_backend_and_model()
+
+
+def get_message_backend_and_model() -> Tuple[Optional[str], Optional[str]]:
+    """Deprecated: Use get_noedit_backend_and_model() instead."""
+    logger.warning("get_message_backend_and_model() is deprecated, use get_noedit_backend_and_model()", opt={"depth": 1})
+    return get_noedit_backend_and_model()
+
+
+# Global convenience functions for general LLM backend operations
+
+
+def get_llm_backend_manager(
+    default_backend: Optional[str] = None,
+    default_client: Optional[Any] = None,
+    factories: Optional[Dict[str, Callable[[], Any]]] = None,
+    order: Optional[List[str]] = None,
+    force_reinitialize: bool = False,
+) -> BackendManager:
+    """
+    Get the global LLM backend manager singleton instance.
+
+    This is a convenience function that delegates to LLMBackendManager.get_llm_instance().
+    Use this when you need to access the general LLM backend manager from anywhere in your code.
+
+    Args:
+        default_backend: Name of the default backend
+        default_client: Default client instance
+        factories: Dictionary of backend name to factory function
+        order: Optional list specifying backend order
+        force_reinitialize: Force reinitialization with new parameters (default: False)
+
+    Returns:
+        BackendManager: The singleton instance for general LLM operations
+
+    Raises:
+        RuntimeError: If called without initialization parameters on first call
+    """
+    return LLMBackendManager.get_llm_instance(
+        default_backend=default_backend,
+        default_client=default_client,
+        factories=factories,
+        order=order,
+        force_reinitialize=force_reinitialize,
+    )
+
+
+def run_llm_prompt(prompt: str, backend_manager: Optional[BackendManager] = None, is_noedit: bool = False) -> str:
+    """
+    Run a prompt using the global LLM backend manager.
+
+    This is a convenience function that provides a simple way to execute general LLM
+    tasks using the global LLM backend manager singleton.
+
+    Args:
+        prompt: The prompt to send to the LLM
+        backend_manager: Optional backend manager instance to use
+        is_noedit: Whether to run in read-only / no-edit mode
+
+    Returns:
+        str: The response from the LLM
+
+    Raises:
+        RuntimeError: If the LLM backend manager hasn't been initialized
+    """
+    manager = backend_manager or LLMBackendManager.get_llm_instance()
+    if manager is None:
+        raise RuntimeError("LLM backend manager not initialized. " "Call get_llm_backend_manager() with initialization parameters first.")
+    return manager._run_llm_cli(prompt, is_noedit=is_noedit)  # type: ignore[no-any-return]
+
+
+def get_llm_backend_and_model() -> Tuple[Optional[str], Optional[str]]:
+    """
+    Get the backend and model used for the most recent general LLM execution.
+
+    Returns:
+        Tuple[Optional[str], Optional[str]]: (backend_name, model_name) or (None, None) if not available
+    """
+    manager = LLMBackendManager.get_llm_instance()
+    if manager is None:
+        return None, None  # type: ignore[unreachable]
+    return manager.get_last_backend_and_model()
+
+
+def get_llm_backend_provider_and_model() -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Get the backend, provider, and model used for the most recent general LLM execution.
+
+    Returns:
+        Tuple[Optional[str], Optional[str], Optional[str]]: (backend_name, provider_name, model_name)
+        or (None, None, None) if not available. Provider name may be None if no provider was used.
+    """
+    manager = LLMBackendManager.get_llm_instance()
+    if manager is None:
+        return None, None, None  # type: ignore[unreachable]
+    return manager.get_last_backend_provider_and_model()

@@ -1,0 +1,1192 @@
+"""Helpers for resolving merge and dependency conflicts for Auto-Coder."""
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from auto_coder.backend_manager import run_llm_noedit_prompt, run_llm_prompt
+
+from .attempt_manager import build_pr_attempt_trigger, increment_attempt
+from .automation_config import AutomationConfig
+from .cli_helpers import create_high_score_backend_manager
+from .git_utils import get_commit_log, git_commit_with_retry, git_push
+from .issue_context import extract_linked_issues_from_pr_body, get_linked_issues_context
+from .logger_config import get_logger
+from .prompt_loader import render_prompt
+from .util.gh_cache import GitHubClient
+from .utils import CommandExecutor, CommandResult, get_pr_author_login, log_action
+
+logger = get_logger(__name__)
+cmd = CommandExecutor()
+
+
+class ConflictPublicationDisposition(str, Enum):
+    """Authoritative publication outcome for a local conflict repair."""
+
+    APPLIED = "applied"
+    FAILED = "failed"
+
+
+class ConflictResolutionResult(list[str]):
+    """Presentation actions accompanied by typed publication evidence."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.disposition = ConflictPublicationDisposition.FAILED
+
+
+@dataclass(frozen=True)
+class ConflictInspection:
+    """Complete, root-scoped evidence that a merge snapshot is resolved."""
+
+    complete: bool
+    unmerged_paths: tuple[str, ...] = ()
+    marker_paths: tuple[str, ...] = ()
+    reason: str = ""
+
+
+def inspect_conflicts(root: Path) -> ConflictInspection:
+    """Inspect Git and changed files without relying on the process cwd.
+
+    Observation errors are deliberately distinct from a clean result.  This is
+    the strict variant used by durable jobs; the legacy presentation helper
+    below retains its existing interface.
+    """
+    try:
+        unmerged = subprocess.run(
+            ["git", "diff", "--name-only", "--diff-filter=U", "-z"],
+            cwd=root,
+            capture_output=True,
+            check=False,
+        )
+        changed = subprocess.run(
+            ["git", "diff", "HEAD", "--name-only", "-z"],
+            cwd=root,
+            capture_output=True,
+            check=False,
+        )
+        if unmerged.returncode or changed.returncode:
+            return ConflictInspection(False, reason="git conflict observation failed")
+        unresolved = tuple(sorted(item.decode("utf-8", "surrogateescape") for item in unmerged.stdout.split(b"\0") if item))
+        markers: list[str] = []
+        for encoded in (item for item in changed.stdout.split(b"\0") if item):
+            name = encoded.decode("utf-8", "surrogateescape")
+            path = root / name
+            try:
+                if path.is_file() and re.search(
+                    rb"^(?:<{7}(?: |$)|={7}$|>{7}(?: |$)|\|{7}(?: |$))",
+                    path.read_bytes(),
+                    re.MULTILINE,
+                ):
+                    markers.append(name)
+            except OSError as exc:
+                return ConflictInspection(False, unresolved, tuple(sorted(markers)), f"cannot inspect {name}: {exc}")
+        return ConflictInspection(True, unresolved, tuple(sorted(markers)))
+    except OSError as exc:
+        return ConflictInspection(False, reason=f"conflict observation unavailable: {exc}")
+
+
+def _push_updated_branch_with_retry(pr_number: int, commit_message: Optional[str] = None) -> List[str]:
+    """Push current branch with a single retry and skip-analysis flag on success."""
+    actions: List[str] = []
+    push_result = git_push(commit_message=commit_message)
+    if push_result.success:
+        actions.append(f"Pushed updated branch for PR #{pr_number}")
+        actions.append("ACTION_FLAG:SKIP_ANALYSIS")
+        return actions
+
+    logger.warning("First push attempt failed for PR #%s: %s", pr_number, push_result.stderr)
+    time.sleep(2)
+    retry_result = git_push(commit_message=commit_message)
+    if retry_result.success:
+        actions.append(f"Pushed updated branch for PR #{pr_number} (after retry)")
+        actions.append("ACTION_FLAG:SKIP_ANALYSIS")
+    else:
+        actions.append(f"Failed to push updated branch for PR #{pr_number}: {retry_result.stderr or push_result.stderr}")
+    return actions
+
+
+def _finalize_merge_commit(pr_number: int, base_branch: str) -> List[str]:
+    """Commit merge resolution changes and push with retry."""
+    actions: List[str] = []
+    flagged = scan_conflict_markers()
+    if flagged:
+        actions.append(f"Conflict markers still present after remediation for PR #{pr_number}: {', '.join(sorted(set(flagged)))}")
+        return actions
+
+    add_result = cmd.run_command(["git", "add", "."])
+    if not add_result.success:
+        actions.append(f"Failed to stage merge remediation changes: {add_result.stderr}")
+        return actions
+
+    commit_message = f"Auto-Coder: Merge {base_branch} into PR #{pr_number}"
+    commit_result = git_commit_with_retry(commit_message)
+    if not commit_result.success:
+        err_out = commit_result.stderr or commit_result.stdout
+        if err_out and "nothing to commit" in err_out.lower():
+            actions.append("No merge remediation changes to commit")
+        else:
+            actions.append(f"Failed to commit merge remediation changes: {err_out}")
+        return actions
+
+    actions.append(f"Committed merge remediation for PR #{pr_number}")
+    actions.extend(_push_updated_branch_with_retry(pr_number, commit_message=commit_message))
+    return actions
+
+
+def _get_merge_conflict_info() -> str:
+    """Get information about merge conflicts."""
+    try:
+        result = cmd.run_command(["git", "status", "--porcelain"])
+        return result.stdout if result.success else "Could not get merge conflict information"
+    except Exception as e:
+        return f"Error getting conflict info: {e}"
+
+
+def _trigger_fallback_for_conflict_failure(
+    repo_name: str,
+    pr_number: int,
+    failure_reason: str,
+) -> None:
+    """Trigger fallback by incrementing attempts for linked issues when conflict resolution fails.
+
+    Args:
+        repo_name: Repository name in format 'owner/repo'
+        pr_number: PR number
+        failure_reason: Reason for the failure
+    """
+    try:
+        cmd.run_command(["git", "merge", "--abort"])
+
+        # Get PR body to extract linked issues
+        head_sha = ""
+        if repo_name:
+            client = GitHubClient.get_instance()
+            pr_data = client.get_pr_details(client.get_pull_request(repo_name, pr_number))
+            pr_body = pr_data.get("body", "")
+            head_sha = pr_data.get("head_sha") or ""
+        else:
+            pr_body = ""
+
+        if not pr_body:
+            logger.debug(f"No PR body found for PR #{pr_number}, cannot extract linked issues")
+            return
+
+        # Extract linked issues from PR body
+        related_issues = extract_linked_issues_from_pr_body(pr_body)
+
+        if not related_issues:
+            logger.debug(f"No linked issues found in PR #{pr_number} body")
+            return
+
+        # Increment attempt and reopen each linked issue
+        # Increment attempt and reopen each linked issue
+        # GitHubClient is already imported globally
+
+        client = GitHubClient.get_instance()
+
+        # Identify this failure by the PR state it was observed on, so that a PR that
+        # keeps failing without receiving new commits only bumps the attempt once.
+        trigger = build_pr_attempt_trigger(pr_number, head_sha)
+
+        for issue_number in related_issues:
+            try:
+                # Check if the issue is closed and reopen it
+                issue = client.get_issue(repo_name, issue_number)
+
+                if issue.get("state") == "closed":
+                    logger.info(f"Reopening closed issue #{issue_number} due to PR #{pr_number} failure")
+                    reopen_comment = f"Auto-Coder: Reopening issue due to PR #{pr_number} failure: {failure_reason}"
+                    client.reopen_issue(repo_name, issue_number, reopen_comment)
+
+                logger.info(f"Incrementing attempt for issue #{issue_number} due to PR #{pr_number} conflict resolution failure: {failure_reason}")
+                increment_attempt(repo_name, issue_number, trigger=trigger)
+            except Exception as e:
+                logger.error(f"Failed to increment attempt for issue #{issue_number}: {e}")
+                # Continue with other issues even if one fails
+                continue
+
+        logger.info(f"Triggered fallback for {len(related_issues)} linked issue(s) from PR #{pr_number}")
+
+    except Exception as e:
+        logger.error(f"Error triggering fallback for PR #{pr_number}: {e}")
+
+
+def scan_conflict_markers() -> List[str]:
+    """Scan for conflict markers in the current working directory.
+
+    Returns:
+        List of file paths that contain conflict markers, empty list if none found.
+    """
+    flagged = []
+
+    try:
+        # Use git to find files with conflicts
+        result = cmd.run_command(["git", "diff", "--name-only", "--diff-filter=U"])
+
+        if result.success:
+            conflict_files = [f.strip() for f in result.stdout.splitlines() if f.strip()]
+            flagged.extend(conflict_files)
+
+        # Staging the merge snapshot makes it suitable for private workspaces,
+        # but does not prove that the working files have been repaired.
+        status_result = cmd.run_command(["git", "diff", "HEAD", "--name-only", "-z"])
+        if status_result.success:
+            for filename in status_result.stdout.split("\0"):
+                if filename and os.path.isfile(filename):
+                    # Read the file and check for conflict markers
+                    try:
+                        with open(filename, "r", encoding="utf-8", errors="ignore") as f:
+                            content = f.read()
+                            if re.search(r"^(?:<{7}(?: |$)|={7}$|>{7}(?: |$)|\|{7}(?: |$))", content, re.MULTILINE):
+                                flagged.append(filename)
+                    except Exception:
+                        # If we can't read the file, still flag it
+                        flagged.append(filename)
+
+        # Remove duplicates and return
+        return list(set(flagged))
+
+    except Exception as e:
+        logger.error(f"Error scanning conflict markers: {e}")
+        return []
+
+
+def check_mergeability_with_llm(
+    pr_data: Dict[str, Any],
+    conflict_info: str,
+    config: AutomationConfig,
+) -> bool:
+    """Check if merge can be performed without degrading code quality.
+
+    Args:
+        pr_data: PR data dictionary
+        conflict_info: Merge conflict information
+        config: AutomationConfig instance
+
+    Returns:
+        True if safe to merge, False if merge would degrade code quality
+    """
+    try:
+        # Get commit log since branch creation
+        base_branch = pr_data.get("base_branch") or pr_data.get("baseRefName") or config.MAIN_BRANCH
+        commit_log = get_commit_log(base_branch=base_branch)
+
+        # Get linked issues context
+        linked_issues_context = ""
+        try:
+            client = GitHubClient.get_instance()
+            linked_issues_context = get_linked_issues_context(client, str(pr_data.get("base", {}).get("repo", {}).get("full_name") or ""), pr_data.get("body", ""))
+            # Wait, repo_name is better passed directly if available?
+            # check_mergeability_with_llm doesn't have repo_name arg.
+            # but pr_data usually has it in "base.repo.full_name" or we can guess.
+            # Actually, AutomationConfig doesn't have repo_name.
+            # Let's try to get it from pr_data["base"]["repo"]["full_name"] which standard GitHub API returns.
+        except Exception:
+            pass
+
+        # Create a prompt for LLM to check mergeability
+        prompt = render_prompt(
+            "pr.mergeability_check",
+            base_branch=base_branch,
+            pr_number=pr_data.get("number", "unknown"),
+            pr_title=pr_data.get("title", "Unknown"),
+            pr_body=(pr_data.get("body") or "")[:500],
+            conflict_info=conflict_info,
+            commit_log=commit_log or "(No commit history)",
+            linked_issues_context=linked_issues_context,
+        )
+        logger.debug(
+            "Generated mergeability check prompt for PR #%s (preview: %s)",
+            pr_data.get("number", "unknown"),
+            prompt[:160].replace("\n", " "),
+        )
+
+        logger.info(f"Asking LLM to check mergeability for PR #{pr_data.get('number')}")
+
+        # Call LLM to check mergeability
+        high_score_backend_manager = create_high_score_backend_manager()
+        if high_score_backend_manager:
+            logger.info("Using high score backend for mergeability check.")
+            response = high_score_backend_manager.run_prompt(prompt)
+        else:
+            response = run_llm_noedit_prompt(prompt)
+
+        # Parse the response
+        if response and len(response.strip()) > 0:
+            response_upper = response.strip().upper()
+            if "SAFE_TO_MERGE" in response_upper:
+                logger.info(f"LLM determined PR #{pr_data.get('number')} is safe to merge")
+                return True
+            elif "DEGRADING_MERGE" in response_upper:
+                logger.info(f"LLM determined PR #{pr_data.get('number')} would degrade code quality")
+                return False
+            else:
+                # Default to not safe (pessimistic) if unclear response
+                logger.warning(f"LLM returned unclear mergeability response for PR #{pr_data.get('number')}: {response[:100]}")
+                return False
+        else:
+            # Default to not safe (pessimistic) if no response
+            logger.warning(f"LLM did not provide a clear response for mergeability check PR #{pr_data.get('number')}")
+            return False
+
+    except Exception as e:
+        logger.error(f"Error checking mergeability with LLM: {e}")
+        # Default to not safe (pessimistic) on exception
+        return False
+
+
+def resolve_merge_conflicts_with_llm(
+    pr_data: Dict[str, Any],
+    conflict_info: str,
+    config: AutomationConfig,
+    repo_name: Optional[str] = None,
+) -> ConflictResolutionResult:
+    """Ask LLM to resolve merge conflicts."""
+    actions = ConflictResolutionResult()
+
+    try:
+        pr_number = pr_data.get("number", 0)
+
+        # Get commit log since branch creation
+        base_branch = pr_data.get("base_branch") or pr_data.get("baseRefName") or config.MAIN_BRANCH
+        commit_log = get_commit_log(base_branch=base_branch)
+
+        # Get linked issues context
+        linked_issues_context = ""
+        try:
+            client = GitHubClient.get_instance()
+            repo_to_use = repo_name or pr_data.get("base", {}).get("repo", {}).get("full_name") or ""
+            linked_issues_context = get_linked_issues_context(client, repo_to_use, pr_data.get("body", ""))
+        except Exception:
+            pass
+
+        # Create a prompt for LLM to resolve conflicts
+        prompt = render_prompt(
+            "pr.merge_conflict_resolution",
+            base_branch=base_branch,
+            pr_number=pr_number,
+            pr_title=pr_data.get("title", "Unknown"),
+            pr_body=(pr_data.get("body") or "")[:500],
+            conflict_info=conflict_info,
+            commit_log=commit_log or "(No commit history)",
+            linked_issues_context=linked_issues_context,
+        )
+        logger.debug(
+            "Generated merge-conflict resolution prompt for PR #%s (preview: %s)",
+            pr_number,
+            prompt[:160].replace("\n", " "),
+        )
+
+        logger.info(f"Asking LLM to resolve merge conflicts for PR #{pr_number}")
+
+        # The controller owns the index. Preserve conflict-marker file contents
+        # in stage zero so the independent clone can capture this merge snapshot.
+        prepare_result = cmd.run_command(["git", "add", "-A"])
+        if not prepare_result.success:
+            actions.append(f"Failed to prepare merge snapshot: {prepare_result.stderr}")
+            _trigger_fallback_for_conflict_failure(repo_name or "", pr_number, "Failed to prepare merge snapshot")
+            return actions
+
+        # Call LLM to resolve conflicts
+        high_score_backend_manager = create_high_score_backend_manager()
+        if high_score_backend_manager:
+            logger.info("Using high score backend for merge conflict resolution.")
+            response = high_score_backend_manager.run_prompt(prompt)
+            from .pr_processing_evidence import record_editing_invocation
+
+            record_editing_invocation(high_score_backend_manager, "local-conflict-repair", repo_name or "")
+        else:
+            response = run_llm_prompt(prompt)
+
+        # Parse the response
+        if response and response.strip() and response.strip() != "CANNOT_FIX":
+            actions.append(f"LLM resolved merge conflicts: {response[:200]}...")
+
+            # Stage any changes made by LLM
+            add_res = cmd.run_command(["git", "add", "."])
+            if not add_res.success:
+                actions.append(f"Failed to stage resolved files: {add_res.stderr}")
+                return actions
+
+            # Verify no conflict markers remain before committing
+            flagged = scan_conflict_markers()
+            if flagged:
+                actions.append(f"Conflict markers still present in {len(flagged)} file(s): {', '.join(sorted(set(flagged)))}; not committing")
+                # Trigger fallback due to unresolved conflict markers
+                _trigger_fallback_for_conflict_failure(repo_name or "", pr_number, "LLM left unresolved conflict markers")
+                return actions
+
+            # Commit via helper and push
+            commit_res = git_commit_with_retry(f"Resolve merge conflicts for PR #{pr_number}")
+            if commit_res.success:
+                actions.append(f"Committed resolved merge for PR #{pr_number}")
+            else:
+                actions.append(f"Failed to commit resolved merge: {commit_res.stderr or commit_res.stdout}")
+                # Trigger fallback due to commit failure
+                _trigger_fallback_for_conflict_failure(repo_name or "", pr_number, "Failed to commit conflict resolution")
+                return actions
+
+            push_res = git_push()
+            if push_res.success:
+                actions.append(f"Pushed resolved merge for PR #{pr_number}")
+                actions.append("ACTION_FLAG:SKIP_ANALYSIS")
+                actions.disposition = ConflictPublicationDisposition.APPLIED
+            else:
+                actions.append(f"Failed to push resolved merge: {push_res.stderr}")
+                # Trigger fallback due to push failure
+                _trigger_fallback_for_conflict_failure(repo_name or "", pr_number, "Failed to push conflict resolution")
+        else:
+            actions.append("LLM did not provide a clear response for merge conflict resolution")
+            # Trigger fallback due to no LLM response
+            _trigger_fallback_for_conflict_failure(repo_name or "", pr_number, "LLM provided no response for conflict resolution")
+
+    except Exception as e:
+        logger.error(f"Error resolving merge conflicts with LLM: {e}")
+        actions.append(f"Error resolving merge conflicts: {e}")
+        # Trigger fallback due to exception
+        _trigger_fallback_for_conflict_failure(repo_name or "", pr_data.get("number", 0), f"Exception during conflict resolution: {str(e)}")
+
+    return actions
+
+
+# _extract_linked_issues removed in favor of issue_context.extract_linked_issues_from_pr_body
+
+
+def _extract_session_id_from_pr_body(pr_body: str) -> Optional[str]:
+    """Extract Session ID from PR body."""
+    if not pr_body:
+        return None
+
+    # Pattern 1: Look for "Session ID:" or "Session:" followed by the session ID
+    session_pattern = r"(?:session\s*id:|session:)\s*(.+?)(?:\n|$)"
+    match = re.search(session_pattern, pr_body, re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+
+    # Pattern 2: Look for URLs that might contain session IDs
+    url_session_pattern = r"(?:session(?:_id)?=)([a-zA-Z0-9-_]+)"
+    match = re.search(url_session_pattern, pr_body, re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+
+    # Pattern 3: Look for Jules session URLs (e.g., https://jules.google.com/session/901463134778726610)
+    jules_session_pattern = r"jules\.google\.com/session/([a-zA-Z0-9-_]+)"
+    match = re.search(jules_session_pattern, pr_body)
+    if match:
+        return match.group(1).strip()
+
+    # Pattern 4: Look for Jules task URLs
+    jules_task_pattern = r"https?://jules\.google\.com/task/(\d+)"
+    match = re.search(jules_task_pattern, pr_body)
+    if match:
+        return match.group(1).strip()
+
+    return None
+
+
+def _close_pr(repo_name: str, pr_number: int) -> None:
+    """Close a PR."""
+    try:
+        client = GitHubClient.get_instance()
+        client.close_pr(repo_name, pr_number, comment="Auto-Coder: Closing PR due to merge conflicts and potential degradation risk.")
+        logger.info(f"Closed PR #{pr_number}")
+    except Exception as e:
+        logger.error(f"Error closing PR #{pr_number}: {e}")
+
+
+def _archive_jules_session(repo_name: str, pr_number: int, pr_body: str) -> None:
+    """Archive Jules session."""
+    try:
+        session_id = _extract_session_id_from_pr_body(pr_body)
+        if not session_id:
+            logger.warning(f"No session ID found in Jules PR #{pr_number} body for archiving")
+            return
+
+        # Archive the Jules session
+        try:
+            from .jules_client import JulesClient
+
+            jules_client = JulesClient()
+            success = jules_client.archive_session(session_id)
+
+            if success:
+                logger.info(f"Archived Jules session '{session_id}' for PR #{pr_number}")
+                log_action(f"Archived Jules session for PR #{pr_number}")
+            else:
+                logger.warning(f"Failed to archive Jules session '{session_id}' for PR #{pr_number}")
+        except Exception as e:
+            logger.warning(f"Error archiving Jules session for PR #{pr_number}: {e}")
+
+    except Exception as e:
+        logger.warning(f"Error processing Jules session archiving for PR #{pr_number}: {e}")
+
+
+def _perform_base_branch_merge_and_conflict_resolution(
+    pr_number: int,
+    base_branch: str,
+    config: AutomationConfig,
+    pr_data: Dict[str, Any],
+    repo_name: Optional[str] = None,
+) -> bool:
+    """Perform base branch merge and resolve conflicts using LLM.
+
+    This is a common subroutine used by both _update_with_base_branch and _resolve_pr_merge_conflicts.
+
+    Returns:
+        True if conflicts were resolved successfully, False otherwise
+    """
+    try:
+        # Step -1: Ensure pr_data has necessary details (author, body, baseRefName)
+        if not pr_data or "author" not in pr_data or "body" not in pr_data or "baseRefName" not in pr_data:
+            logger.info(f"Enriching pr_data for PR #{pr_number} with missing details")
+            try:
+                if repo_name:
+                    client = GitHubClient.get_instance()
+                    fresh_data = client.get_pr_details(client.get_pull_request(repo_name, pr_number))
+                    pr_data = {**pr_data, **fresh_data}
+            except Exception as e:
+                logger.warning(f"Failed to enrich pr_data for PR #{pr_number}: {e}")
+
+        # Step 0: Clean up any existing git state
+        logger.info(f"Cleaning up git state before resolving conflicts for PR #{pr_number}")
+
+        # Reset any uncommitted changes
+        reset_result = cmd.run_command(["git", "reset", "--hard"])
+        if not reset_result.success:
+            logger.warning(f"Failed to reset git state: {reset_result.stderr}")
+
+        # Clean untracked files
+        clean_result = cmd.run_command(["git", "clean", "-fd"])
+        if not clean_result.success:
+            logger.warning(f"Failed to clean untracked files: {clean_result.stderr}")
+
+        # Abort any ongoing merge
+        abort_result = cmd.run_command(["git", "merge", "--abort"])
+        if abort_result.success:
+            logger.info("Aborted ongoing merge")
+
+        # Step 1: Checkout the PR branch (if not already checked out)
+        logger.info(f"Checking out PR #{pr_number} to resolve merge conflicts")
+        if repo_name:
+            client = GitHubClient.get_instance()
+            pr_data_fresh = client.get_pr_details(client.get_pull_request(repo_name, pr_number))
+            head_branch = pr_data_fresh.get("head_branch")
+
+            if head_branch:
+                # Fetch and checkout using standard git
+                fetch_pr_result = cmd.run_command(["git", "fetch", "origin", head_branch])
+                if not fetch_pr_result.success:
+                    logger.error(f"Failed to fetch PR branch {head_branch}: {fetch_pr_result.stderr}")
+                    return False
+
+                checkout_result = cmd.run_command(["git", "checkout", head_branch])
+                if not checkout_result.success:
+                    logger.error(f"Failed to checkout branch {head_branch}: {checkout_result.stderr}")
+                    return False
+            else:
+                logger.error(f"Could not determine head branch for PR #{pr_number}")
+                return False
+        else:
+            logger.error(f"No repo_name provided, cannot checkout PR #{pr_number}")
+            return False
+
+        # Step 2: Fetch the latest base branch
+        logger.info(f"Fetching latest {base_branch} branch")
+        fetch_result = cmd.run_command(["git", "fetch", "origin", base_branch])
+
+        if not fetch_result.success:
+            logger.error(f"Failed to fetch {base_branch} branch: {fetch_result.stderr}")
+            return False
+
+        # Step 3: Attempt to merge base branch (resolve to fully qualified ref to avoid ambiguity)
+        origin_ref = f"refs/remotes/origin/{base_branch}"
+        base_check = cmd.run_command(["git", "rev-parse", "--verify", origin_ref])
+        if base_check.success:
+            resolved_base = origin_ref
+        else:
+            # Fallback to local branch name if remote-tracking ref is unavailable
+            local_check = cmd.run_command(["git", "rev-parse", "--verify", base_branch])
+            if not local_check.success:
+                logger.error(f"Failed to resolve base branch ref for {base_branch}")
+                return False
+            resolved_base = base_branch
+
+        logger.info(f"Merging {resolved_base} into PR #{pr_number}")
+        merge_result = cmd.run_command(["git", "merge", resolved_base])
+
+        if merge_result.success:
+            # No conflicts, push the updated branch using centralized helper with retry
+            logger.info(f"Successfully merged {resolved_base} into PR #{pr_number}, pushing changes")
+            push_result = git_push()
+
+            if push_result.success:
+                logger.info(f"Successfully pushed updated branch for PR #{pr_number}")
+                return True
+            else:
+                # Push failed - try one more time after a brief pause
+                logger.warning(f"First push attempt failed: {push_result.stderr}, retrying...")
+                time.sleep(2)
+                retry_push_result = git_push()
+                if retry_push_result.success:
+                    logger.info(f"Successfully pushed updated branch for PR #{pr_number} (after retry)")
+                    return True
+                else:
+                    logger.error(f"Failed to push updated branch after retry: {retry_push_result.stderr}")
+                    logger.error("Push failure detected during merge conflict resolution")
+                    return False
+        else:
+            # Merge conflicts detected, check if merge would degrade code quality
+            logger.info(f"Merge conflicts detected for PR #{pr_number}, checking mergeability")
+
+            # Dependency-bot PRs (Dependabot/Renovate) are never conflict-resolved:
+            # the bot recreates the PR against the updated base branch by itself.
+            from .pr_processor import _is_dependabot_pr, _is_jules_pr, _is_local_llm_pr
+
+            if _is_dependabot_pr(pr_data):
+                logger.info(f"Skipping merge conflict resolution for dependency-bot PR #{pr_number}")
+                cmd.run_command(["git", "merge", "--abort"])
+                return False
+
+            if not _is_local_llm_pr(pr_data) and not _is_jules_pr(pr_data):
+                logger.info(f"Skipping merge conflict resolution for non-local PR #{pr_number}")
+                cmd.run_command(["git", "merge", "--abort"])
+                return False
+
+            # Get conflict information
+            conflict_info = "\n".join(scan_conflict_markers())
+
+            # Ensure pr_data has the base_branch
+            pr_data = {**pr_data, "base_branch": base_branch}
+
+            # Check if merge would degrade code quality before attempting resolution
+            safe_to_merge = _is_local_llm_pr(pr_data) or check_mergeability_with_llm(pr_data, conflict_info, config)
+
+            if not safe_to_merge:
+                logger.info(f"LLM determined merge would degrade code quality for PR #{pr_number}, skipping merge attempt")
+
+                # Check if PR is from Jules
+                pr_author_login = get_pr_author_login(pr_data) or ""
+                is_jules_pr = "google-labs-jules" in pr_author_login.lower()
+
+                # Check for linked issues (logging only, not used for decision anymore)
+                pr_body = pr_data.get("body", "")
+                linked_issues = extract_linked_issues_from_pr_body(pr_body)
+
+                if is_jules_pr:
+                    logger.info(f"PR #{pr_number} is a Jules PR with degrade risk. Closing PR and archiving session.")
+                    if repo_name:
+                        _close_pr(repo_name, pr_number)
+                        _archive_jules_session(repo_name, pr_number, pr_body)
+                        # Recreate Jules session
+                        try:
+                            session_id = _extract_session_id_from_pr_body(pr_body)
+                            if session_id:
+                                from .cloud_manager import CloudManager
+
+                                cloud_manager = CloudManager(repo_name)
+                                issue_number = cloud_manager.get_issue_by_session(session_id)
+                                if not issue_number:
+                                    from .pr_processor import _find_issue_by_session_id_in_comments
+
+                                    github_client = GitHubClient.get_instance()
+                                    issue_number = _find_issue_by_session_id_in_comments(repo_name, session_id, github_client)
+
+                                if issue_number:
+                                    logger.info(f"Found issue #{issue_number} for closed Jules PR #{pr_number}. Re-creating session.")
+                                    github_client = GitHubClient.get_instance()
+                                    # Re-enter through the engine's shared Issue admission
+                                    # boundary. In particular, do not increment the attempt
+                                    # or start Jules until current readiness has been checked.
+                                    from .automation_engine import AutomationEngine
+
+                                    engine = AutomationEngine(github_client, config=config)
+                                    actions = engine._process_unlocked_issue(repo_name, issue_number, config, jules_mode=True, advance_attempt=True)
+                                    for action in actions:
+                                        logger.info(f"Issue #{issue_number}: {action}")
+                                else:
+                                    logger.warning(f"No issue found associated with session ID '{session_id}' to recreate Jules session")
+                            else:
+                                logger.warning(f"Could not extract session ID from Jules PR #{pr_number} body to recreate session")
+                        except Exception as jerr:
+                            logger.error(f"Error while attempting to recreate Jules session for PR #{pr_number}: {jerr}")
+                    return False
+
+                # Trigger fallback and signal to proceed to fixing
+                _trigger_fallback_for_conflict_failure(
+                    repo_name or "",
+                    pr_number,
+                    "LLM determined merge would degrade code quality",
+                )
+                return False
+
+            # Safe to merge, proceed with LLM conflict resolution
+            logger.info(f"LLM determined merge is safe for PR #{pr_number}, proceeding with resolution")
+
+            resolve_actions = resolve_merge_conflicts_with_llm(pr_data, conflict_info, config, repo_name)
+
+            # Log the resolution actions
+            for action in resolve_actions:
+                logger.info(f"Conflict resolution action: {action}")
+
+            # Check if conflicts were resolved successfully
+            status_result = cmd.run_command(["git", "status", "--porcelain"])
+
+            if resolve_actions.disposition is ConflictPublicationDisposition.APPLIED and status_result.success and not status_result.stdout.strip():
+                logger.info(f"Merge conflicts resolved for PR #{pr_number}")
+                return True
+            else:
+                logger.error(f"Failed to resolve merge conflicts for PR #{pr_number}")
+                # Trigger fallback due to conflict resolution failure
+                _trigger_fallback_for_conflict_failure(repo_name or "", pr_number, "Merge conflict resolution failed (LLM could not resolve conflicts)")
+                return False
+
+    except Exception as e:
+        logger.error(f"Error resolving merge conflicts for PR #{pr_number}: {e}")
+        return False
+
+
+def resolve_pr_merge_conflicts(repo_name: str, pr_number: int, config: AutomationConfig, llm_client: Optional[Any] = None) -> bool:
+    """Resolve merge conflicts for a PR by checking it out and merging with its base branch.
+
+    This function has been moved from pr_processor.py to conflict_resolver.py for better organization.
+    """
+    try:
+        # Get PR details to determine the target base branch
+        if repo_name:
+            client = GitHubClient.get_instance()
+            pr_data = client.get_pr_details(client.get_pull_request(repo_name, pr_number))
+            base_branch = pr_data.get("base_branch") or pr_data.get("baseRefName", config.MAIN_BRANCH)
+        else:
+            logger.error(f"No repo_name provided for PR #{pr_number}")
+            return False
+
+        # Use the common subroutine
+        return _perform_base_branch_merge_and_conflict_resolution(pr_number, base_branch, config, pr_data, repo_name)
+
+    except Exception as e:
+        logger.error(f"Error resolving merge conflicts for PR #{pr_number}: {e}")
+        return False
+
+
+def is_package_lock_only_conflict(conflict_info: str) -> bool:
+    """Check if conflicts are only in package-lock.json files."""
+    try:
+        # Parse git status output to find conflicted files
+        conflicted_files = []
+        for line in conflict_info.strip().split("\n"):
+            if line.strip():
+                # Git status --porcelain format: XY filename
+                # UU means both modified (merge conflict)
+                if line.startswith("UU "):
+                    filename = line[3:].strip()
+                    conflicted_files.append(filename)
+
+        # Check if all conflicted files are package-lock.json or similar dependency files
+        if not conflicted_files:
+            return False
+
+        dependency_files = {"package-lock.json", "yarn.lock", "pnpm-lock.yaml"}
+        return all(any(dep_file in file for dep_file in dependency_files) for file in conflicted_files)
+
+    except Exception as e:
+        logger.error(f"Error checking package-lock conflict: {e}")
+        return False
+
+
+def is_package_json_deps_only_conflict(conflict_info: str) -> bool:
+    """Detect if conflicts only affect package.json dependency sections.
+
+    Strategy:
+    - From git status --porcelain output, pick conflicted package.json files (UU .../package.json)
+    - For each, read stage 2 (ours) and stage 3 (theirs) JSON via `git show :2:path` and `git show :3:path`
+    - Compare both dicts with dependency sections removed; if any non-dependency part differs, return False
+    - If all such files differ only in dependency sections, return True
+    """
+    try:
+        conflicted_files: List[str] = []
+        for line in conflict_info.strip().split("\n"):
+            if line.strip() and line.startswith("UU "):
+                filename = line[3:].strip()
+                if filename.endswith("package.json"):
+                    conflicted_files.append(filename)
+                else:
+                    # Any non-package.json conflict disqualifies this specialized resolver
+                    return False
+
+        if not conflicted_files:
+            return False
+
+        dep_keys = {
+            "dependencies",
+            "devDependencies",
+            "peerDependencies",
+            "optionalDependencies",
+        }
+
+        for path in conflicted_files:
+            ours = cmd.run_command(["git", "show", f":2:{path}"])
+            theirs = cmd.run_command(["git", "show", f":3:{path}"])
+            if not (ours.success and theirs.success):
+                return False
+            try:
+                ours_json = json.loads(ours.stdout or "{}")
+                theirs_json = json.loads(theirs.stdout or "{}")
+            except Exception:
+                return False
+
+            def strip_dep_sections(d: Dict[str, Any]) -> Dict[str, Any]:
+                return {k: v for k, v in d.items() if k not in dep_keys}
+
+            if strip_dep_sections(ours_json) != strip_dep_sections(theirs_json):
+                return False
+
+        return True
+    except Exception as e:
+        logger.error(f"Error checking package.json deps-only conflict: {e}")
+        return False
+
+
+def get_deps_only_conflicted_package_json_paths(conflict_info: str) -> List[str]:
+    """Return list of conflicted package.json paths whose diffs are limited to dependency sections.
+
+    This is similar to is_package_json_deps_only_conflict but operates per-file and
+    returns only those package.json files that are safe to auto-merge dependencies for,
+    regardless of other conflicted files present.
+    """
+    try:
+        conflicted_paths: List[str] = []
+        for line in conflict_info.strip().split("\n"):
+            if line.strip() and line.startswith("UU "):
+                filename = line[3:].strip()
+                if filename.endswith("package.json"):
+                    conflicted_paths.append(filename)
+
+        if not conflicted_paths:
+            return []
+
+        dep_keys = {
+            "dependencies",
+            "devDependencies",
+            "peerDependencies",
+            "optionalDependencies",
+        }
+        eligible: List[str] = []
+        for path in conflicted_paths:
+            ours = cmd.run_command(["git", "show", f":2:{path}"])
+            theirs = cmd.run_command(["git", "show", f":3:{path}"])
+            if not (ours.success and theirs.success):
+                continue
+            try:
+                ours_json = json.loads(ours.stdout or "{}")
+                theirs_json = json.loads(theirs.stdout or "{}")
+            except Exception:
+                continue
+
+            def strip_dep_sections(d: Dict[str, Any]) -> Dict[str, Any]:
+                return {k: v for k, v in d.items() if k not in dep_keys}
+
+            if strip_dep_sections(ours_json) == strip_dep_sections(theirs_json):
+                eligible.append(path)
+        return eligible
+    except Exception as e:
+        logger.error(f"Error collecting deps-only package.json conflicts: {e}")
+        return []
+
+
+def parse_semver_to_tuple(v: str) -> Optional[tuple]:
+    """Parse a semver-ish string to a comparable tuple of ints.
+    - Strips common range operators (^, ~, >=, <=, >, <, =)
+    - Ignores pre-release/build metadata
+    - Returns None if parsing fails
+    """
+    if not isinstance(v, str) or not v:
+        return None
+    # Strip range operators and spaces
+    s = v.strip()
+    while s and s[0] in ("^", "~", ">", "<", "=", "v"):
+        s = s[1:]
+    # Remove leading = if any remain
+    s = s.lstrip("=")
+    # Split on hyphen (prerelease) and plus (build)
+    s = s.split("+", 1)[0].split("-", 1)[0]
+    parts = s.split(".")
+    nums: List[int] = []
+    for p in parts:
+        if p.isdigit():
+            nums.append(int(p))
+        else:
+            # Stop at first non-numeric segment
+            break
+    if not nums:
+        return None
+    while len(nums) < 3:
+        nums.append(0)
+    return tuple(nums[:3])
+
+
+def compare_semver(a: str, b: str) -> int:
+    """Compare two version strings. Return 1 if a>b, -1 if a<b, 0 if equal/unknown.
+    Best-effort for common semver patterns.
+    """
+    ta = parse_semver_to_tuple(a)
+    tb = parse_semver_to_tuple(b)
+    if ta is None or tb is None:
+        # Unknown comparison
+        return 0
+    if ta > tb:
+        return 1
+    if ta < tb:
+        return -1
+    return 0
+
+
+def merge_dep_maps(ours: Dict[str, str], theirs: Dict[str, str], prefer_side: str) -> Dict[str, str]:
+    """Merge two dependency maps choosing newer version when conflict.
+    prefer_side: 'ours' or 'theirs' used as tie-breaker when versions equal/unknown.
+    """
+    result: Dict[str, str] = {}
+    keys = set(ours.keys()) | set(theirs.keys())
+    for k in sorted(keys):
+        va = ours.get(k)
+        vb = theirs.get(k)
+        if va is None:
+            result[k] = vb  # type: ignore
+        elif vb is None:
+            result[k] = va
+        else:
+            cmp = compare_semver(va, vb)
+            if cmp > 0:
+                result[k] = va
+            elif cmp < 0:
+                result[k] = vb
+            else:
+                # Equal or unknown: prefer side with "more" deps overall
+                if prefer_side == "ours":
+                    result[k] = va
+                else:
+                    result[k] = vb
+    return result
+
+
+def resolve_package_json_dependency_conflicts(
+    pr_data: Dict[str, Any],
+    conflict_info: str,
+    config: AutomationConfig,
+    eligible_paths: Optional[List[str]] = None,
+) -> List[str]:
+    """Resolve package.json dependency-only conflicts by merging dependency sections.
+
+    Rules:
+    - For dependencies/devDependencies/peerDependencies/optionalDependencies:
+      - Union of packages
+      - When versions differ: pick newer semver if determinable; otherwise prefer the side that has more deps in that section overall
+    - Non-dependency sections follow 'ours' (since they are identical by detection)
+
+    When eligible_paths is provided, only those package.json files are processed.
+    """
+    actions: List[str] = []
+    try:
+        pr_number = pr_data["number"]
+        actions.append(f"Detected package.json dependency-only conflicts for PR #{pr_number}")
+
+        conflicted_paths: List[str] = []
+        if eligible_paths is not None:
+            conflicted_paths = list(eligible_paths)
+        else:
+            for line in conflict_info.strip().split("\n"):
+                if line.strip() and line.startswith("UU "):
+                    p = line[3:].strip()
+                    if p.endswith("package.json"):
+                        conflicted_paths.append(p)
+
+        updated_files: List[str] = []
+        for path in conflicted_paths:
+            ours = cmd.run_command(["git", "show", f":2:{path}"])
+            theirs = cmd.run_command(["git", "show", f":3:{path}"])
+            if not (ours.success and theirs.success):
+                actions.append(f"Failed to read staged versions for {path}")
+                continue
+            try:
+                ours_json = json.loads(ours.stdout or "{}")
+                theirs_json = json.loads(theirs.stdout or "{}")
+            except Exception as e:
+                actions.append(f"Invalid JSON in staged package.json for {path}: {e}")
+                continue
+
+            dep_keys = [
+                "dependencies",
+                "devDependencies",
+                "peerDependencies",
+                "optionalDependencies",
+            ]
+
+            # Decide tie-breaker side per section by larger map size
+            prefer_map = {}
+            for k in dep_keys:
+                oa = ours_json.get(k) or {}
+                ob = theirs_json.get(k) or {}
+                prefer_map[k] = "ours" if len(oa) >= len(ob) else "theirs"
+
+            merged = dict(ours_json)  # start from ours
+            for k in dep_keys:
+                oa = ours_json.get(k) or {}
+                ob = theirs_json.get(k) or {}
+                if not isinstance(oa, dict) or not isinstance(ob, dict):
+                    # Unexpected structure; fallback to ours
+                    continue
+                merged[k] = merge_dep_maps(oa, ob, prefer_map[k])
+
+            # Write merged JSON back to file
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(merged, f, ensure_ascii=False, indent=2, sort_keys=True)
+                f.write("\n")
+            updated_files.append(path)
+            actions.append(f"Merged dependency sections in {path}")
+
+        if not updated_files:
+            actions.append("No package.json files updated; skipping commit")
+            return actions
+
+        add = cmd.run_command(["git", "add"] + updated_files)
+        if not add.success:
+            actions.append(f"Failed to stage merged package.json files: {add.stderr}")
+            return actions
+        actions.append("Staged merged package.json files")
+
+        # commit = cmd.run_command([
+        #     'git', 'commit',
+        #     '-m', f"Resolve package.json dependency-only conflicts for PR #{pr_number} by preferring newer versions and union"
+        # ])
+        # if not commit.success:
+        #     actions.append(f"Failed to commit merged package.json: {commit.stderr}")
+        #     return actions
+        actions.append("Committed merged package.json changes")
+
+        # push = cmd.run_command(['git', 'push'])
+        # if push.success:
+        #     actions.append(f"Successfully pushed package.json conflict resolution for PR #{pr_number}")
+        #     actions.append("ACTION_FLAG:SKIP_ANALYSIS")
+        # else:
+        #     actions.append(f"Failed to push changes: {push.stderr}")
+
+    except Exception as e:
+        logger.error(f"Error resolving package.json dependency conflicts: {e}")
+        actions.append(f"Error resolving package.json dependency conflicts: {e}")
+    return actions
+
+
+def resolve_package_lock_conflicts(pr_data: Dict[str, Any], conflict_info: str, config: AutomationConfig) -> List[str]:
+    """Resolve package-lock.json conflicts by deleting and regenerating the file.
+
+    Monorepo-friendly: for each conflicted lockfile, if a sibling package.json exists,
+    run package manager commands in that directory to regenerate the lock file.
+    """
+    actions = []
+
+    try:
+        logger.info(f"Resolving package-lock.json conflicts for PR #{pr_data['number']}")
+        actions.append(f"Detected package-lock.json only conflicts for PR #{pr_data['number']}")
+
+        # Parse conflicted files
+        conflicted_files = []
+        for line in conflict_info.strip().split("\n"):
+            if line.strip() and line.startswith("UU "):
+                filename = line[3:].strip()
+                conflicted_files.append(filename)
+
+        # Remove conflicted dependency files
+        lockfile_names = ["package-lock.json", "yarn.lock", "pnpm-lock.yaml"]
+        lockfile_dirs: List[str] = []
+        for file in conflicted_files:
+            if any(dep in file for dep in lockfile_names):
+                remove_result = cmd.run_command(["rm", "-f", file])
+                if remove_result.success:
+                    actions.append(f"Removed conflicted file: {file}")
+                else:
+                    actions.append(f"Failed to remove {file}: {remove_result.stderr}")
+                # Track directory for regeneration attempts
+                lockfile_dirs.append(os.path.dirname(file) or ".")
+
+        # Deduplicate directories while preserving order
+        seen = set()
+        unique_dirs = []
+        for d in lockfile_dirs:
+            if d not in seen:
+                seen.add(d)
+                unique_dirs.append(d)
+
+        # For each directory, if package.json exists there, try to regenerate lock files
+        any_regenerated = False
+        for d in unique_dirs:
+            pkg_path = os.path.join(d, "package.json") if d not in ("", ".") else "package.json"
+            if os.path.exists(pkg_path):
+                # Try npm install first in that directory
+                if d in ("", "."):
+                    npm_result = cmd.run_command(["npm", "install"], timeout=300)
+                else:
+                    npm_result = cmd.run_command(["npm", "install"], timeout=300, cwd=d)
+                if npm_result.success:
+                    actions.append(f"Successfully ran npm install in {d or '.'} to regenerate lock file")
+                    any_regenerated = True
+                else:
+                    # Try yarn if npm fails
+                    if d in ("", "."):
+                        yarn_result = cmd.run_command(["yarn", "install"], timeout=300)
+                    else:
+                        yarn_result = cmd.run_command(["yarn", "install"], timeout=300, cwd=d)
+                    if yarn_result.success:
+                        actions.append(f"Successfully ran yarn install in {d or '.'} to regenerate lock file")
+                        any_regenerated = True
+                    else:
+                        actions.append(f"Failed to regenerate lock file in {d or '.'} with npm or yarn: {npm_result.stderr}")
+            else:
+                if d in ("", "."):
+                    actions.append("No package.json found, skipping dependency installation")
+                else:
+                    actions.append(f"No package.json found in {d or '.'}, skipping dependency installation for this path")
+
+        if not any_regenerated and not unique_dirs:
+            # Fallback message when no lockfile dirs were identified (shouldn't happen)
+            actions.append("No lockfile directories identified, skipping dependency installation")
+
+        # Stage the regenerated files
+        add_result = cmd.run_command(["git", "add", "."])
+        if add_result.success:
+            actions.append("Staged regenerated dependency files")
+        else:
+            actions.append(f"Failed to stage files: {add_result.stderr}")
+            return actions
+
+        # Commit the changes (via common helper which auto-runs dprint fmt)
+        # commit_result = _commit_with_message(
+        #     f"Resolve package-lock.json conflicts for PR #{pr_data['number']}"
+        # )
+        # if commit_result.success:
+        #     actions.append("Committed resolved dependency conflicts")
+        # else:
+        #     actions.append(f"Failed to commit changes: {commit_result.stderr or commit_result.stdout}")
+        #     return actions
+
+        # Push the changes (via common helper)
+        # push_result = _push_current_branch()
+        # if push_result.success:
+        #     actions.append(f"Successfully pushed resolved package-lock.json conflicts for PR #{pr_data['number']}")
+        #     # Signal to skip further LLM analysis for this PR in this run
+        #     actions.append("ACTION_FLAG:SKIP_ANALYSIS")
+        # else:
+        #     actions.append(f"Failed to push changes: {push_result.stderr}")
+
+    except Exception as e:
+        logger.error(f"Error resolving package-lock conflicts: {e}")
+        actions.append(f"Error resolving package-lock conflicts: {e}")
+
+    return actions

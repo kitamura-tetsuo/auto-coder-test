@@ -1,0 +1,341 @@
+from datetime import datetime, timedelta
+from unittest.mock import MagicMock, Mock, patch
+
+import httpx
+import pytest
+
+from src.auto_coder.automation_config import AutomationConfig, CandidateProcessingResult
+from src.auto_coder.automation_engine import AutomationEngine
+from src.auto_coder.implementation_slots import ImplementationOwner, ImplementationSlotRepository
+from src.auto_coder.specification_analyzer import SpecificationAnalysisResult
+from src.auto_coder.specification_validation_lifecycle import SpecificationValidationLifecycle
+from src.auto_coder.util.gh_cache import GitHubClient
+from src.auto_coder.util.github_action import GitHubActionsStatusResult
+
+
+class TestGitHubClientREST:
+    """Test cases for GitHubClient REST API methods."""
+
+    @pytest.mark.parametrize("age_seconds", [300, 3599, 3600, 3601])
+    @patch("src.auto_coder.util.gh_cache.get_ghapi_client")
+    def test_open_issues_cache_expires_after_one_hour(self, mock_get_api, age_seconds):
+        """Reuse the list until one hour, then fetch a fresh complete list."""
+        GitHubClient.reset_singleton()
+        try:
+            client = GitHubClient.get_instance("test_token")
+            now = datetime(2026, 9, 12, 12, 0, 0)
+            client._open_issues_cache = [{"number": 123}]
+            client._open_issues_cache_repo = "owner/repo"
+            client._open_issues_cache_time = now - timedelta(seconds=age_seconds)
+            mock_get_api.return_value.issues.list_for_repo.return_value = []
+
+            with patch("src.auto_coder.util.gh_cache.datetime") as mock_datetime:
+                mock_datetime.now.return_value = now
+                result = client.get_open_issues_json("owner/repo")
+
+            if age_seconds < 3600:
+                assert result == [{"number": 123}]
+                mock_get_api.assert_not_called()
+            else:
+                assert result == []
+                mock_get_api.return_value.issues.list_for_repo.assert_called_once_with("owner", "repo", state="open", per_page=100, page=1)
+                assert client._open_issues_cache == []
+                assert client._open_issues_cache_time == now
+        finally:
+            GitHubClient.reset_singleton()
+
+    @pytest.fixture
+    def mock_github_token(self):
+        return "test_token"
+
+    @patch("src.auto_coder.util.gh_cache.get_ghapi_client")
+    def test_get_pr_changed_file_count_is_independent_of_diff(self, mock_get_ghapi_client, mock_github_token):
+        mock_api = MagicMock()
+        mock_get_ghapi_client.return_value = mock_api
+        mock_api.pulls.get.return_value = {"changed_files": 301}
+        client = GitHubClient.get_instance(mock_github_token)
+
+        changed_file_count = client.get_pr_changed_file_count("owner/repo", 123)
+
+        assert changed_file_count == 301
+        mock_api.pulls.get.assert_called_once_with("owner", "repo", 123)
+
+    @patch("src.auto_coder.util.gh_cache.get_caching_client")
+    def test_get_open_prs_json_rest(self, mock_get_caching_client, mock_github_token):
+        """Test get_open_prs_json uses REST API correctly."""
+        # Setup
+        mock_client = MagicMock()
+        mock_get_caching_client.return_value = mock_client
+
+        # Mock List PRs - return plain dicts as if from cache
+        mock_pr_summary = {"number": 123}
+
+        # Mock Get PR Details - return plain dict
+        mock_pr_detail = {
+            "number": 123,
+            "title": "Test PR",
+            "node_id": "PR_kw...",
+            "body": "Body",
+            "state": "open",
+            "html_url": "http://url",
+            "created_at": "2024-01-01",
+            "updated_at": "2024-01-02",
+            "draft": False,
+            "mergeable": True,
+            "head": {"ref": "head-branch", "sha": "head-sha"},
+            "base": {"ref": "base-branch"},
+            "user": {"login": "author"},
+            "assignees": [{"login": "assignee"}],
+            "labels": [{"name": "label"}],
+            "comments": 1,
+            "review_comments": 1,
+            "commits": 5,
+            "additions": 10,
+            "deletions": 2,
+            "changed_files": 1,
+        }
+
+        list_response = httpx.Response(200, json=[mock_pr_summary], request=httpx.Request("GET", "https://api.github.com/repos/owner/repo/pulls?state=open&per_page=100"))
+        detail_response = httpx.Response(200, json=mock_pr_detail, request=httpx.Request("GET", "https://api.github.com/repos/owner/repo/pulls/123"))
+        mock_client.request.side_effect = [list_response, detail_response]
+
+        client = GitHubClient.get_instance(mock_github_token)
+
+        # Execute
+        result = client.get_open_prs_json("owner/repo")
+
+        # Assert
+        assert len(result) == 1
+        pr = result[0]
+        assert pr["number"] == 123
+        assert pr["title"] == "Test PR"
+        assert pr["node_id"] == "PR_kw..."
+        assert pr["mergeable"] is True
+        assert pr["comments_count"] == 2  # 1 + 1
+        assert pr["commits_count"] == 5
+
+        requested_urls = [call.args[1] for call in mock_client.request.call_args_list]
+        assert requested_urls == [
+            "https://api.github.com/repos/owner/repo/pulls?state=open&per_page=100",
+            "https://api.github.com/repos/owner/repo/pulls/123",
+        ]
+
+    @patch("src.auto_coder.util.gh_cache.get_ghapi_client")
+    def test_get_open_issues_json_rest(self, mock_get_ghapi_client, mock_github_token):
+        """Test get_open_issues_json uses REST API correctly."""
+        # Setup
+        mock_api = MagicMock()
+        mock_get_ghapi_client.return_value = mock_api
+
+        # Mock List Issues - plain dicts
+        issue_obj = {
+            "number": 456,
+            "title": "Test Issue",
+            "body": "Issue Body",
+            "state": "open",
+            "labels": [{"name": "bug"}],
+            "assignees": [{"login": "dev"}],
+            "created_at": "2024-01-01",
+            "updated_at": "2024-01-02",
+            "html_url": "http://issue-url",
+            "user": {"login": "user"},
+            "comments": 3,
+            "parent_issue_url": "https://github.com/owner/repo/issues/999",
+            # No 'pull_request' key
+        }
+
+        pr_obj = {"number": 789, "pull_request": {}, "title": "PR in disguise"}  # It's a PR
+
+        mock_api.issues.list_for_repo.return_value = [issue_obj, pr_obj]
+
+        client = GitHubClient.get_instance(mock_github_token)
+        # Clear cache first to force fetch
+        client._open_issues_cache = None
+
+        # Mock the helper methods that are called for each issue
+        with patch.object(client, "get_connected_prs", return_value=[1, 2]) as mock_linked, patch.object(client, "get_open_sub_issues", return_value=[10, 11]) as mock_sub:
+            # Execute
+            result = client.get_open_issues_json("owner/repo")
+
+            # Assert
+            assert len(result) == 1
+            issue = result[0]
+            assert issue["number"] == 456
+            assert issue["linked_prs"] == [1, 2]
+            assert issue["has_linked_prs"] is True
+            assert issue["open_sub_issue_numbers"] == [10, 11]
+            assert issue["has_open_sub_issues"] is True
+            assert issue["parent_issue_number"] == 999
+
+            mock_api.issues.list_for_repo.assert_called_once_with("owner", "repo", state="open", per_page=100, page=1)
+            mock_linked.assert_called_once_with("owner/repo", 456)
+            mock_sub.assert_called_once_with("owner/repo", 456)
+
+    @patch("src.auto_coder.util.gh_cache.get_ghapi_client")
+    def test_get_open_issues_json_filters_urgent_at_rest_origin(self, mock_get_ghapi_client, mock_github_token):
+        """A narrow discovery request must reach GitHub's supported label filter."""
+        mock_api = MagicMock()
+        mock_get_ghapi_client.return_value = mock_api
+        mock_api.issues.list_for_repo.return_value = [
+            {
+                "number": 1680,
+                "title": "Emergency repair",
+                "body": "",
+                "state": "open",
+                "labels": [{"name": "urgent"}],
+                "assignees": [],
+                "created_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-01T00:00:00Z",
+                "html_url": "https://github.com/owner/repo/issues/1680",
+                "user": {"login": "maintainer", "id": 7},
+                "comments": 0,
+                "sub_issues_summary": {"total": 0},
+            }
+        ]
+        client = GitHubClient.get_instance(mock_github_token)
+        client._open_issues_cache = None
+
+        with patch.object(client, "get_connected_prs", return_value=[]):
+            result = client.get_open_issues_json("owner/repo", labels=["urgent"])
+
+        mock_api.issues.list_for_repo.assert_called_once_with("owner", "repo", state="open", per_page=100, labels="urgent", page=1)
+        assert [(issue["number"], issue["labels"]) for issue in result] == [(1680, ["urgent"])]
+        assert client._open_issues_cache is None
+
+    @patch("src.auto_coder.util.gh_cache.get_ghapi_client")
+    @pytest.mark.parametrize("labels", [[], ["urgent"]], ids=["ordinary", "urgent"])
+    def test_candidate_collection_and_admission_cross_pr_filled_rest_page(
+        self,
+        mock_get_ghapi_client,
+        mock_github_token,
+        labels,
+        tmp_path,
+    ):
+        """PR-only REST pages cannot hide Issues from discovery or admission."""
+        mock_api = MagicMock()
+        mock_get_ghapi_client.return_value = mock_api
+
+        issue = {
+            "number": 1742,
+            "title": "Eligible Issue",
+            "body": "## Requirements\n- REQ-001: Preserve discovery.",
+            "state": "open",
+            "labels": [{"name": label} for label in labels],
+            "assignees": [],
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z",
+            "html_url": "https://github.com/owner/repo/issues/1742",
+            "user": {"login": "maintainer", "id": 7},
+            "comments": 0,
+            "sub_issues_summary": {"total": 0},
+        }
+        pr_only_page = [{"number": number, "title": f"PR {number}", "pull_request": {}} for number in range(1, 101)]
+        mock_api.issues.list_for_repo.side_effect = [pr_only_page, [issue]]
+        client = GitHubClient.get_instance(mock_github_token)
+        client._open_issues_cache = None
+
+        github = MagicMock()
+        github.get_open_prs_json.return_value = [
+            {
+                "number": 200,
+                "title": "Ready PR",
+                "body": "",
+                "head": {"ref": "ready-pr"},
+                "labels": [],
+                "mergeable": True,
+                "created_at": "2024-01-01T00:00:00Z",
+            }
+        ]
+        github.get_open_issues_json.side_effect = client.get_open_issues_json
+        engine = AutomationEngine(github, config=AutomationConfig(env_override=False))
+        engine._specification_validators["owner/repo"] = SpecificationValidationLifecycle(
+            "owner/repo",
+            "test-validator",
+            tmp_path / "specification-validations.json",
+            lambda _manifest, _body: SpecificationAnalysisResult("READY"),
+        )
+        slots = ImplementationSlotRepository("owner/repo", 1, tmp_path / "slots.json")
+        if labels == ["urgent"]:
+            assert slots.start_execution(ImplementationOwner("issue", 99)) is not None
+        engine.implementation_slots = slots
+        engine._process_single_candidate_reserved = Mock(
+            return_value=CandidateProcessingResult(
+                type="issue",
+                number=1742,
+                title="Eligible Issue",
+                success=True,
+            )
+        )
+        github.get_issue_dispatch_snapshot_strict.return_value = {
+            **issue,
+            "labels": [{"name": "implementation-ready"}, *issue["labels"]],
+        }
+
+        with (
+            patch.object(client, "get_connected_prs", return_value=[]),
+            patch(
+                "src.auto_coder.util.github_action._check_github_actions_status",
+                return_value=GitHubActionsStatusResult(success=True, ids=[]),
+            ),
+            patch("src.auto_coder.issue_context.extract_linked_issues_from_pr_body", return_value=[]),
+        ):
+            candidates = engine._get_candidates("owner/repo")
+
+        issue_candidate = next(candidate for candidate in candidates if candidate.type == "issue")
+        assert issue_candidate.data["number"] == 1742
+        assert issue_candidate.priority == (3 if labels == ["urgent"] else 0)
+        github.get_open_issues_json.assert_called_once_with("owner/repo")
+        assert [call.kwargs["page"] for call in mock_api.issues.list_for_repo.call_args_list] == [1, 2]
+
+        result = engine._process_single_candidate_unified("owner/repo", issue_candidate, engine.config)
+
+        assert result.success is True
+        engine._process_single_candidate_reserved.assert_called_once()
+
+    @patch("src.auto_coder.util.gh_cache.get_ghapi_client")
+    def test_get_issue_rest(self, mock_get_ghapi_client, mock_github_token):
+        """Test get_issue uses REST API correctly."""
+        # Setup
+        mock_api = MagicMock()
+        mock_get_ghapi_client.return_value = mock_api
+
+        # Mock Issue
+        mock_issue = Mock()
+        mock_issue.number = 123
+        mock_issue.title = "Test Issue"
+        mock_issue.body = "Body"
+        mock_api.issues.get.return_value = mock_issue
+
+        client = GitHubClient.get_instance(mock_github_token)
+
+        # Execute
+        result = client.get_issue("owner/repo", 123)
+
+        # Assert
+        assert result.number == 123
+        assert result.title == "Test Issue"
+        mock_api.issues.get.assert_called_once_with("owner", "repo", 123)
+
+    @patch("src.auto_coder.util.gh_cache.get_ghapi_client")
+    def test_get_parent_issue_details_rest(self, mock_get_ghapi_client, mock_github_token):
+        """Test get_parent_issue_details uses REST API correctly."""
+        # Setup
+        mock_api = MagicMock()
+        mock_get_ghapi_client.return_value = mock_api
+
+        # Mock Parent Issue Response
+        mock_parent_response = {"number": 123, "title": "Parent Issue", "body": "Parent Body"}
+        mock_api.return_value = mock_parent_response
+
+        client = GitHubClient.get_instance(mock_github_token)
+
+        # Execute
+        result = client.get_parent_issue_details("owner/repo", 456)
+
+        # Assert
+        assert result is not None
+        assert result["number"] == 123
+        assert result["title"] == "Parent Issue"
+
+        # Verify call
+        mock_api.assert_called_with("/repos/owner/repo/issues/456/parent", verb="GET", headers={"X-GitHub-Api-Version": "2022-11-28", "Accept": "application/vnd.github+json"})

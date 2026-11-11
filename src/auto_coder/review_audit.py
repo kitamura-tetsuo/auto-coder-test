@@ -1,0 +1,1009 @@
+"""Durable, non-authorizing review audit model and local read interface."""
+
+from __future__ import annotations
+
+import copy
+import dataclasses
+import json
+import logging
+import os
+import re
+import sqlite3
+import threading
+from datetime import datetime, timezone
+from enum import Enum
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+
+from loguru import logger
+
+SCHEMA_VERSION = 1
+_REDACTION_REPLACEMENT = "[REDACTED]"
+
+# Mandatory token patterns (REQ-008)
+_TOKEN_PATTERNS = [
+    re.compile(r"gh[pousr]_[a-zA-Z0-9]+"),
+    re.compile(r"github_pat_[a-zA-Z0-9_]+"),
+    re.compile(r"AIza[0-9A-Za-z-_]{35}"),
+    re.compile(r"sk-[a-zA-Z0-9]{48}"),
+    re.compile(r"sk-proj-[a-zA-Z0-9_-]+"),
+    re.compile(r"sk-ant-api\d{2}-[\w-]{20,}"),
+    re.compile(r"(AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}"),
+    re.compile(r"xox[baprs]-([0-9a-zA-Z]{10,48})?"),
+    re.compile(r"glpat-[0-9a-zA-Z\-_]{20}"),
+]
+
+_SENSITIVE_KEYS = {
+    "authorization",
+    "proxy_authorization",
+    "token",
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "api_key",
+    "apikey",
+    "x_api_key",
+}
+
+
+class StorageHealth(str, Enum):
+    AVAILABLE = "AVAILABLE"
+    UNINITIALIZED = "UNINITIALIZED"
+    UNAVAILABLE = "UNAVAILABLE"
+
+
+@dataclasses.dataclass
+class AuditReadResult:
+    health: StorageHealth
+    records: List[ReviewAuditRecord]
+    truncated: bool = False
+
+
+@dataclasses.dataclass
+class AuditSingleReadResult:
+    health: StorageHealth
+    record: Optional[ReviewAuditRecord]
+
+
+class EvaluationLifecycle(str, Enum):
+    QUEUED = "QUEUED"
+    RUNNING = "RUNNING"
+    FINISHED = "FINISHED"
+    CANCELLED = "CANCELLED"
+
+
+class ExecutionMode(str, Enum):
+    UNKNOWN = "UNKNOWN"
+    EXECUTED = "EXECUTED"
+    REUSED = "REUSED"
+    LOCAL_ONLY = "LOCAL_ONLY"
+    BYPASSED = "BYPASSED"
+
+
+@dataclasses.dataclass
+class ReviewEffectRecord:
+    review_id: str
+    effect_id: str
+    observation_time: str
+    disposition: str  # pending, confirmed, failed, superseded, unknown
+    details: Optional[Dict[str, Any]] = None
+
+
+class ValidationEvidenceReadStatus(str, Enum):
+    """Distinguishable outcomes of an exact attempt-evidence lookup."""
+
+    AVAILABLE = "AVAILABLE"
+    NOT_FOUND = "NOT_FOUND"
+    PRE_FEATURE = "PRE_FEATURE"  # the audit predates this extension (no table, or only a legacy evaluation exists)
+    UNSUPPORTED_SCHEMA = "UNSUPPORTED_SCHEMA"
+    CORRUPT = "CORRUPT"
+    UNINITIALIZED = "UNINITIALIZED"
+    UNAVAILABLE = "UNAVAILABLE"
+
+
+@dataclasses.dataclass
+class ValidationEvidenceRow:
+    """One attempt-bound diagnostic row; ``payload`` is the bounded, redacted JSON object."""
+
+    review_id: str
+    repository: str
+    pr_number: str
+    attempt_id: str
+    attempt_sequence: int
+    role: str  # "producer" or "reuse"
+    schema_version: int
+    completeness: str  # "partial" or "complete"
+    updated_at: str
+    payload: Dict[str, Any] = dataclasses.field(default_factory=dict)
+
+
+@dataclasses.dataclass
+class LegacyAttemptRecord:
+    """Known metadata of a pre-feature evaluation that retained the selected native attempt."""
+
+    review_id: str
+    attempt_id: Optional[str]
+    attempt_sequence: Optional[int]
+    reviewed_generation: Optional[str]
+    creation_time: Optional[str]
+
+
+@dataclasses.dataclass
+class ValidationEvidenceReadResult:
+    status: ValidationEvidenceReadStatus
+    legacy: Optional[LegacyAttemptRecord] = None
+    producer: Optional[ValidationEvidenceRow] = None
+    reuse_observations: List[ValidationEvidenceRow] = dataclasses.field(default_factory=list)
+    effects: List[ReviewEffectRecord] = dataclasses.field(default_factory=list)
+
+
+VALIDATION_EVIDENCE_SCHEMA_VERSION = 1
+
+
+@dataclasses.dataclass
+class ReviewInteractionRecord:
+    interaction_id: str
+    review_id: str
+    start_time: str
+    end_time: Optional[str]
+    duration_ms: Optional[int]
+    backend_alias: Optional[str]
+    backend_type: Optional[str]
+    provider_alias: Optional[str]
+    requested_model: Optional[str]
+    reported_model: Optional[str]
+    invocation_mode: Optional[str]
+    session_identity: Optional[str]
+    completion_status: str  # RETURNED, RAISED, unrecorded
+
+
+@dataclasses.dataclass
+class ReviewAuditRecord:
+    review_id: str
+    repository: str
+    target_type: str
+    target_number: str
+    review_kind: str  # issue_specification, issue_decomposition, pr_adversarial
+    origin: str
+    process_identity: str
+    creation_time: str
+    creation_sequence: int
+    reviewed_generation: str
+    policy_identity: str
+    related_issue_membership: Optional[str]
+    diagnostic_execution_references: Optional[List[str]]
+    lifecycle: EvaluationLifecycle
+    execution_mode: ExecutionMode
+    native_verdict: Optional[str]
+    native_report: Optional[Dict[str, Any]]
+    source_review_id: Optional[str]  # For REUSED
+    interactions: List[ReviewInteractionRecord] = dataclasses.field(default_factory=list)
+    effects: List[ReviewEffectRecord] = dataclasses.field(default_factory=list)
+
+
+def _normalize_key(key: str) -> str:
+    return key.lower().replace("-", "_")
+
+
+def _membership_numbers(value: Any) -> List[str]:
+    """Extract explicitly captured Issue numbers from legacy membership JSON."""
+    found: List[str] = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key in {"issue_number", "number"} and isinstance(child, (str, int)):
+                found.append(str(child))
+            else:
+                found.extend(_membership_numbers(child))
+    elif isinstance(value, list):
+        for child in value:
+            found.extend(_membership_numbers(child))
+    return found
+
+
+def redact_sensitive_data(data: Any, credentials: Optional[Sequence[str]] = None) -> Any:
+    """Redact sensitive credentials and known token patterns."""
+    creds_list = [c for c in (credentials or []) if c]
+
+    if isinstance(data, str):
+        # 1. Exact string matches of supplied credentials
+        for cred in creds_list:
+            data = data.replace(cred, _REDACTION_REPLACEMENT)
+
+        # 2. Leftmost non-overlapping regex matches for token patterns
+        for pattern in _TOKEN_PATTERNS:
+            data = pattern.sub(_REDACTION_REPLACEMENT, data)
+        return data
+    elif isinstance(data, dict):
+        result = {}
+        for k, v in data.items():
+            if _normalize_key(str(k)) in _SENSITIVE_KEYS:
+                result[k] = _REDACTION_REPLACEMENT
+            else:
+                result[k] = redact_sensitive_data(v, creds_list)
+        return result
+    elif isinstance(data, list):
+        return [redact_sensitive_data(item, creds_list) for item in data]
+    else:
+        return data
+
+
+class ReviewAuditStore:
+    def __init__(self, audit_root: Optional[Union[str, Path]] = None):
+        self._audit_root = self._resolve_root(audit_root)
+        self._local_lock = threading.Lock()
+
+    @staticmethod
+    def _resolve_root(supplied: Optional[Union[str, Path]]) -> Path:
+        if supplied:
+            p = Path(supplied)
+            if str(p).strip():
+                return p.resolve()
+
+        env_root = os.environ.get("AUTO_CODER_REVIEW_AUDIT_ROOT", "").strip()
+        if env_root:
+            return Path(env_root).resolve()
+
+        return Path.home() / ".auto-coder" / "review_audit"
+
+    def _get_db_path(self, repository: str) -> Path:
+        import hashlib
+
+        # Hash to prevent collision and path traversal
+        hash_digest = hashlib.sha256(repository.encode("utf-8")).hexdigest()
+        repo_dir = self._audit_root / hash_digest
+        return repo_dir / "audit.db"
+
+    def _connect_readonly(self, repository: str) -> Tuple[Optional[sqlite3.Connection], StorageHealth]:
+        db_path = self._get_db_path(repository)
+        if not db_path.exists():
+            return None, StorageHealth.UNINITIALIZED
+
+        try:
+            # open read-only URI
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
+            conn.row_factory = sqlite3.Row
+            return conn, StorageHealth.AVAILABLE
+        except sqlite3.Error as e:
+            logger.error(f"Audit read failed for {repository}: {e}")
+            return None, StorageHealth.UNAVAILABLE
+        except Exception as e:
+            logger.error(f"Audit read error for {repository}: {e}")
+            return None, StorageHealth.UNAVAILABLE
+
+    def _ensure_db(self, repository: str) -> Optional[sqlite3.Connection]:
+        """Ensures the directory and database exist, returning a connection or None on failure."""
+        db_path = self._get_db_path(repository)
+        try:
+            db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+            # Use os.open to securely create the file if it doesn't exist
+            if not db_path.exists():
+                fd = os.open(str(db_path), os.O_CREAT | os.O_WRONLY, 0o600)
+                os.close(fd)
+
+            conn = sqlite3.connect(str(db_path), timeout=5.0)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+
+            with conn:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS evaluation (
+                        review_id TEXT PRIMARY KEY,
+                        repository TEXT,
+                        target_type TEXT,
+                        target_number TEXT,
+                        review_kind TEXT,
+                        origin TEXT,
+                        process_identity TEXT,
+                        creation_time TEXT,
+                        creation_sequence INTEGER,
+                        reviewed_generation TEXT,
+                        policy_identity TEXT,
+                        related_issue_membership TEXT,
+                        diagnostic_execution_references TEXT, -- JSON list
+                        lifecycle TEXT,
+                        execution_mode TEXT,
+                        native_verdict TEXT,
+                        native_report TEXT, -- JSON object
+                        source_review_id TEXT
+                    )
+                """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS interaction (
+                        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                        interaction_id TEXT UNIQUE,
+                        review_id TEXT,
+                        start_time TEXT,
+                        end_time TEXT,
+                        duration_ms INTEGER,
+                        backend_alias TEXT,
+                        backend_type TEXT,
+                        provider_alias TEXT,
+                        requested_model TEXT,
+                        reported_model TEXT,
+                        invocation_mode TEXT,
+                        session_identity TEXT,
+                        completion_status TEXT
+                    )
+                """)
+                # Fix: drop autoincrement primary key and use composite or separate id
+                # actually sqlite does not allow multiple primary keys if one is autoincrement
+                # wait, let me fix this in a separate command.
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS effect (
+                        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                        effect_id TEXT UNIQUE,
+                        review_id TEXT,
+                        observation_time TEXT,
+                        disposition TEXT,
+                        details TEXT -- JSON object
+                    )
+                """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS validation_evidence (
+                        review_id TEXT PRIMARY KEY,
+                        repository TEXT,
+                        pr_number TEXT,
+                        attempt_id TEXT,
+                        attempt_sequence INTEGER,
+                        role TEXT,
+                        schema_version INTEGER,
+                        completeness TEXT,
+                        updated_at TEXT,
+                        payload TEXT -- JSON object
+                    )
+                """)
+                conn.execute("CREATE INDEX IF NOT EXISTS validation_evidence_attempt_id ON validation_evidence (pr_number, attempt_id)")
+                conn.execute("CREATE INDEX IF NOT EXISTS validation_evidence_attempt_sequence ON validation_evidence (pr_number, attempt_sequence)")
+            return conn
+        except Exception as e:
+            logger.error(f"Failed to ensure audit db for {repository}: {e}")
+            try:
+                with open("audit_diagnostics.log", "a") as f:
+                    f.write(f"Failed to ensure audit db for {repository}: {e}\n")
+            except Exception:
+                pass
+            return None
+
+    def record_evaluation(self, record: ReviewAuditRecord, credentials: Optional[Sequence[str]] = None) -> bool:
+        """Records a new evaluation or returns False if recording fails/conflicts."""
+        conn = self._ensure_db(record.repository)
+        if not conn:
+            return False
+
+        redacted_report = redact_sensitive_data(record.native_report, credentials) if record.native_report else None
+        redacted_origin = redact_sensitive_data(record.origin, credentials) if record.origin else None
+        redacted_process_identity = redact_sensitive_data(record.process_identity, credentials) if record.process_identity else None
+        redacted_reviewed_generation = redact_sensitive_data(record.reviewed_generation, credentials) if record.reviewed_generation else None
+        redacted_policy_identity = redact_sensitive_data(record.policy_identity, credentials) if record.policy_identity else None
+        redacted_related_issue_membership = redact_sensitive_data(record.related_issue_membership, credentials) if record.related_issue_membership else None
+        redacted_diagnostic = redact_sensitive_data(record.diagnostic_execution_references, credentials) if record.diagnostic_execution_references else None
+        redacted_native_verdict = redact_sensitive_data(record.native_verdict, credentials) if record.native_verdict else None
+
+        try:
+            with conn:
+                try:
+                    conn.execute(
+                        """
+                        INSERT INTO evaluation (
+                            review_id, repository, target_type, target_number, review_kind, origin,
+                            process_identity, creation_time, creation_sequence, reviewed_generation,
+                            policy_identity, related_issue_membership, diagnostic_execution_references,
+                            lifecycle, execution_mode, native_verdict, native_report, source_review_id
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                        (
+                            record.review_id,
+                            record.repository,
+                            record.target_type,
+                            record.target_number,
+                            record.review_kind,
+                            redacted_origin,
+                            redacted_process_identity,
+                            record.creation_time,
+                            record.creation_sequence,
+                            redacted_reviewed_generation,
+                            redacted_policy_identity,
+                            redacted_related_issue_membership,
+                            json.dumps(redacted_diagnostic) if redacted_diagnostic else None,
+                            record.lifecycle.value,
+                            record.execution_mode.value,
+                            redacted_native_verdict,
+                            json.dumps(redacted_report) if redacted_report is not None else None,
+                            record.source_review_id,
+                        ),
+                    )
+                    return True
+                except sqlite3.IntegrityError:
+                    # Idempotent check
+                    cursor = conn.execute("SELECT * FROM evaluation WHERE review_id = ?", (record.review_id,))
+                    existing = cursor.fetchone()
+                    if existing:
+                        # Check for conflict: cannot overwrite a different generation or reopen a terminal result
+                        if existing["reviewed_generation"] != record.reviewed_generation:
+                            logger.error(f"Audit conflict: review_id {record.review_id} has generation {existing['reviewed_generation']}, got {record.reviewed_generation}")
+                            return False
+
+                        # Terminal states: FINISHED, CANCELLED
+                        # If existing is terminal and new is not, conflict
+                        if existing["lifecycle"] in (EvaluationLifecycle.FINISHED.value, EvaluationLifecycle.CANCELLED.value):
+                            if record.lifecycle.value != existing["lifecycle"]:
+                                return False
+                            if record.execution_mode.value != existing["execution_mode"] and record.execution_mode != ExecutionMode.UNKNOWN:
+                                return False
+                            if record.native_verdict and record.native_verdict != existing["native_verdict"]:
+                                return False
+                            return True
+
+                        # Update fields
+                        updates = []
+                        params: list[Any] = []
+                        if existing["lifecycle"] != EvaluationLifecycle.FINISHED.value and record.lifecycle.value == EvaluationLifecycle.FINISHED.value:
+                            updates.append("lifecycle = ?")
+                            params.append(record.lifecycle.value)
+
+                        if record.execution_mode != ExecutionMode.UNKNOWN and existing["execution_mode"] == ExecutionMode.UNKNOWN.value:
+                            updates.append("execution_mode = ?")
+                            params.append(record.execution_mode.value)
+
+                        # Non-terminal conflict checks: if supplied value exists but differs from existing populated value, conflict!
+                        if redacted_native_verdict and existing["native_verdict"] and existing["native_verdict"] != redacted_native_verdict:
+                            return False
+
+                        if redacted_report:
+                            existing_report = json.loads(existing["native_report"]) if existing["native_report"] else None
+                            if existing_report is not None and existing_report != redacted_report:
+                                return False
+
+                        if record.execution_mode != ExecutionMode.UNKNOWN and existing["execution_mode"] != ExecutionMode.UNKNOWN.value:
+                            if existing["execution_mode"] != record.execution_mode.value:
+                                return False
+
+                        if redacted_native_verdict and not existing["native_verdict"]:
+                            updates.append("native_verdict = ?")
+                            params.append(redacted_native_verdict)
+
+                        if redacted_report and not existing["native_report"]:
+                            updates.append("native_report = ?")
+                            params.append(json.dumps(redacted_report))
+
+                        if updates:
+                            params.append(record.review_id)
+                            conn.execute(f"UPDATE evaluation SET {', '.join(updates)} WHERE review_id = ?", params)
+                        return True
+                    return False
+        except Exception as e:
+            logger.error(f"Failed to record evaluation {record.review_id}: {e}")
+            try:
+                with open("audit_diagnostics.log", "a") as f:
+                    f.write(f"Failed to record evaluation {record.review_id}: {e}\n")
+            except Exception:
+                pass
+            return False
+
+    def update_evaluation(
+        self, review_id: str, repository: str, lifecycle: EvaluationLifecycle, execution_mode: ExecutionMode, native_verdict: Optional[str] = None, native_report: Optional[Dict[str, Any]] = None, source_review_id: Optional[str] = None, credentials: Optional[Sequence[str]] = None
+    ) -> bool:
+        """Updates an existing evaluation."""
+        conn = self._ensure_db(repository)
+        if not conn:
+            return False
+
+        redacted_report = redact_sensitive_data(native_report, credentials) if native_report else None
+        redacted_native_verdict = redact_sensitive_data(native_verdict, credentials) if native_verdict else None
+
+        try:
+            with conn:
+                cursor = conn.execute("SELECT * FROM evaluation WHERE review_id = ?", (review_id,))
+                existing = cursor.fetchone()
+                if not existing:
+                    logger.error(f"Audit update failed: review_id {review_id} not found")
+                    return False
+
+                # Terminal state check
+                if existing["lifecycle"] in (EvaluationLifecycle.FINISHED.value, EvaluationLifecycle.CANCELLED.value):
+                    if lifecycle.value != existing["lifecycle"]:
+                        return False
+                    if execution_mode.value != existing["execution_mode"] and execution_mode != ExecutionMode.UNKNOWN:
+                        return False
+                    if native_verdict and native_verdict != existing["native_verdict"]:
+                        return False
+                    return True
+
+                updates = ["lifecycle = ?", "execution_mode = ?"]
+                params: list[Any] = [lifecycle.value, execution_mode.value]
+
+                if redacted_native_verdict:
+                    updates.append("native_verdict = ?")
+                    params.append(redacted_native_verdict)
+                if redacted_report:
+                    updates.append("native_report = ?")
+                    params.append(json.dumps(redacted_report))
+                if source_review_id:
+                    updates.append("source_review_id = ?")
+                    params.append(source_review_id)
+
+                params.append(review_id)
+                conn.execute(f"UPDATE evaluation SET {', '.join(updates)} WHERE review_id = ?", params)
+                return True
+        except Exception as e:
+            logger.error(f"Failed to update evaluation {review_id}: {e}")
+            return False
+
+    def find_finished_evaluation(
+        self,
+        repository: str,
+        target_type: str,
+        target_number: str,
+        review_kind: str,
+        reviewed_generation: str,
+        execution_modes: Sequence[ExecutionMode],
+    ) -> Optional[ReviewAuditRecord]:
+        """Return the newest exact producer without a history-window scan."""
+        conn, _health = self._connect_readonly(repository)
+        if not conn:
+            return None
+        placeholders = ", ".join("?" for _ in execution_modes)
+        params: list[Any] = [
+            target_type,
+            target_number,
+            review_kind,
+            reviewed_generation,
+            EvaluationLifecycle.FINISHED.value,
+            *(mode.value for mode in execution_modes),
+        ]
+        try:
+            row = conn.execute(
+                f"""SELECT * FROM evaluation
+                    WHERE target_type = ? AND target_number = ? AND review_kind = ?
+                      AND reviewed_generation = ? AND lifecycle = ?
+                      AND execution_mode IN ({placeholders})
+                    ORDER BY creation_sequence DESC LIMIT 1""",
+                params,
+            ).fetchone()
+            return self._row_to_evaluation(row) if row is not None else None
+        except Exception as exc:
+            logger.error(f"Failed to find exact audit producer: {exc}")
+            return None
+        finally:
+            conn.close()
+
+    def record_interaction(self, repository: str, interaction: ReviewInteractionRecord, credentials: Optional[Sequence[str]] = None) -> bool:
+        conn = self._ensure_db(repository)
+        if not conn:
+            return False
+
+        try:
+            with conn:
+                try:
+                    conn.execute(
+                        """
+                        INSERT INTO interaction (
+                            interaction_id, review_id, start_time, end_time, duration_ms,
+                            backend_alias, backend_type, provider_alias, requested_model,
+                            reported_model, invocation_mode, session_identity, completion_status
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                        (
+                            interaction.interaction_id,
+                            interaction.review_id,
+                            interaction.start_time,
+                            interaction.end_time,
+                            interaction.duration_ms,
+                            redact_sensitive_data(interaction.backend_alias, credentials) if interaction.backend_alias else None,
+                            redact_sensitive_data(interaction.backend_type, credentials) if interaction.backend_type else None,
+                            redact_sensitive_data(interaction.provider_alias, credentials) if interaction.provider_alias else None,
+                            redact_sensitive_data(interaction.requested_model, credentials) if interaction.requested_model else None,
+                            redact_sensitive_data(interaction.reported_model, credentials) if interaction.reported_model else None,
+                            redact_sensitive_data(interaction.invocation_mode, credentials) if interaction.invocation_mode else None,
+                            redact_sensitive_data(interaction.session_identity, credentials) if interaction.session_identity else None,
+                            interaction.completion_status,
+                        ),
+                    )
+                    return True
+                except sqlite3.IntegrityError:
+                    # check if end_time / status can be updated
+                    cursor = conn.execute("SELECT * FROM interaction WHERE interaction_id = ?", (interaction.interaction_id,))
+                    existing = cursor.fetchone()
+                    if existing:
+                        updates = []
+                        params: list[Any] = []
+                        if interaction.end_time and not existing["end_time"]:
+                            updates.append("end_time = ?")
+                            params.append(interaction.end_time)
+                        if interaction.duration_ms is not None and existing["duration_ms"] is None:
+                            updates.append("duration_ms = ?")
+                            params.append(interaction.duration_ms)
+                        if interaction.completion_status != "unrecorded" and existing["completion_status"] == "unrecorded":
+                            updates.append("completion_status = ?")
+                            params.append(interaction.completion_status)
+
+                        if updates:
+                            params.append(interaction.interaction_id)
+                            conn.execute(f"UPDATE interaction SET {', '.join(updates)} WHERE interaction_id = ?", params)
+                        return True
+                    return False
+        except Exception as e:
+            logger.error(f"Failed to record interaction {interaction.interaction_id}: {e}")
+            return False
+
+    def record_effect(self, repository: str, effect: ReviewEffectRecord, credentials: Optional[Sequence[str]] = None) -> bool:
+        conn = self._ensure_db(repository)
+        if not conn:
+            return False
+
+        redacted_details = redact_sensitive_data(effect.details, credentials) if effect.details else None
+
+        try:
+            with conn:
+                try:
+                    conn.execute(
+                        """
+                        INSERT INTO effect (
+                            effect_id, review_id, observation_time, disposition, details
+                        ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                        (effect.effect_id, effect.review_id, effect.observation_time, effect.disposition, json.dumps(redacted_details) if redacted_details is not None else None),
+                    )
+                    return True
+                except sqlite3.IntegrityError:
+                    return True  # already recorded
+        except Exception as e:
+            logger.error(f"Failed to record effect {effect.effect_id}: {e}")
+            return False
+
+    def record_validation_evidence(self, row: ValidationEvidenceRow, credentials: Optional[Sequence[str]] = None) -> bool:
+        """Insert or replace one attempt-bound diagnostic row for ``row.review_id``.
+
+        Best-effort and non-authorizing. The payload is redacted again here so a
+        caller cannot persist a configured credential or known token family.
+        """
+        conn = self._ensure_db(row.repository)
+        if not conn:
+            return False
+        try:
+            payload = json.dumps(redact_sensitive_data(row.payload, credentials), sort_keys=True, ensure_ascii=False)
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO validation_evidence (
+                        review_id, repository, pr_number, attempt_id, attempt_sequence,
+                        role, schema_version, completeness, updated_at, payload
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(review_id) DO UPDATE SET
+                        completeness = excluded.completeness,
+                        updated_at = excluded.updated_at,
+                        payload = excluded.payload
+                    """,
+                    (row.review_id, row.repository, row.pr_number, row.attempt_id, row.attempt_sequence, row.role, row.schema_version, row.completeness, row.updated_at, payload),
+                )
+            return True
+        except Exception as e:
+            logger.error(f"Failed to record validation evidence {row.review_id}: {e}")
+            return False
+        finally:
+            conn.close()
+
+    def get_validation_evidence(
+        self,
+        repository: str,
+        pr_number: str,
+        attempt_id: Optional[str] = None,
+        attempt_sequence: Optional[int] = None,
+    ) -> ValidationEvidenceReadResult:
+        """Exact, read-only lookup by native attempt ID or sequence.
+
+        Uses the attempt indexes and never loads the repository's audit history.
+        The original producing row is returned separately from any reuse rows;
+        effects remain attributable to the review row they were recorded for.
+        """
+        if attempt_id is None and attempt_sequence is None:
+            return ValidationEvidenceReadResult(status=ValidationEvidenceReadStatus.NOT_FOUND)
+        conn, health = self._connect_readonly(repository)
+        if conn is None:
+            status = ValidationEvidenceReadStatus.UNINITIALIZED if health == StorageHealth.UNINITIALIZED else ValidationEvidenceReadStatus.UNAVAILABLE
+            return ValidationEvidenceReadResult(status=status)
+        try:
+            has_table = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'validation_evidence'").fetchone() is not None
+            if not has_table:
+                return ValidationEvidenceReadResult(status=ValidationEvidenceReadStatus.PRE_FEATURE, legacy=self._legacy_attempt_evaluation(conn, str(pr_number), attempt_id, attempt_sequence))
+            conditions = ["pr_number = ?"]
+            params: list[Any] = [str(pr_number)]
+            if attempt_id is not None:
+                conditions.append("attempt_id = ?")
+                params.append(attempt_id)
+            if attempt_sequence is not None:
+                conditions.append("attempt_sequence = ?")
+                params.append(int(attempt_sequence))
+            rows = conn.execute(f"SELECT rowid AS rid, * FROM validation_evidence WHERE {' AND '.join(conditions)} ORDER BY rid ASC LIMIT 501", params).fetchall()
+            if not rows:
+                legacy = self._legacy_attempt_evaluation(conn, str(pr_number), attempt_id, attempt_sequence)
+                if legacy is not None:
+                    return ValidationEvidenceReadResult(status=ValidationEvidenceReadStatus.PRE_FEATURE, legacy=legacy)
+                return ValidationEvidenceReadResult(status=ValidationEvidenceReadStatus.NOT_FOUND)
+            parsed: List[ValidationEvidenceRow] = []
+            for row in rows[:500]:
+                if row["schema_version"] != VALIDATION_EVIDENCE_SCHEMA_VERSION:
+                    return ValidationEvidenceReadResult(status=ValidationEvidenceReadStatus.UNSUPPORTED_SCHEMA)
+                try:
+                    payload = json.loads(row["payload"])
+                except (TypeError, ValueError):
+                    return ValidationEvidenceReadResult(status=ValidationEvidenceReadStatus.CORRUPT)
+                if not isinstance(payload, dict):
+                    return ValidationEvidenceReadResult(status=ValidationEvidenceReadStatus.CORRUPT)
+                parsed.append(
+                    ValidationEvidenceRow(
+                        review_id=row["review_id"],
+                        repository=row["repository"],
+                        pr_number=row["pr_number"],
+                        attempt_id=row["attempt_id"],
+                        attempt_sequence=row["attempt_sequence"],
+                        role=row["role"],
+                        schema_version=row["schema_version"],
+                        completeness=row["completeness"],
+                        updated_at=row["updated_at"],
+                        payload=payload,
+                    )
+                )
+            producers = [row for row in parsed if row.role == "producer"]
+            effects: List[ReviewEffectRecord] = []
+            for row in parsed:
+                effect_rows = conn.execute("SELECT * FROM effect WHERE review_id = ? ORDER BY seq ASC", (row.review_id,)).fetchall()
+                effects.extend(self._row_to_effect(effect_row) for effect_row in effect_rows)
+            return ValidationEvidenceReadResult(
+                status=ValidationEvidenceReadStatus.AVAILABLE,
+                producer=producers[0] if producers else None,
+                reuse_observations=[row for row in parsed if row.role != "producer"],
+                effects=effects,
+            )
+        except Exception as e:
+            logger.error(f"Failed to read validation evidence for PR {pr_number}: {e}")
+            return ValidationEvidenceReadResult(status=ValidationEvidenceReadStatus.UNAVAILABLE)
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _legacy_attempt_evaluation(conn: sqlite3.Connection, pr_number: str, attempt_id: Optional[str], attempt_sequence: Optional[int]) -> Optional[LegacyAttemptRecord]:
+        """The pre-feature evaluation that retained this native attempt in its report, if any."""
+        conditions = ["target_type = 'pr'", "target_number = ?"]
+        params: list[Any] = [pr_number]
+        if attempt_id is not None:
+            conditions.append("json_extract(native_report, '$.attempt_id') = ?")
+            params.append(attempt_id)
+        if attempt_sequence is not None:
+            conditions.append("json_extract(native_report, '$.attempt_sequence') = ?")
+            params.append(int(attempt_sequence))
+        try:
+            row = conn.execute(
+                "SELECT review_id, reviewed_generation, creation_time, json_extract(native_report, '$.attempt_id') AS attempt_id, " f"json_extract(native_report, '$.attempt_sequence') AS attempt_sequence FROM evaluation WHERE {' AND '.join(conditions)} ORDER BY creation_sequence ASC LIMIT 1",
+                params,
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+        if row is None:
+            return None
+        sequence = row["attempt_sequence"]
+        return LegacyAttemptRecord(
+            review_id=row["review_id"],
+            attempt_id=row["attempt_id"] if isinstance(row["attempt_id"], str) else None,
+            attempt_sequence=sequence if isinstance(sequence, int) and not isinstance(sequence, bool) else None,
+            reviewed_generation=row["reviewed_generation"] or None,
+            creation_time=row["creation_time"] or None,
+        )
+
+    def get_evaluation(self, repository: str, review_id: str) -> AuditSingleReadResult:
+        """Gets a single evaluation and its interactions/effects."""
+        conn, health = self._connect_readonly(repository)
+        if not conn:
+            return AuditSingleReadResult(health=health, record=None)
+
+        try:
+            with conn:
+                cursor = conn.execute("SELECT * FROM evaluation WHERE review_id = ?", (review_id,))
+                row = cursor.fetchone()
+                if not row:
+                    return AuditSingleReadResult(health=StorageHealth.AVAILABLE, record=None)
+
+                eval_record = self._row_to_evaluation(row)
+
+                # Fetch interactions
+                cursor = conn.execute("SELECT * FROM interaction WHERE review_id = ? ORDER BY seq ASC", (review_id,))
+                for ir in cursor.fetchall():
+                    eval_record.interactions.append(self._row_to_interaction(ir))
+
+                # Fetch effects
+                cursor = conn.execute("SELECT * FROM effect WHERE review_id = ? ORDER BY seq ASC", (review_id,))
+                for er in cursor.fetchall():
+                    eval_record.effects.append(self._row_to_effect(er))
+
+                return AuditSingleReadResult(health=StorageHealth.AVAILABLE, record=eval_record)
+        except Exception as e:
+            logger.error(f"Failed to get evaluation {review_id}: {e}")
+            return AuditSingleReadResult(health=StorageHealth.UNAVAILABLE, record=None)
+
+    def get_recent_history(
+        self,
+        repository: str,
+        limit: int = 50,
+        high_water_mark_seq: Optional[int] = None,
+        before_seq: Optional[int] = None,
+        target_type: Optional[str] = None,
+        target_number: Optional[str] = None,
+        review_kind: Optional[str] = None,
+    ) -> AuditReadResult:
+        """Get one bounded, creation-sequence snapshot page.
+
+        Filters are applied by SQLite before the limit.  In particular this is
+        not a filter over whichever fifty rows happened to be loaded by a UI.
+        """
+        if not 1 <= limit <= 200:
+            logger.error("Page size must be between 1 and 200")
+            return AuditReadResult(health=StorageHealth.UNAVAILABLE, records=[])
+
+        conn, health = self._connect_readonly(repository)
+        if not conn:
+            return AuditReadResult(health=health, records=[])
+
+        try:
+            with conn:
+                query = "SELECT * FROM evaluation"
+                params: list[Any] = []
+                conditions = []
+
+                if high_water_mark_seq is not None:
+                    conditions.append("creation_sequence <= ?")
+                    params.append(high_water_mark_seq)
+
+                if before_seq is not None:
+                    conditions.append("creation_sequence < ?")
+                    params.append(before_seq)
+
+                if target_type is not None:
+                    conditions.append("target_type = ?")
+                    params.append(target_type)
+                if target_number is not None:
+                    conditions.append("target_number = ?")
+                    params.append(target_number)
+                if review_kind is not None:
+                    conditions.append("review_kind = ?")
+                    params.append(review_kind)
+
+                if conditions:
+                    query += " WHERE " + " AND ".join(conditions)
+
+                query += " ORDER BY creation_sequence DESC LIMIT ?"
+                params.append(limit)
+
+                cursor = conn.execute(query, params)
+
+                records = []
+                for row in cursor.fetchall():
+                    rec = self._row_to_evaluation(row)
+
+                    # fetch related
+                    ic = conn.execute("SELECT * FROM interaction WHERE review_id = ? ORDER BY seq ASC", (rec.review_id,))
+                    rec.interactions = [self._row_to_interaction(r) for r in ic.fetchall()]
+
+                    ec = conn.execute("SELECT * FROM effect WHERE review_id = ? ORDER BY seq ASC", (rec.review_id,))
+                    rec.effects = [self._row_to_effect(r) for r in ec.fetchall()]
+
+                    records.append(rec)
+                return AuditReadResult(health=StorageHealth.AVAILABLE, records=records)
+        except Exception as e:
+            logger.error(f"Failed to get recent history: {e}")
+            return AuditReadResult(health=StorageHealth.UNAVAILABLE, records=[])
+
+    def get_related_evaluations(self, repository: str, target_type: str, target_number: str, review_kind: Optional[str] = None) -> AuditReadResult:
+        """Looks up decomposition or other related records."""
+        conn, health = self._connect_readonly(repository)
+        if not conn:
+            return AuditReadResult(health=health, records=[])
+
+        try:
+            with conn:
+                query = "SELECT * FROM evaluation WHERE target_type = ? AND target_number = ?"
+                params: list[Any] = [target_type, target_number]
+                if review_kind:
+                    query += " AND review_kind = ?"
+                    params.append(review_kind)
+
+                # Read one sentinel row so callers can explicitly identify a
+                # bounded target history instead of presenting it as complete.
+                query += " ORDER BY creation_sequence DESC LIMIT 501"
+                cursor = conn.execute(query, params)
+
+                rows = cursor.fetchall()
+                records = []
+                for row in rows[:500]:
+                    rec = self._row_to_evaluation(row)
+                    records.append(rec)
+                return AuditReadResult(health=StorageHealth.AVAILABLE, records=records, truncated=len(rows) > 500)
+        except Exception as e:
+            logger.error(f"Failed to get related evaluations: {e}")
+            return AuditReadResult(health=StorageHealth.UNAVAILABLE, records=[])
+
+    def get_decomposition_evaluations_for_member(self, repository: str, issue_number: str) -> AuditReadResult:
+        """Return captured parent-set reviews containing an Issue member.
+
+        Membership is evaluated from the retained review payload.  No current
+        GitHub relationship lookup is involved, so later reparenting cannot
+        rewrite history.
+        """
+        conn, health = self._connect_readonly(repository)
+        if conn is None:
+            return AuditReadResult(health=health, records=[])
+        try:
+            rows = conn.execute(
+                "SELECT * FROM evaluation WHERE review_kind = ? ORDER BY creation_sequence DESC",
+                ("issue_decomposition",),
+            ).fetchall()
+            result = AuditReadResult(
+                health=StorageHealth.AVAILABLE,
+                records=[self._row_to_evaluation(row) for row in rows],
+            )
+        except Exception as exc:
+            logger.error(f"Failed to read captured decomposition membership: {exc}")
+            return AuditReadResult(health=StorageHealth.UNAVAILABLE, records=[])
+        finally:
+            conn.close()
+
+        def contains(record: ReviewAuditRecord) -> bool:
+            report = record.native_report or {}
+            identity = report.get("identity", report)
+            members = [identity.get("parent"), *(identity.get("children") or [])]
+            for member in members:
+                if isinstance(member, dict) and str(member.get("issue_number", member.get("number", ""))) == str(issue_number):
+                    return True
+            # Early producers retained membership as a JSON string column.
+            try:
+                captured = json.loads(record.related_issue_membership or "null")
+            except (TypeError, json.JSONDecodeError):
+                captured = None
+            return str(issue_number) in {str(value) for value in _membership_numbers(captured)}
+
+        return AuditReadResult(health=result.health, records=[record for record in result.records if contains(record)])
+
+    def _row_to_evaluation(self, row: sqlite3.Row) -> ReviewAuditRecord:
+        return ReviewAuditRecord(
+            review_id=row["review_id"],
+            repository=row["repository"],
+            target_type=row["target_type"],
+            target_number=row["target_number"],
+            review_kind=row["review_kind"],
+            origin=row["origin"],
+            process_identity=row["process_identity"],
+            creation_time=row["creation_time"],
+            creation_sequence=row["creation_sequence"],
+            reviewed_generation=row["reviewed_generation"],
+            policy_identity=row["policy_identity"],
+            related_issue_membership=row["related_issue_membership"],
+            diagnostic_execution_references=json.loads(row["diagnostic_execution_references"]) if row["diagnostic_execution_references"] else None,
+            lifecycle=EvaluationLifecycle(row["lifecycle"]),
+            execution_mode=ExecutionMode(row["execution_mode"]),
+            native_verdict=row["native_verdict"],
+            native_report=json.loads(row["native_report"]) if row["native_report"] else None,
+            source_review_id=row["source_review_id"],
+            interactions=[],
+            effects=[],
+        )
+
+    def _row_to_interaction(self, row: sqlite3.Row) -> ReviewInteractionRecord:
+        return ReviewInteractionRecord(
+            interaction_id=row["interaction_id"],
+            review_id=row["review_id"],
+            start_time=row["start_time"],
+            end_time=row["end_time"],
+            duration_ms=row["duration_ms"],
+            backend_alias=row["backend_alias"],
+            backend_type=row["backend_type"],
+            provider_alias=row["provider_alias"],
+            requested_model=row["requested_model"],
+            reported_model=row["reported_model"],
+            invocation_mode=row["invocation_mode"],
+            session_identity=row["session_identity"],
+            completion_status=row["completion_status"],
+        )
+
+    def _row_to_effect(self, row: sqlite3.Row) -> ReviewEffectRecord:
+        return ReviewEffectRecord(review_id=row["review_id"], effect_id=row["effect_id"], observation_time=row["observation_time"], disposition=row["disposition"], details=json.loads(row["details"]) if row["details"] else None)

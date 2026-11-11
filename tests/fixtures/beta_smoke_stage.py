@@ -1,0 +1,87 @@
+"""Install two exact source revisions and a distinguishable same-SHA runtime."""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import uuid
+from dataclasses import asdict
+from pathlib import Path
+
+from ci_timing import installer_span, recorder
+from integration_dependency_observation import mark_cache_population, observe_uv_sync
+from loguru import logger
+
+from auto_coder.worker_versions import PrepareIntent, WorkerVersionConfig, WorkerVersionPreparer
+
+
+def main() -> None:
+    logger.remove()
+    layout = "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level} | {file}:{function}:{line} | {message}"
+    logger.add(sys.stdout, format=layout)
+    logger.add("/runtime/staging.log", rotation="10 MB", format=layout)
+    outputs = []
+    timing = recorder()
+    for index, (revision, root) in enumerate(((sys.argv[1], "worker-versions"), (sys.argv[2], "worker-versions"), (sys.argv[1], "alternate-versions"))):
+        preparer = WorkerVersionPreparer(WorkerVersionConfig(source_repository=Path("/source"), version_root=Path("/runtime") / root, python_executable=Path(sys.executable), uv_executable=Path("/usr/local/bin/uv"), uv_version="0.7.22"))
+        role = ("source-a", "source-b", "source-a-alternate")[index]
+        execution_id = str(uuid.uuid4())
+        install = preparer._install
+
+        def timed_install(checkout: Path, environment: Path) -> None:
+            with installer_span(timing, checkout, "worker.installer", target_role=role, target_source_sha=revision, uv_version="0.7.22", execution_id=execution_id):
+                install(checkout, environment)
+
+        preparer._install = timed_install  # type: ignore[method-assign]
+        observation_root = Path(os.environ.get("AUTO_CODER_CI_TIMING_DIR", "/runtime"))
+        observation = observation_root / f"dependency-work-{role}-smoke-{index}.jsonl"
+        with observe_uv_sync(
+            preparer.config.uv_executable,
+            observation,
+            target_role=role,
+            target_source_sha=revision,
+            attempt_id=f"smoke-{index}",
+            execution_id=execution_id,
+            python_executable=preparer.config.python_executable,
+            uv_version=preparer.config.uv_version,
+        ):
+            with timing.span(
+                "worker.prepare",
+                target_role=role,
+                target_source_sha=revision,
+                uv_version="0.7.22",
+                cache_condition=os.environ.get("AUTO_CODER_DEPENDENCY_CACHE_CONDITION", "uncached"),
+                execution_id=execution_id,
+            ):
+                prepared = preparer.prepare(PrepareIntent(source_sha=revision, attempt_id=f"smoke-{index}"))
+        mark_cache_population(
+            prepared.receipt.source_sha,
+            prepared.receipt.lock_sha256,
+            target_role=role,
+            attempt_id=f"smoke-{index}",
+        )
+        receipt = prepared.receipt
+        ready = Path(receipt.environment_path).parent / "READY.json"
+        assert preparer.read_ready(ready) == receipt
+        # Inspect the installed distribution in its own interpreter. Neither
+        # the source checkout nor a PYTHONPATH overlay is the worker package.
+        program = (
+            "import importlib.metadata,json,pathlib,sys,auto_coder; "
+            "d=importlib.metadata.distribution('auto-coder'); "
+            "u=json.loads(d.read_text('direct_url.json') or '{}'); "
+            "print(json.dumps({'prefix':sys.prefix,'module':str(pathlib.Path(auto_coder.__file__).resolve()),'editable':u.get('dir_info',{}).get('editable',False)}))"
+        )
+        installed = json.loads(subprocess.run([receipt.interpreter_path, "-I", "-c", program], check=True, capture_output=True, text=True).stdout)
+        assert installed["editable"] is False
+        assert Path(installed["module"]).is_relative_to(Path(receipt.environment_path))
+        outputs.append({"receipt": asdict(receipt), "ready_path": str(ready), "installed": installed})
+    assert outputs[0]["receipt"]["source_sha"] != outputs[1]["receipt"]["source_sha"]
+    assert outputs[0]["receipt"]["installed_runtime_id"] != outputs[2]["receipt"]["installed_runtime_id"]
+    assert outputs[0]["receipt"]["content_identity"] != outputs[2]["receipt"]["content_identity"]
+    print(json.dumps(outputs, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()

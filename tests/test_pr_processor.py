@@ -1,0 +1,899 @@
+"""Tests for PR processor backend switching logic.
+
+This module contains tests to verify that backend switching occurs correctly
+during PR processing, specifically in the _fix_pr_issues_with_testing function.
+"""
+
+from unittest.mock import MagicMock, Mock, patch
+
+import pytest
+
+from src.auto_coder.automation_config import AutomationConfig
+from src.auto_coder.pr_processor import _fix_pr_issues_with_testing
+from tests.ci_observation_fakes import authoritative_ci_status
+
+# A focused runner result for the single reported failed file.
+_RUN = {"command": "bash scripts/test.sh tests/test_foo.py", "test_file": "tests/test_foo.py", "return_code": 1}
+
+
+@pytest.fixture(autouse=True)
+def reported_failed_test_file(tmp_path, monkeypatch):
+    """Focused verification only selects reported failed test files that exist."""
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_foo.py").write_text("")
+    monkeypatch.chdir(tmp_path)
+
+
+class TestPRProcessorBackendSwitching:
+    """Test cases for backend switching in PR processor."""
+
+    def setup_method(self):
+        # Mock GitHubClient.get_instance to avoid ValueError due to missing token
+        self.github_client_patcher = patch("src.auto_coder.util.gh_cache.GitHubClient")
+        self.mock_github_client = self.github_client_patcher.start()
+        mock_instance = MagicMock()
+        mock_instance.token = "fake-token"
+        self.mock_github_client.get_instance.return_value = mock_instance
+
+    def teardown_method(self):
+        self.github_client_patcher.stop()
+
+    @patch("src.auto_coder.pr_processor._apply_github_actions_fix")
+    @patch("src.auto_coder.pr_processor.run_local_tests")
+    @patch("src.auto_coder.pr_processor._apply_local_test_fix")
+    @patch("src.auto_coder.pr_processor.create_high_score_backend_manager")
+    @patch("src.auto_coder.pr_processor.git_push")
+    @patch("src.auto_coder.pr_processor.git_commit_with_retry")
+    @patch("src.auto_coder.pr_processor.cmd")
+    @patch("src.auto_coder.pr_processor.get_llm_backend_manager")
+    @patch("src.auto_coder.pr_processor.commit_and_push_changes")
+    def test_backend_switching_on_attempt_2(
+        self,
+        mock_commit,
+        mock_get_default_manager,
+        mock_cmd,
+        mock_git_commit,
+        mock_git_push,
+        mock_create_high_score_manager,
+        mock_apply_local_fix,
+        mock_run_tests,
+        mock_github_actions_fix,
+    ):
+        """Test that backend switching occurs when attempt >= 2."""
+        # Setup
+        config = AutomationConfig()
+        config.MAX_FIX_ATTEMPTS = 10  # Set a high limit to allow multiple attempts
+
+        pr_data = {
+            "number": 123,
+            "title": "Test PR",
+            "body": "Test description",
+            "head": {"ref": "test-branch"},
+            "base": {"ref": "main"},
+        }
+
+        repo_name = "test/repo"
+
+        # Mock managers
+        default_manager = Mock(name="default_manager")
+        high_score_manager = Mock(name="high_score_manager")
+        mock_get_default_manager.return_value = default_manager
+        mock_create_high_score_manager.return_value = high_score_manager
+        mock_cmd.run_command.return_value = MagicMock(success=True, stdout="")
+        mock_git_commit.return_value = MagicMock(success=True)
+        mock_git_push.return_value = MagicMock(success=True)
+
+        # Mock the test results - fail first, pass on third
+        # Use dicts with .get() method since the code uses test_result.get("success")
+        fail_result_1 = {**_RUN, "success": False, "output": "Test failed", "errors": "Error details"}
+        fail_result_2 = {**_RUN, "success": False, "output": "Test failed again", "errors": "More errors"}
+        pass_result = {**_RUN, "success": True, "output": "All tests passed", "errors": ""}
+
+        mock_run_tests.side_effect = [
+            fail_result_1,  # attempt 1
+            fail_result_2,  # attempt 2
+            pass_result,  # attempt 3
+        ]
+
+        # Mock local fix to return empty actions and no response
+        mock_apply_local_fix.return_value = ([], "")
+
+        # Mock GitHub Actions fix to return empty actions
+        mock_github_actions_fix.return_value = []
+
+        # Execute
+        actions = _fix_pr_issues_with_testing(repo_name, pr_data, config, "FAILED tests/test_foo.py")
+
+        # Assert
+        # Check calls to _apply_local_test_fix
+        assert mock_apply_local_fix.call_count == 2
+
+        # First call (attempt 1) should use default manager
+        call_args_1 = mock_apply_local_fix.call_args_list[0]
+        assert call_args_1.kwargs["backend_manager"] == default_manager
+
+        # Second call (attempt 2) should use high_score manager
+        call_args_2 = mock_apply_local_fix.call_args_list[1]
+        assert call_args_2.kwargs["backend_manager"] == high_score_manager
+
+    @patch("src.auto_coder.pr_processor._apply_github_actions_fix")
+    @patch("src.auto_coder.pr_processor.run_local_tests")
+    @patch("src.auto_coder.pr_processor._apply_local_test_fix")
+    @patch("src.auto_coder.pr_processor.create_high_score_backend_manager")
+    @patch("src.auto_coder.pr_processor.git_push")
+    @patch("src.auto_coder.pr_processor.git_commit_with_retry")
+    @patch("src.auto_coder.pr_processor.cmd")
+    @patch("src.auto_coder.pr_processor.get_llm_backend_manager")
+    @patch("src.auto_coder.pr_processor.commit_and_push_changes")
+    def test_no_backend_switching_on_attempt_1(
+        self,
+        mock_commit,
+        mock_get_default_manager,
+        mock_cmd,
+        mock_git_commit,
+        mock_git_push,
+        mock_create_high_score_manager,
+        mock_apply_local_fix,
+        mock_run_tests,
+        mock_github_actions_fix,
+    ):
+        """Test that backend switching does NOT occur for attempt 1."""
+        # Setup
+        config = AutomationConfig()
+        config.MAX_FIX_ATTEMPTS = 10
+
+        pr_data = {
+            "number": 456,
+            "title": "Test PR",
+            "body": "Test description",
+            "head": {"ref": "test-branch"},
+            "base": {"ref": "main"},
+        }
+
+        repo_name = "test/repo"
+
+        # Mock managers
+        default_manager = Mock(name="default_manager")
+        high_score_manager = Mock(name="high_score_manager")
+        mock_get_default_manager.return_value = default_manager
+        mock_create_high_score_manager.return_value = high_score_manager
+        mock_cmd.run_command.return_value = MagicMock(success=True, stdout="")
+        mock_git_commit.return_value = MagicMock(success=True)
+        mock_git_push.return_value = MagicMock(success=True)
+
+        # Mock test to pass on first attempt
+        mock_run_tests.return_value = {**_RUN, "success": True, "output": "Tests passed", "errors": ""}
+
+        # Mock local fix to return empty actions and no response
+        mock_apply_local_fix.return_value = ([], "")
+
+        # Mock GitHub Actions fix to return empty actions
+        mock_github_actions_fix.return_value = []
+
+        # Execute
+        actions = _fix_pr_issues_with_testing(repo_name, pr_data, config, "FAILED tests/test_foo.py")
+
+        # Assert
+        # Should NOT have called _apply_local_test_fix since test passed
+        mock_apply_local_fix.assert_not_called()
+
+    @patch("src.auto_coder.pr_processor._apply_github_actions_fix")
+    @patch("src.auto_coder.pr_processor.run_local_tests")
+    @patch("src.auto_coder.pr_processor._apply_local_test_fix")
+    @patch("src.auto_coder.pr_processor.create_high_score_backend_manager")
+    @patch("src.auto_coder.pr_processor.git_push")
+    @patch("src.auto_coder.pr_processor.git_commit_with_retry")
+    @patch("src.auto_coder.pr_processor.cmd")
+    @patch("src.auto_coder.pr_processor.get_llm_backend_manager")
+    @patch("src.auto_coder.pr_processor.commit_and_push_changes")
+    def test_backend_switching_on_multiple_attempts(
+        self,
+        mock_commit,
+        mock_get_default_manager,
+        mock_cmd,
+        mock_git_commit,
+        mock_git_push,
+        mock_create_high_score_manager,
+        mock_apply_local_fix,
+        mock_run_tests,
+        mock_github_actions_fix,
+    ):
+        """Test that backend switching occurs when attempt >= 2."""
+        # Setup
+        config = AutomationConfig()
+        config.MAX_FIX_ATTEMPTS = 10
+
+        pr_data = {
+            "number": 789,
+            "title": "Test PR",
+            "body": "Test description",
+            "head": {"ref": "test-branch"},
+            "base": {"ref": "main"},
+        }
+
+        repo_name = "test/repo"
+
+        # Mock managers
+        default_manager = Mock(name="default_manager")
+        high_score_manager = Mock(name="high_score_manager")
+        mock_get_default_manager.return_value = default_manager
+        mock_create_high_score_manager.return_value = high_score_manager
+        mock_cmd.run_command.return_value = MagicMock(success=True, stdout="")
+        mock_git_commit.return_value = MagicMock(success=True)
+        mock_git_push.return_value = MagicMock(success=True)
+
+        # Mock test results - fail multiple times
+        # Use dicts with .get() method since the code uses test_result.get("success")
+        fail_1 = {**_RUN, "success": False, "output": "Test failed", "errors": "Error 1"}
+        fail_2 = {**_RUN, "success": False, "output": "Test failed", "errors": "Error 2"}
+        fail_3 = {**_RUN, "success": False, "output": "Test failed", "errors": "Error 3"}
+        pass_res = {**_RUN, "success": True, "output": "Tests passed", "errors": ""}
+
+        mock_run_tests.side_effect = [
+            fail_1,  # attempt 1
+            fail_2,  # attempt 2 (switch here)
+            fail_3,  # attempt 3 (switch here too)
+            pass_res,  # attempt 4 (switch here too)
+        ]
+
+        # Mock local fix to return empty actions and no response
+        mock_apply_local_fix.return_value = ([], "")
+
+        # Mock GitHub Actions fix to return empty actions
+        mock_github_actions_fix.return_value = []
+
+        # Execute
+        actions = _fix_pr_issues_with_testing(repo_name, pr_data, config, "FAILED tests/test_foo.py")
+
+        # Assert
+        # Check calls to _apply_local_test_fix
+        assert mock_apply_local_fix.call_count == 3
+
+        # Attempt 1: default manager
+        assert mock_apply_local_fix.call_args_list[0].kwargs["backend_manager"] == default_manager
+        # Attempt 2: high_score manager
+        assert mock_apply_local_fix.call_args_list[1].kwargs["backend_manager"] == high_score_manager
+        # Attempt 3: high_score manager
+        assert mock_apply_local_fix.call_args_list[2].kwargs["backend_manager"] == high_score_manager
+
+    @patch("src.auto_coder.pr_processor._apply_github_actions_fix")
+    @patch("src.auto_coder.pr_processor.run_local_tests")
+    @patch("src.auto_coder.pr_processor._apply_local_test_fix")
+    @patch("src.auto_coder.pr_processor.create_high_score_backend_manager")
+    @patch("src.auto_coder.pr_processor.git_push")
+    @patch("src.auto_coder.pr_processor.git_commit_with_retry")
+    @patch("src.auto_coder.pr_processor.cmd")
+    @patch("src.auto_coder.pr_processor.get_llm_backend_manager")
+    @patch("src.auto_coder.pr_processor.commit_and_push_changes")
+    def test_backend_switching_with_finite_attempts_limit(
+        self,
+        mock_commit,
+        mock_get_default_manager,
+        mock_cmd,
+        mock_git_commit,
+        mock_git_push,
+        mock_create_high_score_manager,
+        mock_apply_local_fix,
+        mock_run_tests,
+        mock_github_actions_fix,
+    ):
+        """Test that backend switching works correctly with finite attempts limit."""
+        # Setup - use finite limit of 3
+        config = AutomationConfig()
+        config.MAX_FIX_ATTEMPTS = 3
+
+        pr_data = {
+            "number": 321,
+            "title": "Test PR",
+            "body": "Test description",
+            "head": {"ref": "test-branch"},
+            "base": {"ref": "main"},
+        }
+
+        repo_name = "test/repo"
+
+        # Mock managers
+        default_manager = Mock(name="default_manager")
+        high_score_manager = Mock(name="high_score_manager")
+        mock_get_default_manager.return_value = default_manager
+        mock_create_high_score_manager.return_value = high_score_manager
+        mock_cmd.run_command.return_value = MagicMock(success=True, stdout="")
+        mock_git_commit.return_value = MagicMock(success=True)
+        mock_git_push.return_value = MagicMock(success=True)
+
+        # Mock test results - always fail
+        # Use dict with .get() method since the code uses test_result.get("success")
+        mock_run_tests.return_value = {**_RUN, "success": False, "output": "Test failed", "errors": "Errors"}
+
+        # Mock local fix to return empty actions and no response
+        mock_apply_local_fix.return_value = ([], "")
+
+        # Mock GitHub Actions fix to return empty actions
+        mock_github_actions_fix.return_value = []
+
+        # Execute
+        actions = _fix_pr_issues_with_testing(repo_name, pr_data, config, "FAILED tests/test_foo.py")
+
+        # Assert
+        # Check calls to _apply_local_test_fix
+        # Should run 3 times because limit is 3 and it fails everytime
+        assert mock_apply_local_fix.call_count == 3
+
+        # Attempt 1: default manager
+        assert mock_apply_local_fix.call_args_list[0].kwargs["backend_manager"] == default_manager
+        # Attempt 2: high_score manager
+        assert mock_apply_local_fix.call_args_list[1].kwargs["backend_manager"] == high_score_manager
+        # Attempt 3: high_score manager
+        assert mock_apply_local_fix.call_args_list[2].kwargs["backend_manager"] == high_score_manager
+
+
+class TestKeepLabelOnPRMerge:
+    """Test that keep_label() is called on successful PR merge."""
+
+    def test_merge_handler_propagates_caught_internal_error_structurally(self):
+        """A caught merge exception is both diagnostic and machine-readable."""
+        from unittest.mock import Mock, patch
+
+        from src.auto_coder.automation_config import AutomationConfig, ProcessedPRResult, PRProcessingOutcome
+        from src.auto_coder.pr_processor import _handle_pr_merge
+
+        pr_data = {"number": 5266, "head": {"ref": "feature-5266"}}
+        status = ProcessedPRResult(pr_data=pr_data)
+
+        with patch(
+            "src.auto_coder.pr_processor.retry_pending_stale_review_thread_rollbacks",
+            side_effect=RuntimeError("Failed to switch to branch 'work'"),
+        ):
+            actions = _handle_pr_merge(Mock(), "owner/repo", pr_data, AutomationConfig(), {}, status)
+
+        assert status.outcome is PRProcessingOutcome.FAILED
+        assert status.error == "Failed to switch to branch 'work'"
+        assert actions == ["Error handling PR merge for PR #5266: Failed to switch to branch 'work'"]
+
+    def test_process_pr_for_merge_calls_keep_label_on_successful_merge(self):
+        """Test that _process_pr_for_merge calls keep_label when PR is successfully merged."""
+        from contextlib import contextmanager
+        from unittest.mock import Mock, patch
+
+        from src.auto_coder.automation_config import AutomationConfig
+        from src.auto_coder.pr_processor import PRActionList, _process_pr_for_merge
+
+        repo_name = "owner/repo"
+        pr_data = {"number": 123, "title": "Test PR", "body": "Test body", "head": {"ref": "feature-123"}}
+        config = AutomationConfig()
+
+        # Track if keep_label was called
+        keep_label_called = []
+
+        # Create a mock LabelManagerContext that tracks keep_label calls
+        class MockLabelManagerContext:
+            def __init__(self, should_process):
+                self._should_process = should_process
+
+            def __bool__(self):
+                return self._should_process
+
+            def keep_label(self):
+                keep_label_called.append(True)
+
+        @contextmanager
+        def fake_label_manager(*_args, **_kwargs):
+            yield MockLabelManagerContext(True)
+
+        # Mock the shared merge workflow to return a successful merge.
+        with patch("src.auto_coder.pr_processor.LabelManager", fake_label_manager):
+            with patch("src.auto_coder.pr_processor._handle_pr_merge", return_value=PRActionList(("Successfully merged PR #123",))):
+                with patch("src.auto_coder.pr_processor.GitHubClient") as mock_client_class:
+                    mock_client = Mock()
+                    mock_client_class.get_instance.return_value = mock_client
+
+                    result = _process_pr_for_merge(repo_name, pr_data, config)
+
+        # Verify keep_label was called
+        assert len(keep_label_called) == 1, "keep_label should be called once on successful PR merge"
+        assert "Successfully merged" in result.actions_taken[0]
+
+    def test_process_pr_for_merge_does_not_call_keep_label_on_failed_merge(self):
+        """Test that _process_pr_for_merge does not call keep_label when merge fails."""
+        from contextlib import contextmanager
+        from unittest.mock import Mock, patch
+
+        from src.auto_coder.automation_config import AutomationConfig
+        from src.auto_coder.pr_processor import PRActionList, _process_pr_for_merge
+
+        repo_name = "owner/repo"
+        pr_data = {"number": 456, "title": "Test PR", "body": "Test body", "head": {"ref": "feature-456"}}
+        config = AutomationConfig()
+
+        # Track if keep_label was called
+        keep_label_called = []
+
+        # Create a mock LabelManagerContext that tracks keep_label calls
+        class MockLabelManagerContext:
+            def __init__(self, should_process):
+                self._should_process = should_process
+
+            def __bool__(self):
+                return self._should_process
+
+            def keep_label(self):
+                keep_label_called.append(True)
+
+        @contextmanager
+        def fake_label_manager(*_args, **_kwargs):
+            yield MockLabelManagerContext(True)
+
+        # Mock the shared merge workflow to return a failed merge.
+        with patch("src.auto_coder.pr_processor.LabelManager", fake_label_manager):
+            with patch("src.auto_coder.pr_processor._handle_pr_merge", return_value=PRActionList(("Failed to merge PR #456",))):
+                with patch("src.auto_coder.pr_processor.GitHubClient") as mock_client_class:
+                    mock_client = Mock()
+                    mock_client_class.get_instance.return_value = mock_client
+
+                    result = _process_pr_for_merge(repo_name, pr_data, config)
+
+        # Verify keep_label was NOT called
+        assert len(keep_label_called) == 0, "keep_label should not be called when merge fails"
+        assert "Failed to merge" in result.actions_taken[0]
+
+    def test_process_pr_for_fixes_calls_keep_label_on_successful_merge(self):
+        """Test that _process_pr_for_fixes calls keep_label when PR is successfully merged."""
+        from contextlib import contextmanager
+        from unittest.mock import Mock, patch
+
+        from src.auto_coder.automation_config import AutomationConfig
+        from src.auto_coder.pr_processor import _process_pr_for_fixes
+
+        repo_name = "owner/repo"
+        pr_data = {"number": 789, "title": "Test PR", "body": "Test body", "head": {"ref": "feature-789"}}
+        config = AutomationConfig()
+        mock_github_client = Mock()
+
+        # Track if keep_label was called
+        keep_label_called = []
+
+        # Create a mock LabelManagerContext that tracks keep_label calls
+        class MockLabelManagerContext:
+            def __init__(self, should_process):
+                self._should_process = should_process
+
+            def __bool__(self):
+                return self._should_process
+
+            def keep_label(self):
+                keep_label_called.append(True)
+
+        @contextmanager
+        def fake_label_manager(*_args, **_kwargs):
+            yield MockLabelManagerContext(True)
+
+        # Mock _take_pr_actions to return actions indicating successful merge
+        with patch("src.auto_coder.pr_processor.LabelManager", fake_label_manager):
+            with patch("src.auto_coder.pr_processor.ProgressStage"):
+                with patch("src.auto_coder.pr_processor._take_pr_actions") as mock_take_actions:
+                    mock_take_actions.return_value = ["Successfully merged PR #789"]
+
+                    result = _process_pr_for_fixes(mock_github_client, repo_name, pr_data, config)
+
+        # Verify keep_label was called
+        assert len(keep_label_called) == 1, "keep_label should be called once on successful PR merge"
+        assert "Successfully merged" in result.actions_taken[0]
+
+    def test_process_pr_for_fixes_does_not_call_keep_label_on_no_merge(self):
+        """Test that _process_pr_for_fixes does not call keep_label when no merge occurs."""
+        from contextlib import contextmanager
+        from unittest.mock import Mock, patch
+
+        from src.auto_coder.automation_config import AutomationConfig
+        from src.auto_coder.pr_processor import _process_pr_for_fixes
+
+        repo_name = "owner/repo"
+        pr_data = {"number": 101, "title": "Test PR", "body": "Test body"}
+        config = AutomationConfig()
+        mock_github_client = Mock()
+
+        # Track if keep_label was called
+        keep_label_called = []
+
+        # Create a mock LabelManagerContext that tracks keep_label calls
+        class MockLabelManagerContext:
+            def __init__(self, should_process):
+                self._should_process = should_process
+
+            def __bool__(self):
+                return self._should_process
+
+            def keep_label(self):
+                keep_label_called.append(True)
+
+        @contextmanager
+        def fake_label_manager(*_args, **_kwargs):
+            yield MockLabelManagerContext(True)
+
+        # Mock _take_pr_actions to return actions WITHOUT merge
+        with patch("src.auto_coder.pr_processor.LabelManager", fake_label_manager):
+            with patch("src.auto_coder.pr_processor.ProgressStage"):
+                with patch("src.auto_coder.pr_processor._take_pr_actions") as mock_take_actions:
+                    mock_take_actions.return_value = ["GitHub Actions checks are still in progress"]
+
+                    result = _process_pr_for_fixes(mock_github_client, repo_name, pr_data, config)
+
+        # Verify keep_label was NOT called
+        assert len(keep_label_called) == 0, "keep_label should not be called when no merge occurs"
+
+
+class TestPRProcessorMerge:
+    """Test cases for PR merge functionality, including auto-approval and fallback methods.
+
+    Merging goes through the durable per-effect merge operation and typed
+    adapter (Issue #1939), so ``get_ghapi_client`` must be patched both where
+    ``pr_processor`` itself calls it and where ``merge_operation_adapter``
+    calls it (the adapter binds its own module-level reference at import
+    time), and ``MergeOperationStore`` is redirected to an isolated on-disk
+    store per test so state never leaks between tests or real usage.
+    """
+
+    def _patch_merge_operation_store(self, tmp_path):
+        from src.auto_coder.merge_operation_state import MergeOperationStore
+
+        store = MergeOperationStore(db_path=tmp_path / "merge_ops.db")
+        return patch("src.auto_coder.merge_operation_state.get_merge_operation_store", return_value=store)
+
+    @patch("auto_coder.util.gh_cache.get_ghapi_client")
+    def test_merge_pr_blocks_stale_selected_jules_authority(self, mock_get_ghapi_client, tmp_path):
+        """The final sender consumes fresh selected-pair currency, not classification alone."""
+        from src.auto_coder.automation_config import AutomationConfig
+        from src.auto_coder.jules_candidate_observation import ArtifactClassification
+        from src.auto_coder.pr_processor import _merge_pr
+        from src.auto_coder.speculative_jules_lifecycle import LifecycleDecision
+
+        client = MagicMock(token="token")
+        client.get_issue.return_value = {"state": "open", "body": "requirements-v2"}
+        api = MagicMock()
+        api.pulls.get.return_value = {
+            "number": 123,
+            "head": {"sha": "head-b"},
+            "base": {"sha": "base-a", "ref": "main"},
+        }
+        mock_get_ghapi_client.return_value = api
+        lifecycle = MagicMock()
+        lifecycle.evaluate_merge_authority.return_value = LifecycleDecision(
+            ArtifactClassification.BLOCKED,
+            False,
+            False,
+            "selected acceptance is stale or invalidated",
+        )
+
+        with (
+            self._patch_merge_operation_store(tmp_path),
+            patch("src.auto_coder.pr_processor._is_pr_review_thread_gate_enabled", return_value=False),
+            patch("src.auto_coder.pr_processor.get_speculative_jules_lifecycle", return_value=lifecycle),
+            patch("src.auto_coder.pr_processor._resolve_pr_issue_numbers", return_value=[2074]),
+        ):
+            assert _merge_pr("owner/repo", 123, {}, AutomationConfig(), github_client=client) is False
+
+        lifecycle.evaluate_merge_authority.assert_called_once_with("owner/repo", 123, api.pulls.get.return_value, {"state": "open", "body": "requirements-v2"}, (2074,))
+        api.pulls.merge.assert_not_called()
+
+    @patch("src.auto_coder.merge_operation_adapter.get_ghapi_client")
+    @patch("auto_coder.util.gh_cache.get_ghapi_client")
+    @patch("src.auto_coder.pr_processor.GitHubClient")
+    @patch("src.auto_coder.pr_processor._get_allowed_merge_methods")
+    def test_merge_pr_auto_approve_dependabot(self, mock_get_allowed_methods, mock_github_client_class, mock_get_ghapi_client, mock_get_ghapi_client_adapter, tmp_path):
+        """Test that _merge_pr auto-approves Dependabot PRs before merging."""
+        from src.auto_coder.automation_config import AutomationConfig
+        from src.auto_coder.pr_processor import _merge_pr
+
+        # Setup config
+        config = AutomationConfig()
+        config.MERGE_METHOD = "--squash"
+
+        # Mock GitHubClient
+        mock_instance = MagicMock()
+        mock_instance.token = "fake-token"
+        mock_github_client_class.get_instance.return_value = mock_instance
+
+        # Mock GhApi client, shared by pr_processor and the adapter
+        mock_api = MagicMock()
+        mock_get_ghapi_client.return_value = mock_api
+        mock_get_ghapi_client_adapter.return_value = mock_api
+
+        head_sha = "a" * 40
+
+        # Mock Dependabot PR info
+        mock_pr_info = {"number": 123, "user": {"login": "dependabot[bot]"}, "head": {"ref": "dependabot/npm_and_yarn/some-package-1.0.0", "sha": head_sha}}
+        mock_api.pulls.get.return_value = mock_pr_info
+        mock_api.pulls.list_reviews.return_value = []
+        mock_api.pulls.create_review.return_value = {"id": 1, "state": "APPROVED", "commit_id": head_sha, "user": {"login": "auto-coder-bot"}}
+
+        # Mock successful merge
+        mock_api.pulls.merge.return_value = {"merged": True, "sha": "mergedsha"}
+
+        with (
+            self._patch_merge_operation_store(tmp_path),
+            patch("src.auto_coder.pr_processor.resolve_reviewer_app_identity") as mock_reviewer_identity,
+            patch("src.auto_coder.pr_processor._close_linked_issues") as mock_close,
+            patch("src.auto_coder.pr_processor._archive_jules_session") as mock_archive,
+        ):
+            mock_reviewer_identity.return_value.login = "auto-coder-bot"
+
+            result = _merge_pr("owner/repo", 123, {}, config)
+
+            # Assertions
+            assert result is True
+            # Verify auto-approval review was created for the expected head
+            mock_api.pulls.create_review.assert_called_once_with("owner", "repo", 123, event="APPROVE", commit_id=head_sha)
+            # Verify merge was called for the expected head
+            mock_api.pulls.merge.assert_called_once_with("owner", "repo", 123, merge_method="squash", sha=head_sha)
+            mock_close.assert_called_once_with("owner/repo", 123)
+            mock_archive.assert_called_once_with("owner/repo", 123)
+
+    @patch("src.auto_coder.merge_operation_adapter.get_ghapi_client")
+    @patch("auto_coder.util.gh_cache.get_ghapi_client")
+    @patch("src.auto_coder.pr_processor.GitHubClient")
+    @patch("src.auto_coder.pr_processor._get_allowed_merge_methods")
+    def test_merge_pr_no_approve_regular_user(self, mock_get_allowed_methods, mock_github_client_class, mock_get_ghapi_client, mock_get_ghapi_client_adapter, tmp_path):
+        """Test that _merge_pr does not auto-approve PRs from regular users."""
+        from src.auto_coder.automation_config import AutomationConfig
+        from src.auto_coder.pr_processor import _merge_pr
+
+        # Setup config
+        config = AutomationConfig()
+        config.MERGE_METHOD = "--squash"
+
+        # Mock GitHubClient
+        mock_instance = MagicMock()
+        mock_instance.token = "fake-token"
+        mock_github_client_class.get_instance.return_value = mock_instance
+
+        # Mock GhApi client
+        mock_api = MagicMock()
+        mock_get_ghapi_client.return_value = mock_api
+        mock_get_ghapi_client_adapter.return_value = mock_api
+
+        head_sha = "b" * 40
+
+        # Mock regular user PR info
+        mock_pr_info = {"number": 124, "user": {"login": "some-developer"}, "head": {"ref": "feature/some-feature", "sha": head_sha}}
+        mock_api.pulls.get.return_value = mock_pr_info
+
+        # Mock successful merge
+        mock_api.pulls.merge.return_value = {"merged": True, "sha": "mergedsha"}
+
+        with self._patch_merge_operation_store(tmp_path), patch("src.auto_coder.pr_processor._close_linked_issues"), patch("src.auto_coder.pr_processor._archive_jules_session"):
+
+            result = _merge_pr("owner/repo", 124, {}, config)
+
+            # Assertions
+            assert result is True
+            # Verify auto-approval review was NOT created
+            mock_api.pulls.create_review.assert_not_called()
+            # Verify merge was called for the expected head
+            mock_api.pulls.merge.assert_called_once_with("owner", "repo", 124, merge_method="squash", sha=head_sha)
+
+    @patch("src.auto_coder.merge_operation_adapter.get_ghapi_client")
+    @patch("auto_coder.util.gh_cache.get_ghapi_client")
+    @patch("src.auto_coder.pr_processor.GitHubClient")
+    @patch("src.auto_coder.pr_processor._get_allowed_merge_methods")
+    def test_merge_pr_fallback_methods(self, mock_get_allowed_methods, mock_github_client_class, mock_get_ghapi_client, mock_get_ghapi_client_adapter, tmp_path):
+        """A definitive, cause-specified rejection may fall back to a currently allowed alternate method."""
+        from src.auto_coder.automation_config import AutomationConfig
+        from src.auto_coder.pr_processor import _merge_pr
+
+        # Setup config
+        config = AutomationConfig()
+        config.MERGE_METHOD = "--squash"
+
+        # Mock GitHubClient
+        mock_instance = MagicMock()
+        mock_instance.token = "fake-token"
+        mock_github_client_class.get_instance.return_value = mock_instance
+
+        # Mock GhApi client
+        mock_api = MagicMock()
+        mock_get_ghapi_client.return_value = mock_api
+        mock_get_ghapi_client_adapter.return_value = mock_api
+
+        head_sha = "c" * 40
+
+        # Mock PR info: squash is disallowed by current repo settings, so
+        # 405 is a definitive, cause-specified rejection that may fall back
+        # to the currently allowed --merge method (REQ-007). It remains
+        # mergeable throughout (no conflict).
+        mock_pr_info = {"number": 125, "user": {"login": "some-developer"}, "head": {"ref": "feature/some-feature", "sha": head_sha}, "mergeable": True}
+        mock_api.pulls.get.return_value = mock_pr_info
+
+        # Mock allowed merge methods: squash (the selected method) is no
+        # longer allowed; merge is.
+        mock_get_allowed_methods.return_value = ["--merge"]
+
+        from src.auto_coder.util.github_request_outcome import DeliveryCertainty, GitHubApiOutcome, GitHubRequestContext, GitHubRequestError, GitHubRequestOutcome, GitHubResponseMetadata, RequestProvenance
+
+        def make_405() -> GitHubRequestError:
+            context = GitHubRequestContext(operation_id="op", attempt_id="attempt", subsystem="test", api_origin="https://api.github.com", method="PUT", kind="mutation", endpoint_template="/pulls/{n}/merge")
+            outcome = GitHubRequestOutcome(context=context, status=405, classification=GitHubApiOutcome.REMOTE_ERROR, provenance=RequestProvenance.NETWORK, delivery=DeliveryCertainty.HTTP_RESPONSE_RECEIVED, metadata=GitHubResponseMetadata(), elapsed_ms=1.0, message="Method Not Allowed")
+            return GitHubRequestError(outcome)
+
+        def fake_merge(owner, repo, pr_number, merge_method, sha):
+            if merge_method == "squash":
+                raise make_405()
+            elif merge_method == "merge":
+                return {"merged": True, "sha": "mergedsha"}
+            return {"merged": False}
+
+        mock_api.pulls.merge.side_effect = fake_merge
+
+        with (
+            self._patch_merge_operation_store(tmp_path),
+            patch("src.auto_coder.pr_processor._close_linked_issues"),
+            patch("src.auto_coder.pr_processor._archive_jules_session"),
+        ):
+            result = _merge_pr("owner/repo", 125, {}, config)
+
+        # Assertions
+        assert result is True
+        # Verify primary method was tried
+        mock_api.pulls.merge.assert_any_call("owner", "repo", 125, merge_method="squash", sha=head_sha)
+        # Verify fallback method was tried and succeeded
+        mock_api.pulls.merge.assert_any_call("owner", "repo", 125, merge_method="merge", sha=head_sha)
+
+    @patch("src.auto_coder.merge_operation_adapter.get_ghapi_client")
+    @patch("auto_coder.util.gh_cache.get_ghapi_client")
+    @patch("src.auto_coder.pr_processor.GitHubClient")
+    @patch("src.auto_coder.pr_processor._get_allowed_merge_methods")
+    def test_merge_pr_skips_conflict_resolution_for_dependabot(self, mock_get_allowed_methods, mock_github_client_class, mock_get_ghapi_client, mock_get_ghapi_client_adapter, tmp_path):
+        """Merge conflicts of Dependabot PRs must not trigger conflict resolution."""
+        from src.auto_coder.automation_config import AutomationConfig, PRProcessingOutcome
+        from src.auto_coder.pr_processor import MergeRouteDisposition, _merge_pr
+
+        config = AutomationConfig()
+        config.MERGE_METHOD = "--squash"
+
+        mock_instance = MagicMock()
+        mock_instance.token = "fake-token"
+        mock_github_client_class.get_instance.return_value = mock_instance
+
+        mock_api = MagicMock()
+        mock_get_ghapi_client.return_value = mock_api
+        mock_get_ghapi_client_adapter.return_value = mock_api
+
+        head_sha = "d" * 40
+
+        # Dependabot PR that cannot be merged because of conflicts (409, a
+        # definitive rejection that supersedes the operation and is then
+        # observed to be a real conflict on a fresh re-check).
+        mock_api.pulls.get.return_value = {
+            "number": 126,
+            "user": {"login": "dependabot[bot]"},
+            "head": {"ref": "dependabot/pip/requests-2.32.0", "sha": head_sha},
+            "mergeable": False,
+        }
+
+        from src.auto_coder.util.github_request_outcome import DeliveryCertainty, GitHubApiOutcome, GitHubRequestContext, GitHubRequestError, GitHubRequestOutcome, GitHubResponseMetadata, RequestProvenance
+
+        context = GitHubRequestContext(operation_id="op", attempt_id="attempt", subsystem="test", api_origin="https://api.github.com", method="PUT", kind="mutation", endpoint_template="/pulls/{n}/merge")
+        outcome = GitHubRequestOutcome(context=context, status=405, classification=GitHubApiOutcome.REMOTE_ERROR, provenance=RequestProvenance.NETWORK, delivery=DeliveryCertainty.HTTP_RESPONSE_RECEIVED, metadata=GitHubResponseMetadata(), elapsed_ms=1.0, message="Method Not Allowed")
+        mock_api.pulls.merge.side_effect = GitHubRequestError(outcome)
+        mock_get_allowed_methods.return_value = []
+
+        with (
+            self._patch_merge_operation_store(tmp_path),
+            patch("src.auto_coder.pr_processor._resolve_pr_merge_conflicts") as mock_resolve,
+            patch("src.auto_coder.pr_processor._close_linked_issues"),
+            patch("src.auto_coder.pr_processor._archive_jules_session"),
+        ):
+            disposition = MergeRouteDisposition()
+            result = _merge_pr("owner/repo", 126, {}, config, route_disposition=disposition)
+
+        assert result is False
+        assert disposition.outcome is PRProcessingOutcome.FAILED
+        assert disposition.reason == "Definitive merge rejection"
+        mock_resolve.assert_not_called()
+
+
+class TestUpdateWithBaseBranchDependabot:
+    """Dependency-bot PRs must never have their merge conflicts resolved."""
+
+    @patch("src.auto_coder.pr_processor.cmd")
+    def test_update_with_base_branch_skips_dependabot_conflicts(self, mock_cmd):
+        from src.auto_coder.automation_config import AutomationConfig
+        from src.auto_coder.pr_processor import _update_with_base_branch
+        from src.auto_coder.utils import CommandResult
+
+        mock_cmd.run_command.side_effect = [
+            CommandResult(True, "", "", 0),  # git fetch origin
+            CommandResult(True, "3\n", "", 0),  # rev-list --count
+            CommandResult(False, "CONFLICT", "", 1),  # git merge
+            CommandResult(True, "", "", 0),  # git merge --abort
+        ]
+
+        pr_data = {
+            "number": 4242,
+            "base_branch": "main",
+            "title": "Bump requests from 2.31.0 to 2.32.0",
+            "body": "",
+            "author": {"login": "dependabot[bot]"},
+        }
+
+        with patch("src.auto_coder.conflict_resolver._perform_base_branch_merge_and_conflict_resolution") as mock_perform:
+            actions = _update_with_base_branch("owner/repo", pr_data, AutomationConfig())
+
+        mock_perform.assert_not_called()
+        assert any("Skipping conflict resolution" in action for action in actions)
+        assert "ACTION_FLAG:SKIP_ANALYSIS" in actions
+        assert mock_cmd.run_command.call_args_list[-1][0][0] == ["git", "merge", "--abort"]
+
+
+class TestResolvePRMergeConflictsDependabot:
+    """_resolve_pr_merge_conflicts must bail out for dependency-bot PRs."""
+
+    @patch("auto_coder.util.gh_cache.get_ghapi_client")
+    @patch("src.auto_coder.pr_processor.GitHubClient")
+    @patch("src.auto_coder.pr_processor.cmd")
+    def test_resolve_pr_merge_conflicts_skips_dependabot(self, mock_cmd, mock_github_client_class, mock_get_ghapi_client):
+        from src.auto_coder.automation_config import AutomationConfig
+        from src.auto_coder.pr_processor import _resolve_pr_merge_conflicts
+        from src.auto_coder.utils import CommandResult
+
+        mock_instance = MagicMock()
+        mock_instance.token = "fake-token"
+        mock_github_client_class.get_instance.return_value = mock_instance
+
+        mock_api = MagicMock()
+        mock_get_ghapi_client.return_value = mock_api
+        mock_api.pulls.get.return_value = {
+            "number": 4242,
+            "user": {"login": "dependabot[bot]"},
+            "base": {"ref": "main"},
+        }
+
+        mock_cmd.run_command.return_value = CommandResult(True, "", "", 0)
+
+        with patch("src.auto_coder.pr_processor._checkout_pr_branch") as mock_checkout:
+            assert _resolve_pr_merge_conflicts("owner/repo", 4242, AutomationConfig()) is False
+
+        mock_checkout.assert_not_called()
+
+
+class TestPRMergeChecksInProgress:
+    """When GitHub Actions checks are in progress, PR merge is deferred and CI watch recheck is scheduled."""
+
+    @patch("src.auto_coder.pr_processor.check_github_actions_and_exit_if_in_progress", return_value=False)
+    @patch("src.auto_coder.pr_processor._get_mergeable_state", return_value={"mergeable": True, "merge_state_status": "CLEAN"})
+    @patch("src.auto_coder.pr_processor._reject_unsafe_codex_cloud_pr")
+    def test_checks_in_progress_defers_and_schedules_ci_watch(self, mock_unsafe, mock_merge_status, mock_should_continue, tmp_path):
+        import os
+
+        from src.auto_coder.automation_config import AutomationConfig, ProcessedPRResult, PRProcessingOutcome
+        from src.auto_coder.entity_invalidation import DurableInvalidationQueue
+        from src.auto_coder.pr_processor import _handle_pr_merge
+
+        mock_unsafe.return_value = MagicMock(metadata_error=None, closed=False, authoritative_pr_data=None, actions=[])
+        mock_gh = MagicMock()
+
+        db_path = tmp_path / "invalidation.sqlite3"
+        queue = DurableInvalidationQueue(db_path)
+        head_sha = "c" * 40
+        queue.ensure_ci_watch("owner/repo", 55, head_sha, "", now=100)
+        assert queue.promote_due_ci_watches("owner/repo", now=100) == 1
+
+        config = AutomationConfig()
+        pr_data = {"number": 55, "head": {"sha": head_sha}}
+        status = ProcessedPRResult(pr_data=pr_data)
+
+        with patch.dict(os.environ, {"AUTO_CODER_INVALIDATION_DB": str(db_path)}):
+            with (
+                patch("src.auto_coder.entity_invalidation.time.time", return_value=120),
+                patch(
+                    "src.auto_coder.pr_processor._check_github_actions_status",
+                    side_effect=authoritative_ci_status(success=False, ids=[1], in_progress=True),
+                ),
+            ):
+                actions = _handle_pr_merge(mock_gh, "owner/repo", pr_data, config, {}, processing_status=status)
+
+        assert any("GitHub Actions checks are still in progress for PR #55" in a for a in actions)
+        assert status.outcome == PRProcessingOutcome.DEFERRED
+
+        # Watch should now be scheduled at 120 + 30 = 150 (not waiting until 400)
+        assert queue.promote_due_ci_watches("owner/repo", now=149.9) == 0
+        assert queue.promote_due_ci_watches("owner/repo", now=150.0) == 1

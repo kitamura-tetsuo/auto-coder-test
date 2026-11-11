@@ -1,0 +1,1656 @@
+"""Non-interactive Muse Code CLI client using the shared local boundary."""
+
+from __future__ import annotations
+
+import ctypes
+import json
+import os
+import selectors
+import shlex
+import signal
+import stat
+import subprocess
+import tempfile
+import time
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import NoReturn, Optional, Sequence
+
+from .exceptions import AutoCoderTimeoutError, AutoCoderUsageLimitError
+from .execution_trace import EventKind, Outcome, current_scope, get_trace_collector
+from .llm_backend_config import get_llm_config
+from .llm_client_base import LLMClientBase
+from .local_execution_boundary import get_current_local_execution_boundary
+from .local_job_handoff import LocalJobClaim, LocalJobKind
+from .logger_config import get_logger
+from .muse_background_observation import (
+    MuseBackgroundObservation,
+    MuseObservationBinding,
+    MuseObservationFold,
+    MuseRuntimeConformanceEvidence,
+    MuseRuntimeSupport,
+    current_muse_job_observation,
+    decode_muse_msp_frame,
+    detect_muse_background_support,
+    persist_muse_observation,
+    recover_muse_observation,
+)
+from .muse_diagnostics import MuseInvocationObserver, TimedFrame
+from .prompt_loader import render_prompt
+from .usage_marker_utils import has_http_429_marker, has_usage_marker_match
+from .utils import _COMMAND_EXECUTION_CWD
+
+logger = get_logger(__name__)
+
+_MUSE_MSP_DIAGNOSTIC_SCHEMAS = frozenset(
+    {
+        (1, "sha256:b1e6676d624e116e2c1b150fec3192200d2cbca8ed79898e44f8921759c7872f"),
+        (1, "sha256:e0e163db6ccf00dbe68402ce55d6319b3edc33c421f31e9583b587b2de8a118f"),
+    }
+)
+_MUSE_MSP_CLIENT_NAME = "auto_coder"
+_MUSE_141_MODEL_ALIASES = {"muse-spark-1.3": "muse-spark-1.3-contributor"}
+_MUSE_REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"})
+# Auto-Coder policy (not a Muse timeout): how long one host-resolved approval may stay pending.
+_MUSE_APPROVAL_SETTLEMENT_SECONDS = 5.0
+_APPROVAL_POLICY_RESULTS = frozenset({"deny", "allow"})
+
+
+def _wait_msp_pipes(reads: list[int], writes: list[int], timeout: float) -> tuple[set[int], set[int]]:
+    """Wait for MSP pipes without the descriptor-number limit of select()."""
+    with selectors.DefaultSelector() as selector:
+        for fd in reads:
+            selector.register(fd, selectors.EVENT_READ)
+        for fd in writes:
+            selector.register(fd, selectors.EVENT_WRITE)
+        events = selector.select(timeout)
+    return (
+        {key.fd for key, mask in events if mask & selectors.EVENT_READ},
+        {key.fd for key, mask in events if mask & selectors.EVENT_WRITE},
+    )
+
+
+class _MspEndOfStream(Exception):
+    """Signal an expected host EOF while draining a completed turn."""
+
+
+_READ_ONLY_GIT_COMMANDS = {
+    "blame",
+    "cat-file",
+    "describe",
+    "diff",
+    "diff-tree",
+    "for-each-ref",
+    "grep",
+    "log",
+    "ls-files",
+    "ls-tree",
+    "merge-base",
+    "name-rev",
+    "rev-list",
+    "rev-parse",
+    "shortlog",
+    "show",
+    "show-ref",
+    "status",
+}
+
+_DISPOSABLE_DIRECTORY_NAMES = frozenset(
+    {
+        ".git",
+        ".venv",
+        "venv",
+        ".agent-tmp",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".cache",
+        "__pycache__",
+        "node_modules",
+    }
+)
+_DISPOSABLE_DIRECTORY_PREFIXES = tuple(f"{name}/" for name in _DISPOSABLE_DIRECTORY_NAMES)
+
+
+def _read_only_special_git_command(name: object, argv: object) -> bool:
+    """Recognize inspection-only forms of Git commands that also mutate."""
+    if not isinstance(argv, list) or not all(isinstance(argument, str) for argument in argv):
+        return False
+    try:
+        command_index = argv.index(str(name))
+    except ValueError:
+        return False
+    arguments = argv[command_index + 1 :]
+    if name == "branch":
+        mutating_flags = {"-d", "-D", "-m", "-M", "-c", "-C", "--delete", "--move", "--copy", "--edit-description", "--set-upstream-to", "--unset-upstream"}
+        if any(argument in mutating_flags for argument in arguments):
+            return False
+        if any(argument in {"--list", "-l", "--contains", "--no-contains", "--merged", "--no-merged"} for argument in arguments):
+            return True
+        return not any(not argument.startswith("-") for argument in arguments)
+    if name == "symbolic-ref":
+        return len([argument for argument in arguments if not argument.startswith("-")]) <= 1
+    if name == "tag":
+        return not any(not argument.startswith("-") for argument in arguments)
+    if name == "worktree":
+        return bool(arguments) and arguments[0] == "list"
+    return False
+
+
+def _execution_cwd() -> Path:
+    override = _COMMAND_EXECUTION_CWD.get()
+    return Path(override) if override else Path.cwd()
+
+
+@dataclass(frozen=True)
+class _WorkspaceFile:
+    path: str
+    contents: bytes
+    is_symlink: bool
+    mode: int
+
+
+@dataclass(frozen=True)
+class _WorkspaceMode:
+    path: str
+    mode: int
+
+
+@dataclass(frozen=True)
+class _GitState:
+    worktree: Path
+    git_dir: Path
+    branch: Optional[str]
+    head: str
+    index_state: bytes
+    status: bytes
+    staged_patch: bytes
+    unstaged_patch: bytes
+    untracked_files: tuple[_WorkspaceFile, ...]
+    ignored_files: tuple[_WorkspaceFile, ...]
+    tracked_modes: tuple[_WorkspaceMode, ...]
+    directory_modes: tuple[_WorkspaceMode, ...]
+
+
+@dataclass(frozen=True)
+class _MspOptions:
+    host_arguments: list[str]
+    reasoning_effort: Optional[str]
+    noedit: bool
+    approval_denial: bool
+
+
+@dataclass
+class _ApprovalObservation:
+    """One approval observed in the current invocation, keyed by session and approval id."""
+
+    first_seen: float
+    turn_id: Optional[str] = None
+    opened: bool = False
+
+
+@dataclass
+class _ApprovalState:
+    """Per-invocation approval observations; never carried between invocations."""
+
+    eligible: bool = False
+    session_id: Optional[str] = None
+    turn_id: Optional[str] = None
+    completed_while_pending: bool = False
+    records: dict[tuple[str, str], _ApprovalObservation] = field(default_factory=dict)
+    # Terminal host policy results keyed by (session, approval, turn); retained independently
+    # of openings so ordering cannot change them and an unrelated turn cannot bind a record.
+    resolutions: dict[tuple[str, str, str], str] = field(default_factory=dict)
+
+
+def _nonempty_str(value: object) -> Optional[str]:
+    return value if isinstance(value, str) and value else None
+
+
+def _uuid7() -> str:
+    """Create an RFC 9562 UUIDv7 without depending on Python 3.14's uuid.uuid7."""
+    timestamp_ms = int(time.time_ns() // 1_000_000) & ((1 << 48) - 1)
+    random_bits = int.from_bytes(os.urandom(10), "big") & ((1 << 74) - 1)
+    value = timestamp_ms << 80
+    value |= 0x7 << 76
+    value |= (random_bits >> 62) << 64
+    value |= 0b10 << 62
+    value |= random_bits & ((1 << 62) - 1)
+    return str(uuid.UUID(int=value))
+
+
+class MuseClient(LLMClientBase):
+    supports_retained_local_continuation = True
+
+    """Run Muse Code while retaining Auto-Coder's ownership of Git state."""
+
+    def __init__(self, backend_name: Optional[str] = None, use_noedit_options: bool = False) -> None:
+        super().__init__()
+        config = get_llm_config()
+        self.config_backend = config.get_backend_config(backend_name or "muse")
+        self.model_name = (self.config_backend and self.config_backend.model) or "muse-spark-1.3"
+        self.use_noedit_options = use_noedit_options
+        if use_noedit_options and self.config_backend and self.config_backend.options_for_noedit:
+            self.options = self.config_backend.options_for_noedit
+        else:
+            self.options = (self.config_backend and self.config_backend.options) or []
+        self.use_noedit_options = use_noedit_options or "--no-edit" in self.options
+        self.options_for_noedit = (self.config_backend and self.config_backend.options_for_noedit) or []
+        self.usage_markers = (self.config_backend and self.config_backend.usage_markers) or []
+        self.timeout = (self.config_backend and self.config_backend.timeout) or 7200
+        self._msp_stdout = bytearray()
+        self._msp_stderr = bytearray()
+        self._approvals = _ApprovalState()
+        self._diag = MuseInvocationObserver(enabled=False)
+        self._cli_version: Optional[str] = None
+        self._last_background_observation: Optional[MuseBackgroundObservation] = None
+
+        override = os.environ.get("AUTOCODER_MUSE_CLI")
+        command = shlex.split(override) if override else ["muse"]
+        try:
+            result = subprocess.run(command + ["--version"], capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError(f"Muse Code CLI is unavailable: {exc}") from exc
+        if result.returncode != 0:
+            raise RuntimeError("Muse Code CLI is installed but unusable; run 'muse --version' and verify your installation")
+        version_lines = (result.stdout or "").strip().splitlines()
+        self._cli_version = version_lines[0] if version_lines else None
+
+    @classmethod
+    def _execution_cwd(cls) -> Path:
+        return _execution_cwd()
+
+    @classmethod
+    def _git(cls, *args: str, cwd: Optional[Path] = None) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(["git", *args], cwd=cwd or cls._execution_cwd(), capture_output=True, check=False)
+
+    def _snapshot(self) -> _GitState:
+        return self._snapshot_at(self._execution_cwd())
+
+    def _snapshot_at(self, cwd: Path) -> _GitState:
+        """Capture one explicitly bound worktree, independent of later context changes."""
+        cwd = cwd.resolve()
+        head = self._git("rev-parse", "HEAD", cwd=cwd)
+        if head.returncode != 0:
+            raise RuntimeError("Muse backend requires a Git repository with an existing HEAD")
+        branch_result = self._git("symbolic-ref", "--quiet", "HEAD", cwd=cwd)
+        git_dir_result = self._git("rev-parse", "--path-format=absolute", "--git-dir", cwd=cwd)
+        status = self._git("status", "--porcelain=v2", "--untracked-files=all", cwd=cwd)
+        index_state = self._git("ls-files", "--stage", "-z", cwd=cwd)
+        staged_patch = self._git("diff", "--cached", "--binary", cwd=cwd)
+        unstaged_patch = self._git("diff", "--binary", cwd=cwd)
+        untracked = self._git("ls-files", "--others", "--exclude-standard", "-z", cwd=cwd)
+        ignored = self._git("ls-files", "--others", "--ignored", "--exclude-standard", "-z", cwd=cwd)
+        tracked = self._git("ls-files", "-z", cwd=cwd)
+        required_results = (status, git_dir_result, index_state, staged_patch, unstaged_patch, untracked, ignored, tracked)
+        if branch_result.returncode not in (0, 1) or any(result.returncode != 0 for result in required_results):
+            raise RuntimeError("Unable to snapshot repository state before Muse execution")
+        untracked_files = self._snapshot_files(untracked.stdout, cwd=cwd)
+        ignored_files = self._snapshot_files(ignored.stdout, cwd=cwd)
+        tracked_modes = self._snapshot_modes(tracked.stdout, cwd=cwd)
+        directory_modes = self._snapshot_directory_modes(cwd=cwd)
+        return _GitState(
+            worktree=cwd.resolve(),
+            git_dir=Path(os.fsdecode(git_dir_result.stdout).strip()).resolve(),
+            branch=branch_result.stdout.decode().strip() if branch_result.returncode == 0 else None,
+            head=head.stdout.decode().strip(),
+            index_state=index_state.stdout,
+            status=status.stdout,
+            staged_patch=staged_patch.stdout,
+            unstaged_patch=unstaged_patch.stdout,
+            untracked_files=untracked_files,
+            ignored_files=ignored_files,
+            tracked_modes=tracked_modes,
+            directory_modes=directory_modes,
+        )
+
+    @classmethod
+    def _snapshot_files(cls, raw_paths: bytes, cwd: Optional[Path] = None) -> tuple[_WorkspaceFile, ...]:
+        files = []
+        target_cwd = cwd or cls._execution_cwd()
+        for raw_path in filter(None, raw_paths.split(b"\0")):
+            relative_path = os.fsdecode(raw_path)
+            normalized = relative_path.replace(os.sep, "/")
+            if any(normalized.startswith(prefix) or f"/{prefix}" in f"/{normalized}" for prefix in _DISPOSABLE_DIRECTORY_PREFIXES):
+                continue
+            path = target_cwd / relative_path
+            if path.is_symlink():
+                files.append(_WorkspaceFile(relative_path, os.fsencode(os.readlink(path)), True, stat.S_IMODE(path.lstat().st_mode)))
+            elif path.is_file():
+                files.append(_WorkspaceFile(relative_path, path.read_bytes(), False, stat.S_IMODE(path.stat().st_mode)))
+        return tuple(files)
+
+    @classmethod
+    def _snapshot_modes(cls, raw_paths: bytes, cwd: Optional[Path] = None) -> tuple[_WorkspaceMode, ...]:
+        modes = []
+        target_cwd = cwd or cls._execution_cwd()
+        for raw_path in filter(None, raw_paths.split(b"\0")):
+            relative_path = os.fsdecode(raw_path)
+            normalized = relative_path.replace(os.sep, "/")
+            if any(normalized.startswith(prefix) or f"/{prefix}" in f"/{normalized}" for prefix in _DISPOSABLE_DIRECTORY_PREFIXES):
+                continue
+            path = target_cwd / relative_path
+            if path.exists() and not path.is_symlink():
+                modes.append(_WorkspaceMode(relative_path, stat.S_IMODE(path.stat().st_mode)))
+        return tuple(modes)
+
+    @classmethod
+    def _snapshot_directory_modes(cls, cwd: Optional[Path] = None) -> tuple[_WorkspaceMode, ...]:
+        root = cwd or cls._execution_cwd()
+        modes = [_WorkspaceMode(".", stat.S_IMODE(root.stat().st_mode))]
+        for current_root, directories, _files in os.walk(root, followlinks=False):
+            directories[:] = sorted(directory for directory in directories if not (Path(current_root) == root and directory in _DISPOSABLE_DIRECTORY_NAMES))
+            for directory in directories:
+                path = Path(current_root) / directory
+                if not path.is_symlink():
+                    modes.append(_WorkspaceMode(str(path.relative_to(root)), stat.S_IMODE(path.stat().st_mode)))
+        return tuple(modes)
+
+    def _restore_lifecycle(self, state: _GitState) -> None:
+        """Restore only HEAD and index state private to the captured worktree."""
+        target_cwd = state.worktree
+        current_git_dir = self._git("rev-parse", "--path-format=absolute", "--git-dir", cwd=target_cwd)
+        if current_git_dir.returncode != 0 or Path(os.fsdecode(current_git_dir.stdout).strip()).resolve() != state.git_dir:
+            raise RuntimeError(f"Muse recovery refused: original worktree unavailable worktree={target_cwd} git_dir={state.git_dir}")
+        if state.branch:
+            current = self._git("rev-parse", "--verify", state.branch, cwd=target_cwd)
+            current_oid = os.fsdecode(current.stdout).strip() if current.returncode == 0 else "<missing>"
+            if current_oid != state.head:
+                raise RuntimeError("Muse recovery skipped unsafe shared-ref repair " f"worktree={target_cwd} ref={state.branch} before={state.head} current={current_oid}: " "invocation ownership and current-state authority are unavailable")
+            restored = self._git("symbolic-ref", "HEAD", state.branch, cwd=target_cwd)
+        else:
+            restored = self._git("update-ref", "--no-deref", "HEAD", state.head, cwd=target_cwd)
+        index = self._git("read-tree", state.head, cwd=target_cwd)
+        if restored.returncode != 0 or index.returncode != 0:
+            raise RuntimeError("Muse changed Git lifecycle state and Auto-Coder could not restore it")
+
+    def _restore_index(self, state: _GitState) -> None:
+        target_cwd = state.worktree
+        if self._git("read-tree", state.head, cwd=target_cwd).returncode != 0:
+            raise RuntimeError("Auto-Coder could not unstage Muse changes")
+        if state.staged_patch:
+            result = subprocess.run(["git", "apply", "--binary", "--cached"], cwd=target_cwd, input=state.staged_patch, capture_output=True)
+            if result.returncode != 0:
+                raise RuntimeError("Auto-Coder could not restore the pre-Muse index")
+
+    def _restore_repository(self, state: _GitState) -> None:
+        """Restore the exact tracked/index/untracked state captured for no-edit."""
+        target_cwd = state.worktree
+        self._restore_lifecycle(state)
+        clean_args = ["clean", "-fdx"]
+        for name in sorted(_DISPOSABLE_DIRECTORY_NAMES):
+            clean_args.extend(["-e", f"{name}/", "-e", name])
+        if self._git("checkout-index", "-a", "-f", cwd=target_cwd).returncode != 0 or self._git(*clean_args, cwd=target_cwd).returncode != 0:
+            raise RuntimeError("Muse changed repository state and Auto-Coder could not restore it")
+        for patch, cached in ((state.staged_patch, True), (state.unstaged_patch, False)):
+            if not patch:
+                continue
+            args = ["git", "apply", "--binary"]
+            if cached:
+                args.append("--cached")
+            result = subprocess.run(args, cwd=target_cwd, input=patch, capture_output=True)
+            if result.returncode != 0:
+                raise RuntimeError("Muse changed repository state and Auto-Coder could not restore its pre-run patch")
+            if cached and self._git("checkout-index", "-a", "-f", cwd=target_cwd).returncode != 0:
+                raise RuntimeError("Muse changed repository state and Auto-Coder could not restore its working tree")
+        for workspace_file in state.untracked_files + state.ignored_files:
+            path = target_cwd / workspace_file.path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if workspace_file.is_symlink:
+                path.symlink_to(os.fsdecode(workspace_file.contents))
+            else:
+                path.write_bytes(workspace_file.contents)
+                path.chmod(workspace_file.mode)
+        for workspace_mode in state.tracked_modes:
+            path = target_cwd / workspace_mode.path
+            if path.exists() and not path.is_symlink():
+                path.chmod(workspace_mode.mode)
+        for directory_mode in state.directory_modes:
+            path = target_cwd / directory_mode.path
+            if not path.exists():
+                path.mkdir(parents=True)
+        for directory_mode in reversed(state.directory_modes):
+            path = target_cwd / directory_mode.path
+            if not path.is_symlink():
+                path.chmod(directory_mode.mode)
+
+    @staticmethod
+    def _trace_contains_git_mutation(trace_path: str) -> bool:
+        """Fail closed unless every traced Git command is observably read-only."""
+        try:
+            starts = {}
+            with open(trace_path, encoding="utf-8") as trace_file:
+                for line in trace_file:
+                    event = json.loads(line)
+                    if event.get("event") == "start":
+                        starts[event.get("sid")] = event.get("argv")
+                    elif event.get("event") == "cmd_name":
+                        name = event.get("name")
+                        if name not in _READ_ONLY_GIT_COMMANDS and not _read_only_special_git_command(name, starts.get(event.get("sid"))):
+                            logger.warning("Git trace observed non-read-only command: name=%r argv=%r", name, starts.get(event.get("sid")))
+                            return True
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Unable to audit Git commands executed by Muse: {exc}") from exc
+        return False
+
+    def _assert_invariants(self, before: _GitState, is_noedit: bool, mutation_observed: bool = False) -> None:
+        after = self._snapshot_at(before.worktree)
+        lifecycle_changed = (after.git_dir, after.branch, after.head) != (before.git_dir, before.branch, before.head)
+        index_changed = after.index_state != before.index_state
+        noedit_changed = is_noedit and (
+            after.status != before.status or after.unstaged_patch != before.unstaged_patch or after.untracked_files != before.untracked_files or after.ignored_files != before.ignored_files or after.tracked_modes != before.tracked_modes or after.directory_modes != before.directory_modes
+        )
+        recovery_error: Optional[RuntimeError] = None
+        try:
+            if is_noedit and (lifecycle_changed or noedit_changed):
+                self._restore_repository(before)
+            elif lifecycle_changed:
+                self._restore_lifecycle(before)
+                self._restore_index(before)
+            elif index_changed:
+                self._restore_index(before)
+        except RuntimeError as exc:
+            recovery_error = exc
+        if lifecycle_changed or index_changed or noedit_changed or mutation_observed:
+            detail = "Git lifecycle or index" if lifecycle_changed or index_changed else "working tree"
+            if mutation_observed:
+                detail = "Git lifecycle command"
+            logger.warning(
+                "Muse Git-state invariant violated: detail={} lifecycle={} index={} noedit={} mutation_observed={}",
+                detail,
+                lifecycle_changed,
+                index_changed,
+                noedit_changed,
+                mutation_observed,
+            )
+            failure = RuntimeError(f"Muse execution violated the Git-state invariant ({detail} changed)")
+            if recovery_error is not None:
+                failure.add_note(f"Recovery failed or was unsafe: {recovery_error}")
+            raise failure
+
+    @staticmethod
+    def _path_is_within(path: Path, root: Path) -> bool:
+        try:
+            path.relative_to(root)
+        except ValueError:
+            return False
+        return True
+
+    def _safe_prompt_directory(self) -> Path:
+        """Select a temporary directory outside the worktree and Git metadata."""
+        cwd = self._execution_cwd()
+        repository = cwd.resolve()
+        protected = [repository]
+        for argument in ("--git-dir", "--git-common-dir"):
+            result = self._git("rev-parse", "--path-format=absolute", argument, cwd=cwd)
+            if result.returncode != 0:
+                raise RuntimeError("Unable to locate Git metadata for Muse prompt isolation")
+            meta_path = Path(os.fsdecode(result.stdout).strip()).resolve()
+            protected.append(meta_path)
+            if meta_path.name == ".git":
+                protected.append(meta_path.parent)
+
+        candidates = [Path(tempfile.gettempdir())]
+        if os.name == "posix":
+            candidates.append(Path("/tmp"))
+        for candidate in candidates:
+            resolved = candidate.resolve()
+            if any(self._path_is_within(resolved, root) for root in protected):
+                continue
+            if resolved.is_dir() and os.access(resolved, os.W_OK | os.X_OK):
+                return resolved
+        raise RuntimeError("No safe temporary directory is available outside the repository for the Muse prompt file")
+
+    def _create_prompt_file(self, prompt: str) -> Path:
+        """Write one complete rendered prompt to an exclusively created private file."""
+        path: Optional[Path] = None
+        descriptor: Optional[int] = None
+        try:
+            descriptor, raw_path = tempfile.mkstemp(prefix="auto-coder-muse-prompt-", dir=self._safe_prompt_directory())
+            path = Path(raw_path)
+            if os.name == "posix":
+                os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "wb") as prompt_file:
+                descriptor = None
+                prompt_file.write(prompt.encode("utf-8"))
+                prompt_file.flush()
+                os.fsync(prompt_file.fileno())
+            file_stat = path.stat()
+            if not stat.S_ISREG(file_stat.st_mode) or (os.name == "posix" and stat.S_IMODE(file_stat.st_mode) != 0o600):
+                raise RuntimeError("Muse prompt transport did not produce a private regular file")
+            return path
+        except BaseException as exc:
+            cleanup_error: Optional[OSError] = None
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError as close_exc:
+                    cleanup_error = close_exc
+            if path is not None:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as unlink_exc:
+                    cleanup_error = cleanup_error or unlink_exc
+            failure = RuntimeError(f"Unable to prepare the complete Muse prompt file: {exc}")
+            if cleanup_error is not None:
+                failure.add_note(f"Prompt file cleanup also failed: {cleanup_error}")
+            raise failure from exc
+
+    @staticmethod
+    def _reject_competing_prompt_sources(arguments: list[str]) -> None:
+        for argument in arguments:
+            if argument in {"--prompt", "--prompt-file"} or argument.startswith(("--prompt=", "--prompt-file=")):
+                raise RuntimeError("Muse options must not configure a prompt source; Auto-Coder owns --prompt-file")
+
+    @classmethod
+    def _is_usage_limit_exhausted(
+        cls,
+        stdout: str,
+        stderr: str,
+        returncode: int,
+        usage_markers: Sequence[object],
+    ) -> bool:
+        """Check whether Muse exhausted its quota or hit a rate limit.
+
+        When stdout is a Muse JSONL stream, usage markers and HTTP 429 checks are
+        evaluated ONLY against explicit diagnostic/error events or stderr rather
+        than raw stdout. This prevents false positives caused by user prompts, git
+        diffs (e.g. documentation changes containing 'rate limit' or 'error: 429'),
+        or tool outputs echoed in the JSONL stream.
+        """
+        combined_output = "\n".join(part for part in (stdout, stderr) if part).strip()
+        if not combined_output:
+            return False
+
+        events: list[dict[str, object]] = []
+        is_jsonl_stream = False
+        for line in stdout.splitlines():
+            line = line.strip()
+            if not line or line.startswith("muse:"):
+                continue
+            try:
+                parsed = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if isinstance(parsed, dict) and ("record_type" in parsed or "payload_type" in parsed):
+                is_jsonl_stream = True
+                events.append(parsed)
+
+        if not is_jsonl_stream:
+            return has_usage_marker_match(combined_output, usage_markers) or has_http_429_marker(combined_output)
+
+        # In a JSONL stream, extract diagnostic/error events
+        diagnostic_events: list[dict[str, object]] = []
+        for event in events:
+            payload_type = str(event.get("payload_type", ""))
+            payload = event.get("payload")
+            record_type = str(event.get("record_type", ""))
+
+            is_diagnostic = False
+            if record_type == "error" or payload_type in {"run.terminal.failed", "task.lifecycle.failed", "error"}:
+                is_diagnostic = True
+            elif isinstance(payload, dict):
+                payload_kind = str(payload.get("kind", ""))
+                event_obj = payload.get("event")
+                if payload_kind == "run":
+                    if isinstance(event_obj, dict):
+                        event_kind = str(event_obj.get("kind", ""))
+                        if event_kind in {"failed", "error"} or event_obj.get("terminal") == "failed" or "error" in event_obj:
+                            is_diagnostic = True
+                    if payload.get("terminal") == "failed" or "error" in payload:
+                        is_diagnostic = True
+
+            if is_diagnostic:
+                diagnostic_events.append(event)
+
+        diagnostic_parts = [stderr] if stderr else []
+        diagnostic_parts.extend(json.dumps(ev, ensure_ascii=False) for ev in diagnostic_events)
+        diagnostic_output = "\n".join(diagnostic_parts).strip()
+
+        if diagnostic_output:
+            return has_usage_marker_match(diagnostic_output, usage_markers) or has_http_429_marker(diagnostic_output)
+
+        if returncode != 0 and not events:
+            return has_usage_marker_match(combined_output, usage_markers) or has_http_429_marker(combined_output)
+
+        return False
+
+    def _msp_timeout(self) -> AutoCoderTimeoutError:
+        return AutoCoderTimeoutError(f"Muse MSP invocation timed out after {self.timeout} seconds")
+
+    def _msp_send(self, process: subprocess.Popen[bytes], frame: dict[str, object], deadline: float) -> None:
+        if process.stdin is None:
+            raise RuntimeError("Muse MSP host has no input stream")
+        payload = memoryview((json.dumps(frame, separators=(",", ":")) + "\n").encode())
+        total_bytes = len(payload)
+        diag = self._diag
+        diag.begin_write(frame, total_bytes)
+        monitored = diag.begin_operation("pipe_write")
+        try:
+            self._msp_write(process, payload, total_bytes, deadline)
+        finally:
+            diag.end_operation(monitored)
+
+    def _msp_write(self, process: subprocess.Popen[bytes], payload: memoryview, total_bytes: int, deadline: float) -> None:
+        assert process.stdin is not None
+        diag = self._diag
+        stdin_fd = process.stdin.fileno()
+        stderr_fd = process.stderr.fileno() if process.stderr is not None else None
+        while payload:
+            diag.tick()
+            self._check_approval_expiry()
+            remaining = self._wait_budget(deadline)
+            if remaining <= 0:
+                self._check_approval_expiry()
+                if time.monotonic() >= deadline:
+                    raise self._msp_timeout()
+                continue
+            reads = [stderr_fd] if stderr_fd is not None else []
+            wake = diag.select_timeout()
+            readable, writable = _wait_msp_pipes(reads, [stdin_fd], remaining if wake is None else min(remaining, wake))
+            if stderr_fd is not None and stderr_fd in readable:
+                self._drain_msp_stderr(stderr_fd)
+            if stdin_fd not in writable:
+                continue
+            try:
+                written = os.write(stdin_fd, payload)
+            except BlockingIOError:
+                continue
+            if written <= 0:
+                raise RuntimeError("Muse MSP host stopped accepting protocol input")
+            payload = payload[written:]
+            diag.write_progress(total_bytes - len(payload))
+
+    def _drain_msp_stderr(self, stderr_fd: int) -> None:
+        try:
+            chunk = os.read(stderr_fd, 65536)
+        except BlockingIOError:
+            return
+        if chunk:
+            self._diag.read("stderr", len(chunk))
+            self._msp_stderr.extend(chunk)
+            if len(self._msp_stderr) > 8192:
+                del self._msp_stderr[:-8192]
+        else:
+            self._diag.eof("stderr")
+
+    def _raise_msp_failure(self, message: str, payload: object) -> None:
+        diagnostic = json.dumps(payload, ensure_ascii=False) if not isinstance(payload, str) else payload
+        markers = self.usage_markers or ["rate limit", "usage limit", "quota exceeded"]
+        if self._is_usage_limit_exhausted("", diagnostic, 1, markers):
+            raise AutoCoderUsageLimitError(diagnostic or "Muse Code usage limit reached")
+        raise RuntimeError(f"{message}: {diagnostic}")
+
+    def _msp_wait(
+        self,
+        process: subprocess.Popen[bytes],
+        request_id: int,
+        deadline: float,
+        notifications: list[dict[str, object]],
+        *,
+        clean_eof: bool = False,
+    ) -> dict[str, object]:
+        diag = self._diag
+        monitored = diag.begin_operation("response_wait" if request_id >= 0 else "notification_wait")
+        try:
+            return self._msp_wait_loop(process, request_id, deadline, notifications, clean_eof=clean_eof)
+        finally:
+            diag.end_operation(monitored)
+
+    def _msp_wait_loop(
+        self,
+        process: subprocess.Popen[bytes],
+        request_id: int,
+        deadline: float,
+        notifications: list[dict[str, object]],
+        *,
+        clean_eof: bool,
+    ) -> dict[str, object]:
+        if process.stdout is None:
+            raise RuntimeError("Muse MSP host has no output stream")
+        diag = self._diag
+        stdout_fd = process.stdout.fileno()
+        stderr_fd = process.stderr.fileno() if process.stderr is not None else None
+        while True:
+            diag.tick()
+            self._check_approval_expiry()
+            newline = self._msp_stdout.find(b"\n")
+            if newline >= 0:
+                raw = bytes(self._msp_stdout[:newline])
+                del self._msp_stdout[: newline + 1]
+                try:
+                    frame = decode_muse_msp_frame(raw)
+                except ValueError as exc:
+                    diag.failure_hint("invalid_frame")
+                    raise RuntimeError("Muse MSP host emitted an invalid protocol frame") from exc
+                decoded_at = diag.decoded_frame(frame) or time.monotonic()
+                if "method" in frame:
+                    method = frame["method"]
+                    if not isinstance(method, str):
+                        raise RuntimeError("Muse MSP host emitted a frame with a non-string method")
+                    if "id" in frame:
+                        # Server-originated RPC: its id namespace is independent of ours.
+                        self._msp_handle_server_request(process, frame, method, deadline)
+                    else:
+                        self._msp_handle_notification(frame, method)
+                        timed = TimedFrame(frame, decoded_at)
+                        diag.notification(timed)
+                        notifications.append(timed)
+                        if request_id == -1:
+                            return {}
+                    continue
+                response_id = frame.get("id")
+                if "id" in frame and type(response_id) is int and response_id == request_id:
+                    error = frame.get("error")
+                    diag.correlated_response(error.get("code") if isinstance(error, dict) else None)
+                    if "error" in frame:
+                        diag.failure_hint("rpc_error")
+                        self._raise_msp_failure("Muse MSP request failed", frame["error"])
+                    result = frame.get("result")
+                    if not isinstance(result, dict):
+                        raise RuntimeError("Muse MSP response did not contain an object result")
+                    return result
+                continue
+
+            remaining = self._wait_budget(deadline)
+            if remaining <= 0:
+                self._check_approval_expiry()
+                if time.monotonic() >= deadline:
+                    raise self._msp_timeout()
+                continue
+            reads = [stdout_fd]
+            if stderr_fd is not None:
+                reads.append(stderr_fd)
+            wake = diag.select_timeout()
+            readable, _ = _wait_msp_pipes(reads, [], remaining if wake is None else min(remaining, wake))
+            if not readable:
+                if time.monotonic() >= deadline:
+                    raise self._msp_timeout()
+                continue
+            if stderr_fd is not None and stderr_fd in readable:
+                self._drain_msp_stderr(stderr_fd)
+            if stdout_fd not in readable:
+                continue
+            try:
+                chunk = os.read(stdout_fd, 65536)
+            except BlockingIOError:
+                continue
+            if chunk:
+                diag.read("stdout", len(chunk))
+                self._msp_stdout.extend(chunk)
+                continue
+            diag.eof("stdout")
+            if clean_eof:
+                raise _MspEndOfStream
+            diag.failure_hint("host_eof")
+            detail = self._msp_stderr.decode(errors="replace").strip()
+            self._raise_msp_failure("Muse MSP host exited before completing the request", detail)
+
+    def _fail_interactive_request(self, method: str, params: object) -> NoReturn:
+        details = params if isinstance(params, dict) else {}
+        # Preserve correlation, never raw commands, prompts, subjects, or choices.
+        facts = {
+            "method": method,
+            "requested_approval_policy": self._requested_approval_mode,
+            "effective_approval_policy": self._observed_approval_mode or "unknown",
+        }
+        for field_name in ("sessionId", "turnId", "approvalId", "requestId"):
+            value = details.get(field_name)
+            if isinstance(value, str):
+                facts[field_name] = value[:200]
+        get_trace_collector().record_event(EventKind.STAGE_RESULT, "llm.muse-interactive-request", "local-backend", label="Muse interactive request blocked", outcome=Outcome.BLOCKED, facts=facts)
+        logger.error("Muse unattended execution received an interactive request: {}", facts)
+        raise RuntimeError(f"Muse MSP unattended execution cannot wait for interactive request {method}; configure required Muse permission rules and prepare dependencies before invocation")
+
+    # --- Host-resolved approval observation (confirmed denyUnmatched only) ---
+
+    def _pending_approvals(self) -> list[tuple[tuple[str, str], _ApprovalObservation]]:
+        state = self._approvals
+        pending = []
+        for key, record in state.records.items():
+            turn_id = record.turn_id or state.turn_id
+            if turn_id is None or (key[0], key[1], turn_id) not in state.resolutions:
+                pending.append((key, record))
+        return pending
+
+    def _wait_budget(self, deadline: float) -> float:
+        """Seconds until the overall deadline or the earliest pending approval deadline."""
+        now = time.monotonic()
+        limits = [deadline - now]
+        limits.extend(record.first_seen + _MUSE_APPROVAL_SETTLEMENT_SECONDS - now for _, record in self._pending_approvals())
+        return max(min(limits), 0.0) if len(limits) > 1 else limits[0]
+
+    def _check_approval_expiry(self) -> None:
+        now = time.monotonic()
+        for (session_id, approval_id), record in self._pending_approvals():
+            if now - record.first_seen >= _MUSE_APPROVAL_SETTLEMENT_SECONDS:
+                params = {"sessionId": session_id, "approvalId": approval_id, "turnId": record.turn_id}
+                self._fail_interactive_request("approval/settlement-expired", params)
+
+    def _bind_admitted_turn(self, turn_id: str) -> None:
+        """Check pre-acknowledgement approval traffic against the actual admitted turn."""
+        state = self._approvals
+        state.turn_id = turn_id
+        for key, record in list(state.records.items()):
+            if record.turn_id is None or record.turn_id == turn_id:
+                continue
+            if record.opened:
+                self._fail_interactive_request("approval/incompatible-turn", {"sessionId": key[0], "approvalId": key[1], "turnId": record.turn_id})
+            del state.records[key]
+
+    def _assert_approvals_settled(self) -> None:
+        state = self._approvals
+        pending = self._pending_approvals()
+        if pending or state.completed_while_pending:
+            session_id, approval_id = pending[0][0] if pending else (state.session_id, None)
+            self._fail_interactive_request("approval/unresolved-at-completion", {"sessionId": session_id, "approvalId": approval_id, "turnId": state.turn_id})
+
+    @staticmethod
+    def _valid_rpc_id(value: object) -> bool:
+        return type(value) is int or (type(value) is str)
+
+    def _msp_handle_server_request(self, process: subprocess.Popen[bytes], frame: dict[str, object], method: str, deadline: float) -> None:
+        request_id = frame["id"]
+        if not self._valid_rpc_id(request_id):
+            raise RuntimeError("Muse MSP host emitted a server request with an invalid id")
+        params = frame.get("params")
+        if method == "approval/request":
+            identity = self._approval_identity(params, require_turn=True)
+            if identity is None:
+                self._msp_send(process, {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32602, "message": "Invalid approval request identity"}}, deadline)
+                self._fail_interactive_request(method, params)
+            # The empty result is only a presentation receipt, never a decision.
+            self._msp_send(process, {"jsonrpc": "2.0", "id": request_id, "result": {}}, deadline)
+            if not self._approvals.eligible:
+                self._fail_interactive_request(method, params)
+            self._observe_approval_opening(method, params, identity)
+            return
+        self._msp_send(
+            process,
+            {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": "Auto-Coder does not support interactive MSP requests"}},
+            deadline,
+        )
+        self._fail_interactive_request(method, params)
+
+    def _msp_handle_notification(self, frame: dict[str, object], method: str) -> None:
+        params = frame.get("params")
+        state = self._approvals
+        if method == "userInput/requested":
+            self._fail_interactive_request(method, params)
+        if method in {"approval/requested", "approval/updated"}:
+            if not state.eligible:
+                self._fail_interactive_request(method, params)
+            if method == "approval/requested":
+                identity = self._approval_identity(params, require_turn=True)
+                if identity is None:
+                    self._fail_interactive_request(method, params)
+                self._observe_approval_opening(method, params, identity)
+            else:
+                self._observe_approval_update(method, params)
+        elif method == "approval/resolved" and state.eligible:
+            self._observe_approval_resolution(params)
+        elif method == "turn/completed" and state.eligible and self._pending_approvals():
+            state.completed_while_pending = True
+
+    @staticmethod
+    def _approval_identity(params: object, *, require_turn: bool) -> Optional[tuple[str, Optional[str], str]]:
+        if not isinstance(params, dict):
+            return None
+        session_id = _nonempty_str(params.get("sessionId"))
+        approval_id = _nonempty_str(params.get("approvalId"))
+        turn_id = _nonempty_str(params.get("turnId"))
+        if session_id is None or approval_id is None or (require_turn and turn_id is None):
+            return None
+        return session_id, turn_id, approval_id
+
+    def _observe_approval_opening(self, method: str, params: object, identity: Optional[tuple[str, Optional[str], str]]) -> None:
+        state = self._approvals
+        assert identity is not None
+        session_id, turn_id, approval_id = identity
+        if session_id != state.session_id or (state.turn_id is not None and turn_id != state.turn_id):
+            self._fail_interactive_request(method, params)
+        record = state.records.get((session_id, approval_id))
+        if record is None:
+            state.records[(session_id, approval_id)] = _ApprovalObservation(first_seen=time.monotonic(), turn_id=turn_id, opened=True)
+            return
+        if record.turn_id is not None and record.turn_id != turn_id:
+            self._fail_interactive_request(method, params)
+        # Duplicates neither renew the age nor reopen a settled approval.
+        record.turn_id = turn_id
+        record.opened = True
+
+    def _observe_approval_update(self, method: str, params: object) -> None:
+        state = self._approvals
+        identity = self._approval_identity(params, require_turn=False)
+        if identity is None:
+            self._fail_interactive_request(method, params)
+        session_id, turn_id, approval_id = identity
+        if session_id != state.session_id or (turn_id is not None and state.turn_id is not None and turn_id != state.turn_id):
+            return
+        # An update cannot establish turn identity or completion; it only starts the clock.
+        state.records.setdefault((session_id, approval_id), _ApprovalObservation(first_seen=time.monotonic()))
+
+    def _observe_approval_resolution(self, params: object) -> None:
+        state = self._approvals
+        identity = self._approval_identity(params, require_turn=True)
+        policy_result = params.get("policyResult") if isinstance(params, dict) else None
+        if identity is None or policy_result not in _APPROVAL_POLICY_RESULTS:
+            return
+        session_id, turn_id, approval_id = identity
+        if session_id != state.session_id or (state.turn_id is not None and turn_id != state.turn_id):
+            return
+        assert turn_id is not None
+        key = (session_id, approval_id, turn_id)
+        if state.resolutions.get(key, str(policy_result)) != policy_result:
+            raise RuntimeError("Muse MSP host reported conflicting policy results for one approval")
+        state.resolutions[key] = str(policy_result)
+
+    @staticmethod
+    def _session_metadata(result: dict[str, object]) -> dict[str, object]:
+        session = result.get("session")
+        if not isinstance(session, dict):
+            raise RuntimeError("Muse MSP response omitted session metadata")
+        return session
+
+    def _msp_options(self, effective_noedit: bool) -> _MspOptions:
+        processed = self.config_backend.replace_placeholders(model_name=self.model_name) if self.config_backend else {}
+        configured = processed.get(
+            "options_for_noedit" if effective_noedit and self.options_for_noedit else "options",
+            self.options_for_noedit if effective_noedit and self.options_for_noedit else self.options,
+        )
+        arguments = [*configured, *self.consume_extra_args()]
+        self._reject_competing_prompt_sources(arguments)
+        host_arguments = ["serve"]
+        reasoning: Optional[str] = None
+        approval_denial = False
+        index = 0
+        harmless = {"exec", "--json"}
+        while index < len(arguments):
+            argument = arguments[index]
+            if argument in harmless:
+                index += 1
+                continue
+            if argument == "--disable-approval":
+                approval_denial = True
+                index += 1
+                continue
+            if argument == "--no-edit":
+                effective_noedit = True
+                index += 1
+                continue
+            if argument in {"--model", "--reasoning-effort"}:
+                if index + 1 >= len(arguments):
+                    raise RuntimeError(f"Muse option {argument} requires a value")
+                value = arguments[index + 1]
+                if argument == "--model" and value != self.model_name:
+                    raise RuntimeError("Muse configured model conflicts with the selected backend model")
+                if argument == "--reasoning-effort":
+                    reasoning = value
+                index += 2
+                continue
+            if argument.startswith("--model="):
+                if argument.split("=", 1)[1] != self.model_name:
+                    raise RuntimeError("Muse configured model conflicts with the selected backend model")
+                index += 1
+                continue
+            if argument.startswith("--reasoning-effort="):
+                reasoning = argument.split("=", 1)[1]
+                index += 1
+                continue
+            if argument in {"--disable-write", "--disable-shell"}:
+                host_arguments.append(argument)
+                index += 1
+                continue
+            if argument == "--trust-workspace":
+                raise RuntimeError("Muse workspace trust was requested without independent PR-review authorization")
+            raise RuntimeError(f"Muse option is not representable through MSP: {argument}")
+        if reasoning is not None and reasoning not in _MUSE_REASONING_EFFORTS:
+            raise RuntimeError(f"Muse reasoning effort is not supported by MSP: {reasoning}")
+        if effective_noedit and "--disable-write" not in host_arguments:
+            host_arguments.append("--disable-write")
+        return _MspOptions(host_arguments, reasoning, effective_noedit, approval_denial)
+
+    @staticmethod
+    def _validate_command_ack(result: dict[str, object], command_id: str, *, approval_mode: Optional[str] = None) -> None:
+        if result.get("commandId") != command_id or result.get("status") != "accepted":
+            raise RuntimeError("Muse MSP returned an invalid or uncorrelated command acknowledgement")
+        if approval_mode is not None:
+            if result.get("applyOutcome") not in {"completed", "noop"}:
+                raise RuntimeError(f"Muse MSP did not apply approval mode {approval_mode}")
+            effective_mode = result.get("effectiveMode")
+            if not isinstance(effective_mode, dict) or effective_mode.get("mode") != approval_mode:
+                raise RuntimeError(f"Muse MSP did not confirm effective approval mode {approval_mode}")
+
+    @staticmethod
+    def _process_group_exists(process_group: int) -> bool:
+        """Return whether any writer remains in an owned POSIX process group."""
+        proc = Path("/proc")
+        if proc.is_dir():
+            try:
+                for entry in proc.iterdir():
+                    if not entry.name.isdigit():
+                        continue
+                    raw = (entry / "stat").read_text()
+                    fields = raw[raw.rfind(")") + 2 :].split()
+                    if len(fields) > 2 and int(fields[2]) == process_group and fields[0] != "Z":
+                        return True
+                return False
+            except (OSError, ValueError):
+                pass
+        try:
+            os.killpg(process_group, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError as exc:
+            raise RuntimeError("Muse writer settlement could not inspect its process group") from exc
+        return True
+
+    @classmethod
+    def _settle_process_group(cls, process: subprocess.Popen[bytes]) -> None:
+        """Stop every process in the invocation-owned session before handoff."""
+        if os.name != "posix":
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=2)
+            return
+
+        process_group = process.pid
+        if not cls._process_group_exists(process_group):
+            return
+        os.killpg(process_group, signal.SIGTERM)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            process.poll()
+            if not cls._process_group_exists(process_group):
+                return
+            time.sleep(0.01)
+        os.killpg(process_group, signal.SIGKILL)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            process.poll()
+            if not cls._process_group_exists(process_group):
+                return
+            time.sleep(0.01)
+        raise RuntimeError("Muse process group did not terminate after SIGKILL; writer settlement is unknown")
+
+    def _pending_approval_remaining(self) -> Optional[float]:
+        now = time.monotonic()
+        limits = [record.first_seen + _MUSE_APPROVAL_SETTLEMENT_SECONDS - now for _, record in self._pending_approvals()]
+        return min(limits) if limits else None
+
+    def _run_msp_turn(self, prompt: str, is_noedit: bool, session_id: Optional[str]) -> str:
+        """Run one turn under a per-call, metadata-only diagnostic observer."""
+        diag = self._diag = MuseInvocationObserver()
+        scope = current_scope()
+        boundary = get_current_local_execution_boundary()
+        backend = self.config_backend
+        diag.update_metadata(
+            backend_alias=getattr(backend, "name", None) or "muse",
+            backend_type=getattr(backend, "backend_type", None) or "muse",
+            model=self.model_name,
+            continuation=session_id is not None,
+            requested_session_id=session_id,
+            controller_pid=os.getpid(),
+            cli_version=self._cli_version,
+            execution_id=scope.execution_id if scope else None,
+            repository=scope.repository if scope else None,
+            item=f"{scope.item_type}#{scope.item_number}" if scope else None,
+            invocation_id=boundary.binding.invocation_id if boundary else None,
+        )
+        diag.start()
+        error: Optional[BaseException] = None
+        try:
+            return self._run_msp_turn_observed(prompt, is_noedit, session_id)
+        except BaseException as exc:
+            error = exc
+            raise
+        finally:
+            diag.finish(error)
+
+    def _run_msp_turn_observed(self, prompt: str, is_noedit: bool, session_id: Optional[str]) -> str:
+        diag = self._diag
+        # An invocation owns only the identity it establishes successfully.
+        # Clear before snapshot/configuration/rendering so any pre-host failure
+        # cannot expose a previous invocation's session as its own result.
+        self._last_session_id = None
+        self._last_background_observation = None
+        effective_noedit = is_noedit or self.use_noedit_options
+        cwd = self._execution_cwd().resolve()
+        msp_options = self._msp_options(effective_noedit)
+        effective_noedit = msp_options.noedit
+        diag.update_metadata(effective_mode="no-edit" if effective_noedit else "edit", reasoning_effort=msp_options.reasoning_effort)
+        # Review is unattended too. Let the host authorize shell inspection;
+        # --disable-write and the no-edit snapshot/trace still reject mutation.
+        self._requested_approval_mode = "denyUnmatched" if msp_options.approval_denial else "allowAll"
+        self._observed_approval_mode: Optional[str] = None
+        self._approvals = _ApprovalState()
+        boundary = get_current_local_execution_boundary()
+        if not effective_noedit:
+            if boundary is None:
+                raise RuntimeError("Editable Muse execution requires a controller-owned local workspace binding")
+            if not boundary.editable or boundary.backend_type.lower() != "muse" or boundary.binding.workspace.resolve() != cwd:
+                raise RuntimeError("Editable Muse execution has an incompatible local workspace binding")
+        before = self._snapshot_at(cwd) if effective_noedit else None
+        rendered_prompt = render_prompt(
+            "muse.execution",
+            task_prompt=prompt,
+            mode="no-edit" if effective_noedit else "edit",
+            result_root=str(cwd),
+        )
+        env = os.environ.copy()
+        if self.config_backend and self.config_backend.api_key and "MUSE_API_KEY" not in env:
+            env["MUSE_API_KEY"] = self.config_backend.api_key
+        trace_path: Optional[str] = None
+        if effective_noedit:
+            # Inspection must not refresh Git's index as an optional side effect.
+            env["GIT_OPTIONAL_LOCKS"] = "0"
+            env["MUSE_DISABLE_APPROVAL_JUDGE"] = "1"
+            trace = tempfile.NamedTemporaryFile(prefix="auto-coder-muse-git-trace-", delete=False)
+            trace_path = trace.name
+            trace.close()
+            env["GIT_TRACE2_EVENT"] = trace_path
+        command = shlex.split(os.environ.get("AUTOCODER_MUSE_CLI", "muse")) + msp_options.host_arguments
+        process: Optional[subprocess.Popen[bytes]] = None
+        deadline = time.monotonic() + self.timeout
+        diag.set_budget_sources(deadline, self._pending_approval_remaining, lambda: len(self._msp_stdout))
+        notifications: list[dict[str, object]] = []
+        command_ids: set[str] = set()
+
+        def new_command_id() -> str:
+            command_id = _uuid7()
+            while command_id in command_ids:
+                command_id = _uuid7()
+            command_ids.add(command_id)
+            return command_id
+
+        completed_session_id: Optional[str] = None
+        final_output: Optional[str] = None
+        final_continuation_frontier: Optional[int] = None
+        invocation_error: Optional[BaseException] = None
+        predecessor_turn: Optional[str] = None
+        try:
+            logger.warning("LLM invocation: Muse Code MSP host is being called. Keep LLM calls minimized.")
+            diag.enter_phase("host_startup")
+            retained_observer = current_muse_job_observation()
+            if retained_observer is not None and retained_observer.job.kind in {LocalJobKind.PR_CI_FAILURE, LocalJobKind.PR_MERGE_CONFLICT} and session_id is None and retained_observer.store.get_continuation(retained_observer.job.job_id) is not None:
+                if not retained_observer.store.bind_continuation_writer(retained_observer.job.job_id, retained_observer.executor_token, cwd, "ambiguous:multiple-provider-sessions"):
+                    raise RuntimeError("Multiple Muse provider sessions could not be fenced")
+                retained_observer = None
+            if retained_observer is not None and session_id is not None:
+                previous = recover_muse_observation(retained_observer.store, retained_observer.job.job_id)
+                if previous is not None and (
+                    previous.binding.provider_session == session_id
+                    and previous.binding.backend_name == retained_observer.job.backend_name
+                    and previous.binding.execution_incarnation == retained_observer.job.execution_incarnation
+                    and previous.binding.upstream_attempt == retained_observer.job.upstream_attempt
+                    and previous.binding.workspace.resolve() == Path(retained_observer.job.workspace_path).resolve()
+                ):
+                    predecessor_turn = _nonempty_str(previous.foreground_turn)
+                if not retained_observer.store.bind_continuation_writer(retained_observer.job.job_id, retained_observer.executor_token, cwd, "ambiguous:host-launch"):
+                    raise RuntimeError("Muse resumed host launch could not be fenced")
+            process = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=os.name == "posix", bufsize=0)
+            if retained_observer is not None and retained_observer.store.get_continuation(retained_observer.job.job_id) is not None:
+                from .local_job_runner import process_owner
+
+                if not retained_observer.store.bind_continuation_writer(retained_observer.job.job_id, retained_observer.executor_token, cwd, process_owner(process.pid)):
+                    raise RuntimeError("Muse resumed host ownership could not be retained")
+            diag.host_started(process)
+            self._msp_stdout.clear()
+            self._msp_stderr.clear()
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None:
+                    os.set_blocking(stream.fileno(), False)
+            diag.enter_phase("initialization")
+            self._msp_send(
+                process,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {"clientInfo": {"name": _MUSE_MSP_CLIENT_NAME, "version": "1"}},
+                },
+                deadline,
+            )
+            initialized = self._msp_wait(process, 1, deadline, notifications)
+            server_info = initialized.get("serverInfo")
+            schema = initialized.get("schema")
+            host_version = server_info.get("version") if isinstance(server_info, dict) else None
+            if isinstance(schema, dict):
+                diag.update_metadata(host_version=host_version, schema_version=schema.get("version"), schema_fingerprint=schema.get("fingerprint"))
+            if not isinstance(schema, dict):
+                raise RuntimeError("Muse MSP initialization returned missing or non-object schema metadata " f"(host version={host_version!r}; required schema.version=1 and a nonblank schema.fingerprint)")
+            schema_version = schema.get("version")
+            schema_fingerprint = schema.get("fingerprint")
+            observed_schema = (schema_version, schema_fingerprint)
+            if type(schema_version) is not int or schema_version != 1:
+                raise RuntimeError("Muse MSP initialization has unsupported schema.version " f"(host version={host_version!r}; observed version={schema_version!r}; required integer 1)")
+            if not isinstance(schema_fingerprint, str) or not schema_fingerprint.strip():
+                raise RuntimeError("Muse MSP initialization has invalid schema.fingerprint " f"(host version={host_version!r}; observed fingerprint={schema_fingerprint!r}; required nonblank string)")
+            if observed_schema not in _MUSE_MSP_DIAGNOSTIC_SCHEMAS:
+                logger.warning(
+                    "Muse MSP schema fingerprint is not in Auto-Coder's diagnostic reference set; "
+                    "execution continues with required runtime contract checks "
+                    f"(schema version={schema_version!r}, fingerprint={schema_fingerprint!r}, host version={host_version!r}). "
+                    "This does not certify host compatibility."
+                )
+            self._msp_send(process, {"jsonrpc": "2.0", "method": "initialized"}, deadline)
+            session_command_id = new_command_id()
+            if session_id is None:
+                params: dict[str, object] = {"commandId": session_command_id, "workspaceRoot": str(cwd), "modelId": self.model_name}
+                params["approvalMode"] = self._requested_approval_mode
+                method = "session/start"
+            else:
+                if not session_id.strip():
+                    raise ValueError("Muse session ID must be nonempty")
+                params = {"commandId": session_command_id, "sessionId": session_id}
+                method = "session/resume"
+            diag.enter_phase("session_start_resume")
+            self._msp_send(process, {"jsonrpc": "2.0", "id": 2, "method": method, "params": params}, deadline)
+            opened = self._msp_wait(process, 2, deadline, notifications)
+            metadata = self._session_metadata(opened)
+            canonical_id = metadata.get("sessionId")
+            if not isinstance(canonical_id, str) or not canonical_id:
+                raise RuntimeError("Muse MSP returned an invalid session identity")
+            if session_id is not None and canonical_id != session_id:
+                raise RuntimeError("Muse MSP resumed a different session identity")
+            diag.session_confirmed(canonical_id)
+            job_observer = retained_observer
+            if job_observer is not None:
+                bound = job_observer.store.bind_continuation(
+                    LocalJobClaim(job_observer.job, True),
+                    canonical_id,
+                    job_observer.executor_token,
+                    deadline_at=time.time() + self.timeout,
+                )
+                if bound is None and job_observer.job.kind in {LocalJobKind.PR_CI_FAILURE, LocalJobKind.PR_MERGE_CONFLICT}:
+                    if not job_observer.store.bind_continuation_writer(job_observer.job.job_id, job_observer.executor_token, cwd, "ambiguous:multiple-provider-sessions"):
+                        raise RuntimeError("Muse provider session could not be fenced")
+                    job_observer = None
+            workspace = metadata.get("workspaceRoot")
+            if not isinstance(workspace, str) or workspace != str(cwd):
+                raise RuntimeError("Muse MSP session belongs to an incompatible workspace")
+            if job_observer is not None:
+                from .local_job_runner import process_owner
+
+                if not job_observer.store.bind_continuation_writer(job_observer.job.job_id, job_observer.executor_token, cwd, process_owner(process.pid)):
+                    raise RuntimeError("Muse provider workspace and writer binding could not be retained")
+            effective_model = metadata.get("modelId")
+            model_matches = effective_model == self.model_name
+            resolved_model = _MUSE_141_MODEL_ALIASES.get(self.model_name)
+            model_matches = model_matches or (resolved_model is not None and effective_model == resolved_model)
+            if not model_matches:
+                raise RuntimeError("Muse MSP session omitted or uses an incompatible model")
+            approval_mode = metadata.get("approvalMode")
+            observed_mode = approval_mode.get("mode") if isinstance(approval_mode, dict) else None
+            if isinstance(observed_mode, str):
+                self._observed_approval_mode = observed_mode
+            pending = opened.get("pendingRequests")
+            if pending not in (None, []):
+                get_trace_collector().record_event(
+                    EventKind.STAGE_RESULT,
+                    "llm.muse-interactive-request",
+                    "local-backend",
+                    label="Muse interactive request blocked",
+                    outcome=Outcome.BLOCKED,
+                    facts={
+                        "method": method,
+                        "requested_approval_policy": self._requested_approval_mode,
+                        "effective_approval_policy": self._observed_approval_mode or "unknown",
+                        "sessionId": canonical_id,
+                        "reason": "pending interactive requests",
+                    },
+                )
+                raise RuntimeError("Muse MSP session has pending interactive requests")
+            approval_confirmed = observed_mode == self._requested_approval_mode
+            if session_id is None:
+                if not approval_confirmed:
+                    raise RuntimeError(f"Muse MSP fresh session did not confirm approval mode {self._requested_approval_mode}")
+            elif not approval_confirmed:
+                approval_command_id = new_command_id()
+                approval_params: dict[str, object] = {
+                    "commandId": approval_command_id,
+                    "sessionId": canonical_id,
+                    "mode": self._requested_approval_mode,
+                }
+                diag.enter_phase("approval_mode_change")
+                self._msp_send(process, {"jsonrpc": "2.0", "id": 3, "method": "session/setApprovalMode", "params": approval_params}, deadline)
+                approval_result = self._msp_wait(process, 3, deadline, notifications)
+                self._validate_command_ack(approval_result, approval_command_id, approval_mode=self._requested_approval_mode)
+                diag.ack_accepted()
+                self._observed_approval_mode = self._requested_approval_mode
+            command_id = new_command_id()
+            # Automatic settlement is eligible only after denyUnmatched is confirmed for this session.
+            self._approvals = _ApprovalState(eligible=self._observed_approval_mode == "denyUnmatched", session_id=canonical_id)
+            turn_params: dict[str, object] = {"commandId": command_id, "sessionId": canonical_id, "input": [{"type": "text", "text": rendered_prompt}]}
+            if msp_options.reasoning_effort is not None:
+                turn_params["reasoningEffort"] = msp_options.reasoning_effort
+            turn_request_id = 4
+            diag.enter_phase("turn_submission")
+            self._msp_send(process, {"jsonrpc": "2.0", "id": turn_request_id, "method": "turn/start", "params": turn_params}, deadline)
+            turn_ack = self._msp_wait(process, turn_request_id, deadline, notifications)
+            self._validate_command_ack(turn_ack, command_id)
+            diag.ack_accepted()
+            turn_id = turn_ack.get("turnId")
+            if not isinstance(turn_id, str) or not turn_id or type(turn_ack.get("startedNewTurn")) is not bool or not isinstance(turn_ack.get("disposition"), str) or not turn_ack.get("disposition"):
+                raise RuntimeError("Muse MSP did not acknowledge the submitted turn")
+            if turn_ack.get("startedNewTurn") is False and turn_ack.get("disposition") in {"steered", "queued"}:
+                for event in reversed(notifications):
+                    params_obj = event.get("params")
+                    if event.get("method") in {"turn/started", "turn/queued"} and isinstance(params_obj, dict) and params_obj.get("sessionId") == canonical_id:
+                        steered_turn = _nonempty_str(params_obj.get("turnId"))
+                        if steered_turn is not None and steered_turn != predecessor_turn:
+                            turn_id = steered_turn
+                            break
+            self._bind_admitted_turn(turn_id)
+            observation_fold: Optional[MuseObservationFold] = None
+            conformance_evidence = MuseRuntimeConformanceEvidence()
+            if job_observer is not None:
+                observation_fold = MuseObservationFold(
+                    MuseObservationBinding(
+                        job_observer.job.backend_name,
+                        canonical_id,
+                        job_observer.job.execution_incarnation,
+                        job_observer.job.upstream_attempt,
+                        Path(job_observer.job.workspace_path),
+                    ),
+                    turn_id,
+                    MuseRuntimeSupport(False, reason="runtime conformance observations are incomplete"),
+                )
+            diag.turn_acknowledged(turn_id, notifications)
+            diag.enter_phase("turn_terminal_wait")
+            terminal: Optional[dict[str, object]] = None
+            notification_cursor = 0
+            while terminal is None:
+                if notification_cursor == len(notifications):
+                    # Wait for a deliberately unused response id while collecting notifications.
+                    self._msp_wait(process, -1, deadline, notifications)
+                for event in notifications[notification_cursor:]:
+                    notification_cursor += 1
+                    if observation_fold is not None:
+                        observation_fold.consume(event)
+                        self._last_background_observation = observation_fold.observation()
+                        assert job_observer is not None
+                        persist_muse_observation(
+                            job_observer.store,
+                            job_observer.job.job_id,
+                            job_observer.executor_token,
+                            self._last_background_observation,
+                        )
+                    params_obj = event.get("params")
+                    if event.get("method") != "turn/completed":
+                        continue
+                    if predecessor_turn is not None and isinstance(params_obj, dict) and params_obj.get("turnId") == predecessor_turn and predecessor_turn != turn_id and params_obj.get("sessionId") == canonical_id:
+                        # A resumed host can reconcile its orphaned predecessor
+                        # after acknowledging the new turn. It cannot complete it.
+                        continue
+                    if not isinstance(params_obj, dict) or params_obj.get("turnId") != turn_id:
+                        raise RuntimeError("Muse MSP terminal belongs to an incompatible turn")
+                    if params_obj.get("sessionId") != canonical_id:
+                        raise RuntimeError("Muse MSP terminal belongs to an incompatible session")
+                    if terminal is None:
+                        terminal = params_obj
+            if terminal.get("terminal") != "completed":
+                self._raise_msp_failure("Muse MSP turn did not complete successfully", terminal)
+            # A resolution arriving after completion cannot rescue an unresolved approval.
+            self._assert_approvals_settled()
+            if observation_fold is not None and job_observer is not None:
+                self._msp_send(
+                    process,
+                    {"jsonrpc": "2.0", "id": 5, "method": "task/list", "params": {"sessionId": canonical_id}},
+                    deadline,
+                )
+                inventory = self._msp_wait(process, 5, deadline, notifications)
+                rows = inventory.get("tasks")
+                observation_fold.consume_task_inventory(rows if isinstance(rows, list) else None, "task/list:5")
+                current_observation = observation_fold.observation()
+                in_turn_delivered = bool(current_observation.tasks) and all(task.state == "terminal" and task.result_delivered for task in current_observation.tasks)
+                conformance_evidence = MuseRuntimeConformanceEvidence(
+                    task_list_observed=isinstance(rows, list),
+                    task_result_delivery_observed=in_turn_delivered,
+                    continuation_ownership="native" if in_turn_delivered else "",
+                )
+                self._last_background_observation = current_observation
+                persist_muse_observation(job_observer.store, job_observer.job.job_id, job_observer.executor_token, current_observation)
+                while current_observation.tasks and not current_observation.final_assistant:
+                    if notification_cursor == len(notifications):
+                        self._msp_wait(process, -1, deadline, notifications)
+                    for event in notifications[notification_cursor:]:
+                        notification_cursor += 1
+                        observation_fold.consume(event)
+                        params_obj = event.get("params")
+                        if event.get("method") == "turn/started" and isinstance(params_obj, dict):
+                            continuation_turn = params_obj.get("turnId")
+                            if isinstance(continuation_turn, str) and continuation_turn != turn_id:
+                                raw_references = params_obj.get("resultReferences")
+                                if isinstance(raw_references, list):
+                                    references = [reference for reference in raw_references if isinstance(reference, str) and reference]
+                                else:
+                                    references = [task.result_reference for task in observation_fold.observation().tasks if task.state == "terminal" and task.result_reference]
+                                observation_fold.consume_result_delivery(continuation_turn, references, str(params_obj.get("viewCursor", "")))
+                                conformance_evidence = MuseRuntimeConformanceEvidence(
+                                    task_list_observed=conformance_evidence.task_list_observed,
+                                    task_result_delivery_observed=conformance_evidence.task_result_delivery_observed or bool(references),
+                                    continuation_ownership="native",
+                                )
+                        current_observation = observation_fold.observation()
+                        self._last_background_observation = current_observation
+                        persist_muse_observation(job_observer.store, job_observer.job.job_id, job_observer.executor_token, current_observation)
+                self._msp_send(
+                    process,
+                    {"jsonrpc": "2.0", "id": 6, "method": "session/read", "params": {"sessionId": canonical_id, "excludeItems": False}},
+                    deadline,
+                )
+                replay = self._msp_wait(process, 6, deadline, notifications)
+                observation_fold.consume_session_snapshot(replay, str(replay.get("viewCursor", "session/read:6")))
+                history = replay.get("history")
+                conformance_evidence = MuseRuntimeConformanceEvidence(
+                    task_list_observed=conformance_evidence.task_list_observed,
+                    session_replay_observed=isinstance(history, dict) and history.get("mode") == "inline",
+                    task_result_delivery_observed=conformance_evidence.task_result_delivery_observed,
+                    continuation_ownership=conformance_evidence.continuation_ownership,
+                )
+                observation_fold.support = detect_muse_background_support(initialized, conformance_evidence)
+                self._last_background_observation = observation_fold.observation()
+                persist_muse_observation(job_observer.store, job_observer.job.job_id, job_observer.executor_token, self._last_background_observation)
+                if self._last_background_observation.tasks and not observation_fold.support.supported:
+                    raise RuntimeError("Muse background completion is not supported by this observed runtime: " + observation_fold.support.reason)
+            # A single-turn host remains open waiting for more input. Close our
+            # input after completion, then consume every remaining notification
+            # through host EOF so a later contradictory terminal cannot escape
+            # correlation checks merely by arriving after the first terminal.
+            diag.enter_phase("post_terminal_host_exit_wait")
+            if process.stdin is not None:
+                process.stdin.close()
+                diag.stdin_closed()
+            host_wait = diag.begin_operation("host_exit_wait")
+            # ``session/read`` may be decoded in the same read as notifications
+            # that follow its response. Start at the last event consumed by the
+            # foreground/native loop, not at the current list length.
+            drain_cursor = notification_cursor
+
+            def persist_drained_observations() -> None:
+                nonlocal drain_cursor
+                if observation_fold is None or job_observer is None:
+                    drain_cursor = len(notifications)
+                    return
+                for drained_event in notifications[drain_cursor:]:
+                    observation_fold.consume(drained_event)
+                    self._last_background_observation = observation_fold.observation()
+                    if not persist_muse_observation(
+                        job_observer.store,
+                        job_observer.job.job_id,
+                        job_observer.executor_token,
+                        self._last_background_observation,
+                    ):
+                        raise RuntimeError("Muse shutdown activity could not be fenced to the local job")
+                drain_cursor = len(notifications)
+
+            try:
+                while True:
+                    poll_deadline = min(deadline, time.monotonic() + 0.05)
+                    try:
+                        self._msp_wait(process, -1, poll_deadline, notifications, clean_eof=True)
+                    except AutoCoderTimeoutError:
+                        if process.poll() is not None:
+                            break
+                        if time.monotonic() >= deadline:
+                            raise
+                    finally:
+                        persist_drained_observations()
+            except _MspEndOfStream:
+                persist_drained_observations()
+            finally:
+                diag.end_operation(host_wait)
+            diag.enter_phase("result_validation")
+            for event in notifications:
+                params_obj = event.get("params")
+                if event.get("method") != "turn/completed":
+                    continue
+                if not isinstance(params_obj, dict) or params_obj.get("turnId") != turn_id:
+                    if observation_fold is not None and isinstance(params_obj, dict):
+                        continue
+                    raise RuntimeError("Muse MSP terminal belongs to an incompatible turn")
+                if params_obj.get("sessionId") != canonical_id:
+                    raise RuntimeError("Muse MSP terminal belongs to an incompatible session")
+                if params_obj.get("terminal") != terminal.get("terminal"):
+                    raise RuntimeError("Muse MSP host reported conflicting terminal outcomes for the turn")
+            self._assert_approvals_settled()
+            valid_answer_turns = {turn_id}
+            if self._last_background_observation is not None and self._last_background_observation.final_assistant_turn:
+                valid_answer_turns.add(self._last_background_observation.final_assistant_turn)
+            answers: list[str] = []
+            for event in notifications:
+                params_obj = event.get("params")
+                if event.get("method") != "item/completed" or not isinstance(params_obj, dict):
+                    continue
+                if params_obj.get("sessionId") != canonical_id:
+                    raise RuntimeError("Muse MSP assistant item belongs to an incompatible session")
+                item = params_obj.get("item")
+                if isinstance(item, dict) and item.get("turnId") in valid_answer_turns and item.get("kind") in {"message", "agentMessage"} and item.get("status") == "completed" and (item.get("kind") == "agentMessage" or item.get("role") == "assistant") and isinstance(item.get("text"), str):
+                    answers.append(str(item["text"]))
+            if not answers:
+                raise RuntimeError("Muse MSP turn completed without final assistant text")
+            completed_session_id = canonical_id
+            observed_output = self._last_background_observation.final_assistant if self._last_background_observation is not None else ""
+            if observation_fold is not None and not observed_output:
+                raise RuntimeError("Muse final output became stale while newer session activity remained unresolved")
+            final_output = observed_output or answers[-1]
+            if job_observer is not None:
+                continuation = job_observer.store.get_continuation(job_observer.job.job_id)
+                if continuation is None or not job_observer.store.record_candidate_output(
+                    job_observer.job.job_id,
+                    job_observer.executor_token,
+                    continuation.frontier,
+                    final_output,
+                ):
+                    raise RuntimeError("Muse final output could not be fenced to the observed result frontier")
+                final_continuation_frontier = continuation.frontier
+        except subprocess.TimeoutExpired as exc:
+            invocation_error = AutoCoderTimeoutError(f"Muse MSP invocation timed out after {self.timeout} seconds")
+            invocation_error.__cause__ = exc
+            diag.failure(invocation_error)
+        except BaseException as exc:
+            invocation_error = exc
+            diag.failure(exc)
+        finally:
+            if process is not None:
+                diag.enter_phase("writer_settlement")
+                if process.stdin is not None:
+                    try:
+                        process.stdin.close()
+                        diag.stdin_closed()
+                    except OSError:
+                        pass
+                if invocation_error is None:
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        pass
+                try:
+                    self._settle_process_group(process)
+                    if process.poll() is None:
+                        process.wait(timeout=2)
+                    if boundary is not None:
+                        # Settlement is independent of protocol/result success.
+                        # Failed turns must also release their execution lease.
+                        boundary.record_writer_completion(boundary.binding.invocation_id)
+                    diag.settlement_result("confirmed")
+                except BaseException as settlement_error:
+                    diag.settlement_result("failed")
+                    diag.failure(settlement_error, "writer_settlement")
+                    if invocation_error is None:
+                        invocation_error = settlement_error
+                    else:
+                        invocation_error.add_note(f"Muse writer settlement also failed: {settlement_error}")
+                if process.returncode != 0 and invocation_error is None:
+                    invocation_error = RuntimeError(f"Muse MSP host exited with nonzero status {process.returncode}")
+                    diag.failure_hint("host_exit_nonzero")
+                    diag.failure(invocation_error, "writer_settlement")
+            try:
+                # Editable work executes in the controller-owned private repository.
+                # Its Git index, HEAD, refs, branches, stashes, and worktrees are
+                # implementation state and must survive for generation handoff.
+                # Only no-edit turns retain the mutation audit and exact snapshot
+                # invariant.
+                if effective_noedit:
+                    diag.enter_phase("result_validation")
+                    assert trace_path is not None
+                    assert before is not None
+                    mutation_observed = self._trace_contains_git_mutation(trace_path)
+                    self._assert_invariants(before, True, mutation_observed)
+            except BaseException as invariant_error:
+                diag.failure(invariant_error, "result_validation")
+                self._last_session_id = None
+                if invocation_error is None:
+                    invocation_error = invariant_error
+                else:
+                    invocation_error.add_note(f"Muse repository invariant check also failed: {invariant_error}")
+            finally:
+                if trace_path is not None:
+                    os.unlink(trace_path)
+
+        if invocation_error is not None:
+            self._last_session_id = None
+            raise invocation_error.with_traceback(invocation_error.__traceback__)
+        if completed_session_id is None or final_output is None:
+            self._last_session_id = None
+            raise RuntimeError("Muse MSP invocation ended without a completed result")
+        if job_observer is not None:
+            confirmed = final_continuation_frontier is not None and job_observer.store.confirm_final_output(
+                job_observer.job.job_id,
+                job_observer.executor_token,
+                final_continuation_frontier,
+            )
+            if not confirmed and session_id is not None:
+                from .muse_retained_result import confirm_muse_retained_result
+
+                confirmed = confirm_muse_retained_result(job_observer.store, job_observer.job)
+            if not confirmed:
+                self._last_session_id = None
+                raise RuntimeError("Muse final output changed or remained unresolved before writer settlement")
+        self._last_session_id = completed_session_id
+        if boundary is not None:
+            boundary.record_violation_observation(boundary.binding.invocation_id)
+        return final_output
+
+    def _run_llm_cli(self, prompt: str, is_noedit: bool = False) -> str:
+        return self._run_msp_turn(prompt, is_noedit, None)
+
+    def continue_session(self, session_id: str, prompt: str, is_noedit: bool = False) -> str:
+        return self._run_msp_turn(prompt, is_noedit, session_id)
+
+    def get_last_session_id(self) -> Optional[str]:
+        return self._last_session_id
+
+    def get_last_background_observation(self) -> Optional[MuseBackgroundObservation]:
+        return self._last_background_observation
+
+    def check_mcp_server_configured(self, server_name: str) -> bool:
+        return False
+
+    def add_mcp_server_config(self, server_name: str, command: str, args: list[str]) -> bool:
+        return False

@@ -1,0 +1,350 @@
+import importlib.util
+import json
+import os
+import subprocess
+from pathlib import Path
+
+import pytest
+import yaml
+
+RUNNER = Path(__file__).parents[1] / "prompt-evals/run_prompt_evals.py"
+REPOSITORY_ROOT = Path(__file__).parents[1]
+pytestmark = pytest.mark.usefixtures("_use_real_commands")
+
+
+def commit(repo: Path, message: str) -> str:
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", message], cwd=repo, check=True, capture_output=True)
+    return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+
+
+def setup_repo(tmp_path: Path, targets: list[dict[str, object]]) -> tuple[Path, str]:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+    (tmp_path / "prompt-evals").mkdir()
+    (tmp_path / "prompt-evals/registry.json").write_text(json.dumps({"schema_version": 1, "targets": targets}))
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src/prompts.yaml").write_text("a: {prompt: original}\nb: {prompt: original}\nshared: original\nshared.safety: original\n")
+    return tmp_path, commit(tmp_path, "base")
+
+
+def invoke(repo: Path, base: str, fake_npx: Path) -> subprocess.CompletedProcess[str]:
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    return subprocess.run(["python", str(RUNNER), "--repo", str(repo), "--base", base, "--head", head, "--npx", str(fake_npx)], text=True, capture_output=True)
+
+
+def target(name: str, keys: list[str]) -> dict[str, object]:
+    root = f"prompt-evals/targets/{name}"
+    return {"id": name, "prompt_dependencies": [{"path": "src/prompts.yaml", "keys": keys}], "config": f"{root}/promptfooconfig.yaml", "cases": [f"{root}/cases/*.yaml"]}
+
+
+def fake_npx(tmp_path: Path) -> Path:
+    script = tmp_path / "npx"
+    script.write_text('#!/bin/sh\nprintf \'%s\\n\' "$*" >> "$NPX_LOG"\n' "for last; do :; done\n" 'printf \'%s\\n\' \'{"results":{"results":[{"success":true}]}}\' > "$last"\n' 'exit "${NPX_EXIT:-0}"\n')
+    script.chmod(0o755)
+    return script
+
+
+def test_empty_registry_and_unrelated_change_do_not_invoke_provider(tmp_path: Path) -> None:
+    repo, base = setup_repo(tmp_path, [])
+    (repo / "unrelated.py").write_text("value = 1\n")
+    commit(repo, "unrelated")
+    result = invoke(repo, base, repo / "missing-npx")
+    assert result.returncode == 0
+    assert "No prompt-evaluation targets affected" in result.stdout
+
+
+def test_prompt_regression_workflow_is_active_and_advisory() -> None:
+    assert not (REPOSITORY_ROOT / ".github/workflows/prompt-regression.yml.disabled").exists()
+    workflow = yaml.safe_load((REPOSITORY_ROOT / ".github/workflows/prompt-regression.yml").read_text())
+    assert workflow["permissions"] == {"contents": "read"}
+    job = workflow["jobs"]["selective-prompt-evals"]
+    assert "if" not in job
+    assert workflow["on"]["pull_request"]["types"] == ["opened", "synchronize", "reopened"]
+    steps = job["steps"]
+    evaluation_step = next(step for step in steps if step.get("name") == "Run selective advisory evaluation")
+    assert evaluation_step["env"]["CODEX_AUTH_JSON"] == "${{ secrets.CODEX_AUTH_JSON }}"
+    assert "--require-credentials" in evaluation_step["run"]
+    assert "--untrusted" in evaluation_step["run"]
+
+    reporting = yaml.safe_load((REPOSITORY_ROOT / ".github/workflows/prompt-regression-report.yml").read_text())
+    assert reporting["permissions"]["pull-requests"] == "write"
+    script = reporting["jobs"]["publish"]["steps"][-1]["with"]["script"]
+    assert "github-actions[bot]" in script
+    assert "<!-- auto-coder:prompt-regression-advisory:v1 -->" in script
+    assert "observed.pull_requests.length !== 1" in script
+
+    config = yaml.safe_load((REPOSITORY_ROOT / "prompt-evals/targets/individual-objective-scope/promptfooconfig.yaml").read_text())
+    provider = config["providers"][0]
+    assert provider == {
+        "id": "openai:codex-sdk:gpt-5.6-sol",
+        "config": {
+            "sandbox_mode": "read-only",
+            "model_reasoning_effort": "high",
+        },
+    }
+
+
+def test_incremental_rereview_semantic_cases_use_production_prompt_and_record_execution() -> None:
+    from auto_coder.prompt_loader import get_prompt_template
+
+    target = REPOSITORY_ROOT / "prompt-evals/targets/incremental-pr-rereview"
+    registry = json.loads((REPOSITORY_ROOT / "prompt-evals/registry.json").read_text())
+    registered = next(item for item in registry["targets"] if item["id"] == "incremental-pr-rereview")
+    assert registered["config"] == "prompt-evals/targets/incremental-pr-rereview/promptfooconfig.yaml"
+    assert registered["cases"] == ["prompt-evals/targets/incremental-pr-rereview/cases/*.yaml"]
+    assert registered["prompt_dependencies"] == [
+        {
+            "path": "src/auto_coder/prompts.yaml",
+            "keys": [
+                "pr.adversarial_validation",
+                "pr.adversarial_validation_rereview",
+                "policies.objective_requirements_boundary",
+                "policies.parent_child_contract_boundary",
+                "policies.pr_validation_contract_boundary",
+                "policies.bounded_correction_contract",
+                "policies.task_scoped_test_execution",
+            ],
+        }
+    ]
+    config = yaml.safe_load((target / "promptfooconfig.yaml").read_text())
+    assert config["tests"] == ["file://cases.py:generate_tests"]
+    spec = importlib.util.spec_from_file_location("incremental_pr_rereview_prompt", target / "prompt.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    prompts = yaml.safe_load((REPOSITORY_ROOT / "src/auto_coder/prompts.yaml").read_text())
+    assert module._production_template(prompts, prompts["pr"]["adversarial_validation"]) == get_prompt_template("pr.adversarial_validation")
+    assert module._production_template(prompts, prompts["pr"]["adversarial_validation_rereview"]) == get_prompt_template("pr.adversarial_validation_rereview")
+
+    case_document = yaml.safe_load((target / "cases/policy.yaml").read_text())
+    cases = case_document["tests"]
+    assert len(cases) == 3
+    case_spec = importlib.util.spec_from_file_location("incremental_pr_rereview_cases", target / "cases.py")
+    assert case_spec is not None and case_spec.loader is not None
+    case_module = importlib.util.module_from_spec(case_spec)
+    case_spec.loader.exec_module(case_module)
+    assert case_module.generate_tests() == cases
+    assert [case["vars"]["id"] for case in cases] == [
+        "fixed-original-oracle-converges",
+        "unrelated-variant-and-parent-demand-are-not-blockers",
+        "correction-induced-material-defect-blocks",
+    ]
+    rendered = module.render({"vars": cases[0]["vars"]})
+    assert "Previous reviewed head: accepted-head" in rendered
+    assert "Current head: current-head" in rendered
+    assert "TOG-original-oracle" in rendered
+    assert "Stable Issue Requirement Manifest:\nManifest mode: explicit\n- REQ-001:" in rendered
+    assert "Do not rely on access to a previous provider conversation" in " ".join(rendered.split())
+    for case in cases:
+        case_prompt = module.render({"vars": case["vars"]})
+        assert "CONTROLLER CORRECTION REFERENCES:\nnull\n" in case_prompt
+        assert "$correction_references" not in case_prompt
+
+    record = json.loads((target / "execution-record.json").read_text())
+    assert record["local_real_model_executed"] is False
+    assert record["local_outcome"] == "NOT_RUN"
+    assert "did not execute a real semantic model" in record["local_reason"]
+    assert record["observed_ci_execution"]["real_model_executed"] is True
+    assert record["observed_ci_execution"]["executed_cases"] == 3
+    assert set(record["observed_ci_execution"]["observations"]) == set(case["vars"]["id"] for case in cases)
+
+
+def test_prompt_key_and_shared_dependencies_select_only_affected_targets(tmp_path: Path) -> None:
+    targets = [target("a", ["a.prompt", "shared"]), target("b", ["b.prompt", "shared"]), target("c", ["b.prompt"])]
+    repo, base = setup_repo(tmp_path, targets)
+    for name in ("a", "b", "c"):
+        directory = repo / f"prompt-evals/targets/{name}"
+        (directory / "cases").mkdir(parents=True)
+        (directory / "promptfooconfig.yaml").write_text("description: test\n")
+        (directory / "cases/case.yaml").write_text("tests: [{vars: {id: smoke}}]\n")
+    commit(repo, "register fixtures")
+    base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    (repo / "src/prompts.yaml").write_text("a: {prompt: changed}\nb: {prompt: original}\nshared: original\n")
+    commit(repo, "change a")
+    log = repo / "npx.log"
+    os.environ["NPX_LOG"] = str(log)
+    result = invoke(repo, base, fake_npx(repo))
+    assert result.returncode == 0
+    assert "target: a" in result.stdout
+    assert "target: b" not in result.stdout
+    assert "target: c" not in result.stdout
+    assert log.read_text().count("promptfoo@0.122.2") == 1
+
+    base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    (repo / "src/prompts.yaml").write_text("a: {prompt: changed}\nb: {prompt: original}\nshared: changed\n")
+    commit(repo, "change shared")
+    log.unlink()
+    result = invoke(repo, base, fake_npx(repo))
+    assert result.returncode == 0
+    assert "target: a" in result.stdout and "target: b" in result.stdout
+    assert "target: c" not in result.stdout
+    assert log.read_text().count("promptfoo@0.122.2") == 2
+
+
+def test_flat_dotted_shared_dependency_selects_only_consumers(tmp_path: Path) -> None:
+    targets = [target("a", ["shared.safety"]), target("b", ["shared.safety"]), target("independent", ["a.prompt"])]
+    repo, base = setup_repo(tmp_path, targets)
+    for name in ("a", "b", "independent"):
+        directory = repo / f"prompt-evals/targets/{name}"
+        (directory / "cases").mkdir(parents=True)
+        (directory / "promptfooconfig.yaml").write_text("description: test\n")
+        (directory / "cases/case.yaml").write_text("tests: [{vars: {id: smoke}}]\n")
+    commit(repo, "evaluation fixtures")
+    base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    (repo / "src/prompts.yaml").write_text("a: {prompt: original}\nb: {prompt: original}\nshared: original\nshared.safety: changed\n")
+    commit(repo, "change flat shared prompt")
+    log = repo / "npx.log"
+    os.environ["NPX_LOG"] = str(log)
+    result = invoke(repo, base, fake_npx(repo))
+    assert result.returncode == 0
+    assert "target: a" in result.stdout and "target: b" in result.stdout
+    assert "target: independent" not in result.stdout
+    assert log.read_text().count("promptfoo@0.122.2") == 2
+
+
+def test_renamed_dependency_is_not_silently_ignored(tmp_path: Path) -> None:
+    repo, base = setup_repo(tmp_path, [target("a", ["a.prompt"])])
+    directory = repo / "prompt-evals/targets/a"
+    (directory / "cases").mkdir(parents=True)
+    (directory / "promptfooconfig.yaml").write_text("description: test\n")
+    (directory / "cases/case.yaml").write_text("tests: [{vars: {id: smoke}}]\n")
+    commit(repo, "evaluation fixtures")
+    base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    (repo / "src/prompts.yaml").rename(repo / "src/renamed.yaml")
+    commit(repo, "rename prompt dependency")
+    log = repo / "npx.log"
+    os.environ["NPX_LOG"] = str(log)
+    result = invoke(repo, base, fake_npx(repo))
+    assert result.returncode == 0
+    assert "target: a" in result.stdout
+    assert log.read_text().count("promptfoo@0.122.2") == 1
+
+
+def test_recursive_corpus_change_selects_owning_target(tmp_path: Path) -> None:
+    recursive = target("a", ["a.prompt"])
+    recursive["cases"] = ["prompt-evals/targets/a/cases/**/*.yaml"]
+    repo, base = setup_repo(tmp_path, [recursive, target("b", ["b.prompt"])])
+    for name in ("a", "b"):
+        directory = repo / f"prompt-evals/targets/{name}"
+        (directory / "cases/deep/nested").mkdir(parents=True)
+        (directory / "promptfooconfig.yaml").write_text("description: test\n")
+        (directory / "cases/deep/nested/case.yaml").write_text("tests: [{vars: {id: smoke}}]\n")
+    commit(repo, "evaluation fixtures")
+    base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    (repo / "prompt-evals/targets/a/cases/deep/nested/case.yaml").write_text("tests: [{vars: {changed: true}}]\n")
+    commit(repo, "change nested case")
+    log = repo / "npx.log"
+    os.environ["NPX_LOG"] = str(log)
+    result = invoke(repo, base, fake_npx(repo))
+    assert result.returncode == 0
+    assert "target: a" in result.stdout
+    assert "target: b" not in result.stdout
+    assert log.read_text().count("promptfoo@0.122.2") == 1
+
+
+@pytest.mark.parametrize(
+    ("pattern", "hidden_path"),
+    [
+        ("prompt-evals/targets/a/cases/*.yaml", ".notes.yaml"),
+        ("prompt-evals/targets/a/cases/**/*.yaml", ".draft/note.yaml"),
+    ],
+)
+def test_hidden_files_excluded_by_corpus_glob_do_not_select_target(tmp_path: Path, pattern: str, hidden_path: str) -> None:
+    registered = target("a", ["a.prompt"])
+    registered["cases"] = [pattern]
+    repo, base = setup_repo(tmp_path, [registered])
+    directory = repo / "prompt-evals/targets/a"
+    (directory / "cases").mkdir(parents=True)
+    (directory / "promptfooconfig.yaml").write_text("tests: cases/case.yaml\n")
+    (directory / "cases/case.yaml").write_text("tests: [{vars: {id: smoke}}]\n")
+    hidden = directory / "cases" / hidden_path
+    hidden.parent.mkdir(parents=True, exist_ok=True)
+    hidden.write_text("draft: original\n")
+    commit(repo, "evaluation fixtures")
+    base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    hidden.write_text("draft: changed\n")
+    commit(repo, "change excluded draft")
+    result = invoke(repo, base, repo / "missing-npx")
+    assert result.returncode == 0
+    assert "No prompt-evaluation targets affected" in result.stdout
+    assert "Evaluating affected target" not in result.stdout
+
+
+def test_corpus_change_runs_promptfoo_and_propagates_failure(tmp_path: Path) -> None:
+    repo, base = setup_repo(tmp_path, [target("a", ["a.prompt"])])
+    directory = repo / "prompt-evals/targets/a"
+    (directory / "cases").mkdir(parents=True)
+    (directory / "promptfooconfig.yaml").write_text("description: test\n")
+    commit(repo, "config")
+    base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    (directory / "cases/new.yaml").write_text("tests: [{vars: {id: smoke}}]\n")
+    commit(repo, "case")
+    os.environ["NPX_LOG"] = str(repo / "npx.log")
+    os.environ["NPX_EXIT"] = "7"
+    result = invoke(repo, base, fake_npx(repo))
+    os.environ.pop("NPX_EXIT")
+    assert result.returncode == 7
+    assert "target: a" in result.stdout
+
+
+def test_selected_empty_executable_set_is_not_run_without_credentials(tmp_path: Path) -> None:
+    repo, base = setup_repo(tmp_path, [target("a", ["a.prompt"])])
+    directory = repo / "prompt-evals/targets/a"
+    (directory / "cases").mkdir(parents=True)
+    (directory / "promptfooconfig.yaml").write_text("description: test\n")
+    commit(repo, "config")
+    base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    (directory / "cases/empty.yaml").write_text("tests: []\n")
+    commit(repo, "empty corpus")
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    report = repo / "report.json"
+
+    result = subprocess.run(
+        [
+            "python",
+            str(RUNNER),
+            "--repo",
+            str(repo),
+            "--base",
+            base,
+            "--head",
+            head,
+            "--npx",
+            str(repo / "missing-npx"),
+            "--report",
+            str(report),
+            "--require-credentials",
+        ],
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0
+    record = json.loads(report.read_text())
+    assert record["base_sha"] == base
+    assert record["head_sha"] == head
+    assert record["selected_targets"] == ["a"]
+    assert record["targets"] == [
+        {
+            "executed_cases": 0,
+            "expected_cases": 0,
+            "failures": [],
+            "id": "a",
+            "outcome": "NOT_RUN",
+            "reason": "Selected corpus has no executable cases; no provider was invoked.",
+        }
+    ]
+
+
+def test_malformed_affected_dependency_fails_closed(tmp_path: Path) -> None:
+    broken = target("a", ["a.prompt"])
+    broken["prompt_dependencies"] = [{"path": "src/prompts.yaml", "keys": "a.prompt"}]
+    repo, base = setup_repo(tmp_path, [broken])
+    (repo / "src/prompts.yaml").write_text("a: {prompt: changed}\n")
+    commit(repo, "prompt")
+    result = invoke(repo, base, repo / "missing-npx")
+    assert result.returncode == 2
+    assert "failed closed" in result.stderr

@@ -1,0 +1,413 @@
+import json
+
+import pytest
+
+from auto_coder.objective_evidence import ObjectiveAnchor, ObjectiveExtraction
+from auto_coder.requirement_contract import build_normative_issue_manifest
+from auto_coder.specification_analyzer import (
+    IncrementalReviewContext,
+    IndividualRelationshipContext,
+    IndividualReviewEvidence,
+)
+from auto_coder.specification_analyzer import analyze_issue_specification as _analyze_issue_specification
+from auto_coder.specification_analyzer import parse_incremental_specification_response, parse_specification_analysis_response
+from tests.support.individual_review_evidence import prompt_evidence
+
+
+def analyze_issue_specification(manifest, issue_body, **kwargs):
+    kwargs.setdefault(
+        "review_evidence",
+        IndividualReviewEvidence(
+            "{}",
+            objective=ObjectiveAnchor(manifest.issue_number, "UNANCHORED", None, "test:v1", ObjectiveExtraction("ABSENT")),
+        ),
+    )
+    return _analyze_issue_specification(manifest, issue_body, **kwargs)
+
+
+def _manifest():
+    return build_normative_issue_manifest(
+        1727,
+        "Independent preview contract",
+        "## Requirements\nREQ-001: Preview renders the selected draft.\nREQ-002: The result is JSON.\n\n## Context\nPreview must not alter live state.",
+    )
+
+
+def _response(verdict="READY", findings=None, remediation=None):
+    remediation = remediation or ("EDIT_IN_PLACE" if verdict == "BLOCKED" else "NONE")
+    return json.dumps(
+        {
+            "verdict": verdict,
+            "remediation": remediation,
+            "findings": findings or [],
+            "finding_dispositions": [],
+            "coverage": [{"boundary": boundary, "status": "FRESH", "no_impact_reason": ""} for boundary in ("REQ-001", "REQ-002", "contract-wide")],
+        }
+    )
+
+
+def _finding(category="hidden_requirement", requirement_ids=None):
+    return {
+        "category": category,
+        "requirement_ids": requirement_ids or [],
+        "explanation": "Live-state immutability is mandatory only in Context.",
+        "clarification": "Add an explicit Requirement forbidding live-state writes.",
+        "counterexample": "",
+        "missing_normative_boundary": "",
+    }
+
+
+def test_supported_manifest_origin_reaches_analysis_without_reparsing_body():
+    manifest = _manifest()
+    captured = []
+
+    def runner(prompt):
+        captured.append(prompt)
+        return _response("BLOCKED", [_finding()])
+
+    result = analyze_issue_specification(
+        manifest,
+        "## Requirements\nREQ-999: This conflicting raw Markdown must not enter the manifest.",
+        parent_context="REQ-888: Parent behavior is context only.",
+        prompt_runner=runner,
+    )
+
+    assert result.verdict == "BLOCKED"
+    assert result.findings[0].category == "hidden_requirement"
+    authoritative = prompt_evidence(captured[0])["current"]["manifest"]
+    assert authoritative["requirements"] == (
+        {"requirement_id": "REQ-001", "text": "Preview renders the selected draft."},
+        {"requirement_id": "REQ-002", "text": "The result is JSON."},
+    )
+    assert "REQ-999" not in {item["requirement_id"] for item in authoritative["requirements"]}
+    assert "REQ-999: This conflicting raw Markdown" in captured[0]
+    assert "Parent Issue context (non-normative evidence only)" in captured[0]
+
+
+def test_ready_preserves_implementation_freedom_and_missing_examples():
+    result = analyze_issue_specification(_manifest(), "No architecture or examples supplied.", prompt_runner=lambda _prompt: _response())
+    assert result.verdict == "READY"
+    assert result.is_ready is True
+    assert result.findings == ()
+    assert result.error is None
+
+
+def test_standalone_prompt_gets_closure_without_graph_obligations_from_body_marker():
+    captured = []
+    result = analyze_issue_specification(
+        _manifest(),
+        "Parent-Issue: #99",
+        prompt_runner=lambda prompt: captured.append(prompt) or _response(),
+    )
+
+    assert result.verdict == "READY"
+    prompt = captured[0]
+    assert "perform an ambiguity-closure pass" in prompt
+    assert "perform a next-review-prediction pass" in prompt
+    assert "Authoritative relationship role selected by the caller after reconciliation: standalone" in prompt
+    assert "A raw Parent-Issue marker in body evidence cannot select child behavior" in prompt
+
+
+def test_authoritative_child_context_adds_graph_checks_without_normative_inheritance():
+    captured = []
+    context = IndividualRelationshipContext(
+        role="child",
+        related_contracts='[{"issue_number": 99, "relationship": "parent", "body_non_normative_evidence": "Sibling C supplies tokens"}]',
+    )
+    result = analyze_issue_specification(
+        _manifest(),
+        "Child body",
+        relationship_context=context,
+        prompt_runner=lambda prompt: captured.append(prompt) or _response(),
+    )
+
+    assert result.verdict == "READY"
+    prompt = captured[0]
+    assert "Authoritative relationship role selected by the caller after reconciliation: child" in prompt
+    assert "report it as unstated_dependency and never silently inherit" in prompt
+    assert "parent-to-child and child-to-parent propagation" in prompt
+    assert "Sibling C supplies tokens" in prompt
+
+
+def test_invalid_relationship_role_fails_closed_before_provider_invocation():
+    invoked = []
+    result = analyze_issue_specification(
+        _manifest(),
+        "body",
+        relationship_context=IndividualRelationshipContext(role="parent"),
+        prompt_runner=lambda prompt: invoked.append(prompt) or _response(),
+    )
+    assert result.verdict == "ERROR"
+    assert result.error == "Specification analysis received an invalid authoritative relationship role"
+    assert invoked == []
+
+
+def test_external_reference_with_explicit_semantics_is_not_intrinsically_blocking():
+    manifest = build_normative_issue_manifest(
+        1772,
+        "Explicit persisted-state contract",
+        """## Requirements
+REQ-001: Read the existing `enabled` persisted field; when its authoritative value is `true`, display `Enabled`, and when it is `false`, display `Disabled`.
+REQ-002: Values other than the booleans `true` and `false` must produce the observable error `invalid enabled state` and must not display either status.
+""",
+    )
+    captured = []
+
+    result = analyze_issue_specification(
+        manifest,
+        "The field is part of the External Settings interface.",
+        prompt_runner=lambda prompt: captured.append(prompt) or _response("READY"),
+    )
+
+    assert result.verdict == "READY"
+    assert "External references are not defects by themselves" in captured[0]
+    assert "The blocker is missing normative semantics" in captured[0]
+    assert prompt_evidence(captured[0])["current"]["manifest"]["requirements"][0] == {"requirement_id": "REQ-001", "text": manifest.requirements[0].text}
+    assert "External Settings interface" in captured[0]
+    assert "Do not retrieve, inspect, or request" in captured[0]
+    assert "no retrieval tool exists" in captured[0]
+    assert "retrieval failure" in captured[0]
+    assert "restoring network access is not the clarification" in captured[0]
+    assert "genuine review execution or output-validation failure remains ERROR" in captured[0]
+
+
+def test_reference_retrieval_diagnostic_is_non_normative_and_does_not_trigger_recovery():
+    captured = []
+    result = analyze_issue_specification(
+        _manifest(),
+        "Optional provenance lookup reported curl: (6) Could not resolve host: example.invalid",
+        prompt_runner=lambda prompt: captured.append(prompt) or _response("READY"),
+    )
+
+    assert result.verdict == "READY"
+    assert result.remediation == "NONE"
+    assert result.findings == ()
+    assert "Never salvage or replace ERROR by recognizing a URL, DNS message" in captured[0]
+
+
+def test_scope_drift_evidence_is_rendered_only_as_remediation_evidence():
+    captured = []
+    evidence = IndividualReviewEvidence(
+        '{"title":"Original lifecycle boundary"}',
+        ('{"verdict":"BLOCKED","finding":"added persistence clarification"}',),
+        ObjectiveAnchor(1727, "UNANCHORED", None, "test:v1", ObjectiveExtraction("ABSENT")),
+    )
+    result = analyze_issue_specification(
+        _manifest(),
+        "Current authoritative body",
+        review_evidence=evidence,
+        prompt_runner=lambda prompt: captured.append(prompt) or _response("READY"),
+    )
+
+    assert result.verdict == "READY"
+    assert "Durable first-review baseline (non-normative evidence for remediation only" in captured[0]
+    assert "Original lifecycle boundary" in captured[0]
+    assert "added persistence clarification" in captured[0]
+    assert "historical drift or possible decomposition must never manufacture a finding" in captured[0]
+
+
+def test_false_success_requires_written_counterexample_and_boundary():
+    finding = _finding("false_success_gap", ["REQ-001"])
+    finding["counterexample"] = "Ordinary --only also bypasses capacity and still satisfies the stated rule."
+    finding["missing_normative_boundary"] = "The contract does not forbid bypass without both flags."
+    result = parse_specification_analysis_response(
+        json.dumps({"verdict": "BLOCKED", "remediation": "EDIT_IN_PLACE", "findings": [finding]}),
+        _manifest(),
+    )
+    assert result.verdict == "BLOCKED"
+    assert result.findings[0].requirement_ids == ("REQ-001",)
+    assert result.findings[0].counterexample.startswith("Ordinary --only")
+
+
+def test_incremental_parser_requires_complete_coverage_and_predecessor_dispositions():
+    predecessor = json.dumps({"findings": [{"finding_id": "decision-a:finding:1"}]})
+    context = IncrementalReviewContext("INCREMENTAL", "decision-a", predecessor, "{}")
+    response = json.dumps(
+        {
+            "verdict": "READY",
+            "remediation": "NONE",
+            "findings": [],
+            "finding_dispositions": [
+                {
+                    "finding_id": "decision-a:finding:1",
+                    "disposition": "RESOLVED",
+                    "reasoning": "The current Requirement now defines the previously missing boundary.",
+                }
+            ],
+            "coverage": [
+                {"boundary": "REQ-001", "status": "FRESH", "no_impact_reason": ""},
+                {
+                    "boundary": "REQ-002",
+                    "status": "CARRIED",
+                    "no_impact_reason": "The edit changes only REQ-001 and has no producer or consumer shared with JSON serialization.",
+                },
+                {"boundary": "contract-wide", "status": "FRESH", "no_impact_reason": ""},
+            ],
+        }
+    )
+
+    result = parse_incremental_specification_response(response, _manifest(), context)
+
+    assert result.verdict == "READY"
+    assert result.dispositions[0].disposition == "RESOLVED"
+    assert result.coverage[1].status == "CARRIED"
+
+    incomplete = json.loads(response)
+    incomplete["coverage"] = incomplete["coverage"][:-1]
+    refused = parse_incremental_specification_response(json.dumps(incomplete), _manifest(), context)
+    assert refused.verdict == "ERROR"
+    assert refused.error == "Specification analyzer did not establish complete current coverage"
+
+
+def test_full_review_rejects_carried_coverage_without_a_predecessor():
+    response = json.dumps(
+        {
+            "verdict": "READY",
+            "remediation": "NONE",
+            "findings": [],
+            "finding_dispositions": [],
+            "coverage": [
+                {"boundary": "REQ-001", "status": "CARRIED", "no_impact_reason": "unchanged"},
+                {"boundary": "REQ-002", "status": "CARRIED", "no_impact_reason": "unchanged"},
+                {"boundary": "contract-wide", "status": "CARRIED", "no_impact_reason": "unchanged"},
+            ],
+        }
+    )
+
+    result = parse_incremental_specification_response(response, _manifest(), IncrementalReviewContext("FULL"))
+
+    assert result.verdict == "ERROR"
+    assert result.error == "A FULL review cannot carry predecessor coverage"
+
+
+@pytest.mark.parametrize(
+    ("verdict", "remediation"),
+    [("READY", "EDIT_IN_PLACE"), ("ERROR", "REISSUE_REQUIRED"), ("BLOCKED", "NONE"), ("BLOCKED", "UNKNOWN")],
+)
+def test_invalid_verdict_remediation_combinations_fail_closed(verdict, remediation):
+    findings = [_finding()] if verdict == "BLOCKED" else []
+    result = parse_specification_analysis_response(_response(verdict, findings, remediation), _manifest())
+    assert result.verdict == "ERROR"
+    assert result.remediation == "NONE"
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        "The issue is READY.",
+        '{"findings": []}',
+        '{"verdict": "READY", "findings": [], "summary": "ready"}',
+        _response("READY", [_finding()]),
+        _response("BLOCKED", []),
+        _response("BLOCKED", [_finding("unknown")]),
+        _response("BLOCKED", [_finding(requirement_ids=["REQ-999"])]),
+        _response("ERROR", [_finding()]),
+        _response("false", []),
+    ],
+)
+def test_invalid_or_contradictory_model_output_fails_closed(response):
+    result = parse_specification_analysis_response(response, _manifest())
+    assert result.verdict == "ERROR"
+    assert result.is_ready is False
+    assert result.findings == ()
+    assert result.error
+
+
+def test_false_success_without_required_evidence_fails_closed():
+    result = parse_specification_analysis_response(_response("BLOCKED", [_finding("false_success_gap", ["REQ-001"])]), _manifest())
+    assert result.verdict == "ERROR"
+    assert result.findings == ()
+
+
+def test_invalid_authoritative_manifest_never_invokes_provider():
+    manifest = build_normative_issue_manifest(8, "Bad", "## Requirements\nREQ-001: First\nREQ-001: Duplicate")
+    invoked = []
+    result = analyze_issue_specification(manifest, "body", prompt_runner=lambda prompt: invoked.append(prompt) or _response())
+    assert result.verdict == "ERROR"
+    assert "duplicate IDs" in (result.error or "")
+    assert invoked == []
+
+
+def test_provider_failure_returns_error_not_a_policy_verdict():
+    def failing_runner(_prompt):
+        raise RuntimeError("provider unavailable")
+
+    result = analyze_issue_specification(_manifest(), "body", prompt_runner=failing_runner)
+    assert result.verdict == "ERROR"
+    assert result.findings == ()
+    assert result.error == "Specification analysis execution failed: RuntimeError"
+
+
+def test_provider_dns_failure_remains_error_not_reference_policy_success():
+    def failing_runner(_prompt):
+        raise RuntimeError("curl: (6) Could not resolve host: raw.githubusercontent.com")
+
+    result = analyze_issue_specification(_manifest(), "body", prompt_runner=failing_runner)
+    assert (result.verdict, result.remediation, result.findings) == ("ERROR", "NONE", ())
+    assert result.error == "Specification analysis execution failed: RuntimeError"
+
+
+@pytest.mark.parametrize("invalid_verdict", [[], {}])
+def test_public_operation_fails_closed_for_unhashable_verdict(invalid_verdict):
+    response = json.dumps({"verdict": invalid_verdict, "findings": []})
+    result = analyze_issue_specification(_manifest(), "body", prompt_runner=lambda _prompt: response)
+    assert result.verdict == "ERROR"
+    assert result.findings == ()
+    assert result.is_ready is False
+
+
+@pytest.mark.parametrize("invalid_remediation", [[], {}])
+@pytest.mark.parametrize("verdict", ["READY", "BLOCKED"])
+def test_public_operation_fails_closed_for_unhashable_remediation(invalid_remediation, verdict):
+    response = json.dumps({"verdict": verdict, "remediation": invalid_remediation, "findings": []})
+    result = analyze_issue_specification(_manifest(), "body", prompt_runner=lambda _prompt: response)
+    assert (result.verdict, result.remediation, result.findings) == ("ERROR", "NONE", ())
+    assert result.is_ready is False
+
+
+@pytest.mark.parametrize("invalid_category", [[], {}])
+def test_public_operation_fails_closed_for_unhashable_category(invalid_category):
+    finding = _finding()
+    finding["category"] = invalid_category
+    response = _response("BLOCKED", [finding])
+    result = analyze_issue_specification(_manifest(), "body", prompt_runner=lambda _prompt: response)
+    assert result.verdict == "ERROR"
+    assert result.findings == ()
+    assert result.is_ready is False
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        '{"verdict":"ERROR","verdict":"READY","findings":[]}',
+        '{"verdict":"READY","findings":[{"category":"hidden_requirement","requirement_ids":[],"explanation":"gap","clarification":"clarify","counterexample":"","missing_normative_boundary":""}],"findings":[]}',
+    ],
+)
+def test_public_operation_rejects_conflicting_duplicate_json_members(response):
+    result = analyze_issue_specification(_manifest(), "body", prompt_runner=lambda _prompt: response)
+    assert result.verdict == "ERROR"
+    assert result.findings == ()
+    assert result.is_ready is False
+
+
+@pytest.mark.parametrize("field", ["status", "disposition"])
+@pytest.mark.parametrize("value", [[], {}, None, True])
+def test_incremental_non_string_enums_return_error_without_raising(field, value):
+    manifest = _manifest()
+    context = IncrementalReviewContext("INCREMENTAL", predecessor_evidence=json.dumps({"findings": [{"finding_id": "old-finding"}]}))
+    payload = {
+        "verdict": "READY",
+        "remediation": "NONE",
+        "findings": [],
+        "finding_dispositions": [{"finding_id": "old-finding", "disposition": "RESOLVED", "reasoning": "No longer reachable."}],
+        "coverage": [{"boundary": boundary, "status": "FRESH", "no_impact_reason": ""} for boundary in [item.requirement_id for item in manifest.requirements] + ["contract-wide"]],
+    }
+    if field == "status":
+        payload["coverage"][0][field] = value
+    else:
+        payload["finding_dispositions"][0][field] = value
+
+    result = parse_incremental_specification_response(json.dumps(payload), manifest, context)
+
+    assert result.verdict == "ERROR"
+    assert result.findings == ()

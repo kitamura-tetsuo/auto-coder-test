@@ -1,0 +1,2768 @@
+"""
+Configuration management for LLM backends using TOML files.
+"""
+
+import contextvars
+import copy
+import os
+import tomllib
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
+from urllib.parse import urlparse
+
+import tomli_w
+
+from .logger_config import get_logger
+
+# Define implementation-required options for each backend type. Codex execution
+# policies are validated by mode in ``BackendConfig.validate_required_options``
+# and must never be injected as defaults.
+REQUIRED_OPTIONS_BY_BACKEND = {
+    "codex": [],
+    "claude": ["--dangerously-skip-permissions", "--allow-dangerously-skip-permissions"],
+    "antigravity": ["--dangerously-skip-permissions"],
+    "auggie": ["--print"],
+    "muse": [],
+    "qwen": ["-y"],
+    "jules": [],  # Session-based, no required flags
+    "codex-mcp": [],  # MCP-based, options flexible
+    "aider": [],  # Aider-based, options flexible
+    "opencode": [],  # Local CLI; the required "provider/model" value is validated by OpenCodeClient
+}
+
+# Resolved implementation types that are task-only remote backends: they accept
+# an Issue/PR submission and return asynchronously (a session or cloud task),
+# never a synchronous prompt response. Ordinary selection may pick one of these
+# as the dispatched candidate, but any synchronous manager (general LLM prompts,
+# no-edit/message generation, review) must exclude them from its own candidate
+# pool rather than try to use them as a synchronous client.
+TASK_ONLY_BACKEND_TYPES = {"codex-cloud", "claude-routine", "jules"}
+
+
+def resolve_config_path(config_path: Optional[str] = None) -> str:
+    """Resolve the configuration file path with priority rules.
+
+    Priority (highest to lowest):
+    1. Explicitly provided config_path argument
+    2. Environment variable AUTO_CODER_CONFIG_PATH or AUTO_CODER_LLM_CONFIG_PATH
+    3. .auto-coder/llm_config.toml in current directory
+    4. ~/.auto-coder/llm_config.toml in home directory
+
+    Args:
+        config_path: Optional explicit path to configuration file
+
+    Returns:
+        Absolute path to the configuration file to use
+    """
+    # Priority 1: Explicitly provided config_path
+    if config_path is not None:
+        expanded_path = os.path.expanduser(config_path)
+        return os.path.abspath(expanded_path)
+
+    # Priority 2: Environment variable override
+    env_config = os.environ.get("AUTO_CODER_CONFIG_PATH") or os.environ.get("AUTO_CODER_LLM_CONFIG_PATH")
+    if env_config:
+        return os.path.abspath(os.path.expanduser(env_config))
+
+    # Priority 3: Local .auto-coder/llm_config.toml
+    local_config = os.path.join(os.getcwd(), ".auto-coder", "llm_config.toml")
+    if os.path.exists(local_config):
+        return os.path.abspath(local_config)
+
+    # Priority 4: Home directory ~/.auto-coder/llm_config.toml
+    home_config = os.path.expanduser("~/.auto-coder/llm_config.toml")
+    return os.path.abspath(home_config)
+
+
+def resolve_repo_override_path(
+    repo_name: Optional[str],
+    override_root_dir: Optional[str] = None,
+    filename: str = "llm_config.toml",
+) -> Optional[str]:
+    """Resolve the repository-specific configuration override file path.
+
+    The path convention is:
+        ~/.auto-coder/<owner>/<repo>/<filename>
+
+    Repository overrides must be selected using the GitHub 'owner/name' identity
+    and mapped directly to the directory hierarchy under ~/.auto-coder.
+    The override location is independent of where the base configuration was loaded from.
+
+    Args:
+        repo_name: GitHub repository in 'owner/repo' format. If None, empty, or
+                   not in 'owner/repo' format, returns None.
+        override_root_dir: Optional override root directory (defaults to ~/.auto-coder).
+        filename: Name of the config file to resolve (defaults to 'llm_config.toml').
+
+    Returns:
+        Absolute path to the repository override configuration file, or None if invalid repo_name.
+    """
+    if not repo_name or not isinstance(repo_name, str):
+        return None
+
+    cleaned_repo = repo_name.strip().strip("/")
+    if "/" not in cleaned_repo:
+        # Repository matching must not depend only on the short repository name
+        return None
+
+    parts = cleaned_repo.split("/")
+    if len(parts) != 2:
+        return None
+
+    owner, repo = parts[0], parts[1]
+    if repo.endswith(".git"):
+        repo = repo[:-4]
+
+    if not owner or not repo:
+        return None
+
+    # Validate that owner and repo are valid GitHub identifiers (no path traversal, no . or ..)
+    import re
+
+    valid_identifier_pattern = re.compile(r"^[a-zA-Z0-9_.-]+$")
+    if not valid_identifier_pattern.match(owner) or not valid_identifier_pattern.match(repo):
+        return None
+    if owner in (".", "..") or repo in (".", ".."):
+        return None
+
+    if override_root_dir is not None:
+        base_dir = os.path.expanduser(override_root_dir)
+    else:
+        base_dir = os.path.expanduser("~/.auto-coder")
+
+    base_dir = os.path.abspath(base_dir)
+    override_path = os.path.abspath(os.path.join(base_dir, owner, repo, filename))
+
+    # Ensure resolved path is strictly inside base_dir
+    try:
+        common = os.path.commonpath([base_dir, override_path])
+        if common != base_dir:
+            return None
+    except ValueError:
+        return None
+
+    return override_path
+
+
+def deep_merge_config_dict(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    """Recursively merge repository override dictionary into base configuration dictionary.
+
+    Merge semantics:
+    - Scalar values: a repository override replaces the base value.
+    - Tables/objects: merge recursively so that sibling values not mentioned by the
+      override remain inherited from the base configuration.
+    - Arrays/lists: if an override specifies the value, replace the entire base array
+      rather than concatenating or partially merging it.
+    - Missing override keys: inherit from the base configuration.
+    - If incompatible override data is supplied (e.g., dict vs non-dict), fails with ValueError.
+
+    Args:
+        base: Base configuration dictionary.
+        override: Repository override configuration dictionary.
+
+    Returns:
+        New merged configuration dictionary without mutating the original inputs.
+
+    Raises:
+        ValueError: If invalid or incompatible override data is supplied.
+    """
+    if not isinstance(base, dict):
+        raise ValueError(f"Base configuration must be a dictionary, got {type(base).__name__}")
+    if not isinstance(override, dict):
+        raise ValueError(f"Override configuration must be a dictionary, got {type(override).__name__}")
+
+    merged: Dict[str, Any] = copy.deepcopy(base)
+
+    for key, override_val in override.items():
+        if key not in merged:
+            merged[key] = copy.deepcopy(override_val)
+        else:
+            base_val = merged[key]
+            if isinstance(base_val, dict) and isinstance(override_val, dict):
+                merged[key] = deep_merge_config_dict(base_val, override_val)
+            elif isinstance(base_val, dict) != isinstance(override_val, dict):
+                raise ValueError(f"Incompatible override type for key '{key}': base is {type(base_val).__name__}, " f"override is {type(override_val).__name__}")
+            elif isinstance(base_val, list) and not isinstance(override_val, list) and override_val is not None:
+                raise ValueError(f"Incompatible override type for key '{key}': base is list, " f"override is {type(override_val).__name__}")
+            elif not isinstance(base_val, list) and isinstance(override_val, list):
+                raise ValueError(f"Incompatible override type for key '{key}': base is {type(base_val).__name__}, " f"override is list")
+            else:
+                # Replace scalars or arrays as whole values
+                merged[key] = copy.deepcopy(override_val)
+
+    return merged
+
+
+def _normalize_backend_dict(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize environment / env_id alias keys inside a backend configuration dictionary."""
+    if not isinstance(data, dict):
+        return data
+    norm = dict(data)
+    if "environment" in norm:
+        norm["environment_id"] = norm.pop("environment")
+    if "env_id" in norm:
+        norm["environment_id"] = norm.pop("env_id")
+    return norm
+
+
+def _normalize_config_dict(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize aliases in configuration dictionary only for known backend tables."""
+    if not isinstance(data, dict):
+        return data
+
+    result: Dict[str, Any] = {}
+    backend_section_keys = {
+        "backend_cloud",
+        "backend_with_high_score",
+        "backend_with_high_score_cloud",
+        "backend_adversarial_validation",
+        "backend_issue_adversarial_validation",
+        "backend_pr_adversarial_validation",
+        "backend_strong_pr_adversarial_validation",
+    }
+
+    for key, value in data.items():
+        if key == "backends" and isinstance(value, dict):
+            norm_backends: Dict[str, Any] = {}
+            for b_name, b_val in value.items():
+                if isinstance(b_val, dict):
+                    norm_backends[b_name] = _normalize_backend_dict(b_val)
+                else:
+                    norm_backends[b_name] = b_val
+            result[key] = norm_backends
+        elif key in backend_section_keys and isinstance(value, dict):
+            result[key] = _normalize_backend_dict(value)
+        else:
+            result[key] = value
+    return result
+
+
+@dataclass
+class BackendConfig:
+    """Configuration for a single backend."""
+
+    name: str
+    enabled: bool = True
+    # Model name can be provided directly or will use backend default if None
+    model: Optional[str] = None
+    # Additional backend-specific settings
+    api_key: Optional[str] = None
+    base_url: Optional[str] = None
+    # LLM parameters
+    temperature: Optional[float] = None
+    timeout: Optional[int] = None
+    max_retries: Optional[int] = None
+    # For OpenAI-compatible backends
+    openai_api_key: Optional[str] = None
+    openai_base_url: Optional[str] = None
+    # For OpenRouter-compatible backends
+    openrouter_api_key: Optional[str] = None
+    openrouter_base_url: Optional[str] = None
+    # For Claude Code CLI authentication
+    claude_code_oauth_token: Optional[str] = None
+    # For Claude Routine authentication and URL
+    claude_code_routine_token: Optional[str] = None
+    url: Optional[str] = None
+    # Codex Cloud environment and best-of-N task settings
+    environment_id: Optional[str] = None
+    attempts: int = 1
+    # For custom configurations
+    extra_args: Dict[str, Any] = field(default_factory=dict)
+    # List of provider names available for this backend
+    # Schema: [backends.qwen].providers = ["qwen-open-router", ...]
+    providers: List[str] = field(default_factory=list)
+    # Retry configuration for usage limit handling
+    usage_limit_retry_count: int = 0
+    usage_limit_retry_wait_seconds: int = 0
+    # Additional options for the backend
+    options: List[str] = field(default_factory=list)
+    # Options for no-edit functionality (used in Claude CLI)
+    options_for_noedit: List[str] = field(default_factory=list)
+    # Options for resume functionality
+    options_for_resume: List[str] = field(default_factory=list)
+    # Type of backend
+    backend_type: Optional[str] = None
+    # Model provider (e.g., "openrouter", "anthropic", etc.)
+    model_provider: Optional[str] = None
+    # Always switch to next backend after execution
+    always_switch_after_execution: bool = False
+    # Path to settings file (for Claude backend)
+    settings: Optional[str] = None
+    # Usage markers for tracking usage patterns
+    usage_markers: List[str] = field(default_factory=list)
+    # Flags to track if options were explicitly set in configuration
+    options_explicitly_set: bool = False
+    options_for_noedit_explicitly_set: bool = False
+
+    @property
+    def environment(self) -> Optional[str]:
+        """Alias for environment_id."""
+        return self.environment_id
+
+    @environment.setter
+    def environment(self, value: Optional[str]) -> None:
+        self.environment_id = value
+
+    def __getattr__(self, name: str) -> Any:
+        """Allow accessing unrecognized table keys from extra_args."""
+        if name in ("extra_args", "__dataclass_fields__"):
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+        extra = self.__dict__.get("extra_args")
+        if isinstance(extra, dict) and name in extra:
+            return extra[name]
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
+    def validate_required_options(self, is_noedit: bool = False) -> List[str]:
+        """Validate required options for the requested execution mode.
+
+        No-edit Codex invocations do not rely on configured permission flags:
+        ``CodexClient`` removes unsafe options and enforces its read-only,
+        non-interactive policy. Editable Codex runs, however, need a configured
+        unattended execution policy.
+
+        Returns:
+            List of error messages (empty if valid)
+        """
+        errors: List[str] = []
+        # Use backend_type if available, otherwise fall back to name
+        backend_type = self.backend_type or self.name
+
+        if backend_type == "codex":
+            if is_noedit:
+                return errors
+
+            options = set(self.options)
+            has_unattended_policy = bool(
+                options
+                & {
+                    "--dangerously-bypass-approvals-and-sandbox",
+                    "--full-auto",
+                    "--yolo",
+                }
+            )
+            has_never_approval = any(option in {"--ask-for-approval=never", "-a=never", "-anever"} or (option in {"--ask-for-approval", "-a"} and index + 1 < len(self.options) and self.options[index + 1] == "never") for index, option in enumerate(self.options))
+            has_writable_sandbox = any(option in {"--sandbox=workspace-write", "-s=workspace-write", "-sworkspace-write"} or (option in {"--sandbox", "-s"} and index + 1 < len(self.options) and self.options[index + 1] == "workspace-write") for index, option in enumerate(self.options))
+            if has_unattended_policy or (has_never_approval and has_writable_sandbox):
+                return errors
+
+            errors.append(f"Backend '{self.name}' missing an unattended editable Codex execution policy. " "Configure --dangerously-bypass-approvals-and-sandbox, --full-auto, or " "--sandbox workspace-write with --ask-for-approval never.")
+            return errors
+
+        required = REQUIRED_OPTIONS_BY_BACKEND.get(backend_type, [])
+
+        for req_opt in required:
+            if req_opt not in self.options:
+                errors.append(f"Backend '{self.name}' missing required option: {req_opt}. " f"Add to [backends.{self.name}].options in llm_config.toml")
+
+        return errors
+
+    def replace_placeholders(
+        self,
+        model_name: Optional[str] = None,
+        session_id: Optional[str] = None,
+        settings: Optional[str] = None,
+    ) -> Dict[str, List[str]]:
+        """Replace placeholders in option lists with provided values.
+
+        Supports placeholders:
+        - [model_name] - replaced with the model_name parameter
+        - [sessionId] - replaced with the session_id parameter
+        - [settings] - replaced with the settings parameter
+
+        Args:
+            model_name: Model name to replace [model_name] placeholders
+            session_id: Session ID to replace [sessionId] placeholders
+            settings: Settings file path to replace [settings] placeholders
+
+        Returns:
+            Dictionary with processed option lists:
+            - 'options': processed options list
+            - 'options_for_noedit': processed options_for_noedit list
+            - 'options_for_resume': processed options_for_resume list
+        """
+        # Create a mapping of placeholders to their values
+        placeholder_map = {}
+        if model_name is not None:
+            placeholder_map["[model_name]"] = model_name
+        if session_id is not None:
+            placeholder_map["[sessionId]"] = session_id
+        if settings is not None:
+            placeholder_map["[settings]"] = settings
+
+        def replace_in_list(option_list: List[str]) -> List[str]:
+            """Replace placeholders in a single option list."""
+            if not placeholder_map:
+                # No placeholders to replace, return a copy of the original list
+                return list(option_list)
+
+            result = []
+            for option in option_list:
+                # Replace all placeholders in this option string
+                replaced_option = option
+                for placeholder, value in placeholder_map.items():
+                    replaced_option = replaced_option.replace(placeholder, value)
+                result.append(replaced_option)
+            return result
+
+        # Process all three option lists
+        return {
+            "options": replace_in_list(self.options),
+            "options_for_noedit": replace_in_list(self.options_for_noedit),
+            "options_for_resume": replace_in_list(self.options_for_resume),
+        }
+
+
+@dataclass
+class LLMBackendConfiguration:
+    """Main configuration class for LLM backends."""
+
+    # General backend settings
+    backend_order: List[str] = field(default_factory=list)
+    backend_priority_groups: List[List[str]] = field(default_factory=list)
+    backend_selector_explicit: bool = False
+    backend_selector_kind: Optional[str] = None
+    default_backend: str = "codex"
+    quota_selection_strategy: str = "surplus"
+    # Individual backend configurations
+    backends: Dict[str, BackendConfig] = field(default_factory=dict)
+    # Backend configuration for non-editing operations (message generation, etc.)
+    backend_for_noedit_order: List[str] = field(default_factory=list)
+    backend_for_noedit_default: Optional[str] = None
+    backend_for_noedit_explicit: bool = False
+    # Local PR CI/conflict repair selection is independent of remote Issue dispatch.
+    backend_for_failed_pr_order: List[str] = field(default_factory=list)
+    backend_for_failed_pr_explicit: bool = False
+    # Fallback backend configuration for failed PRs
+    backend_with_high_score: Optional[BackendConfig] = None
+    backend_with_high_score_order: List[str] = field(default_factory=list)
+    # Cloud backend configuration (e.g., for standard/non-difficult cloud tasks)
+    backend_cloud: Optional[BackendConfig] = None
+    backend_cloud_order: List[str] = field(default_factory=list)
+    backend_cloud_priority_groups: List[List[str]] = field(default_factory=list)
+    # Cloud backend configuration with high score (e.g., for difficult issues)
+    backend_with_high_score_cloud: Optional[BackendConfig] = None
+    backend_with_high_score_cloud_order: List[str] = field(default_factory=list)
+    # Backend configuration for strong-model adversarial validation
+    backend_adversarial_validation: Optional[BackendConfig] = None
+    backend_adversarial_validation_order: List[str] = field(default_factory=list)
+    backend_adversarial_validation_default: Optional[str] = None
+    # Dedicated backend configuration for Issue specification/decomposition adversarial validation.
+    # Falls back to backend_adversarial_validation when absent.
+    backend_issue_adversarial_validation: Optional[BackendConfig] = None
+    backend_issue_adversarial_validation_order: List[str] = field(default_factory=list)
+    backend_issue_adversarial_validation_default: Optional[str] = None
+    # Dedicated backend configuration for PR adversarial validation.
+    # Falls back to backend_adversarial_validation when absent.
+    backend_pr_adversarial_validation: Optional[BackendConfig] = None
+    backend_pr_adversarial_validation_order: List[str] = field(default_factory=list)
+    backend_pr_adversarial_validation_default: Optional[str] = None
+    # Dedicated backend configuration for strong PR adversarial validation.
+    # Distinct from ordinary PR review.
+    backend_strong_pr_adversarial_validation: Optional[BackendConfig] = None
+    backend_strong_pr_adversarial_validation_order: List[str] = field(default_factory=list)
+    backend_strong_pr_adversarial_validation_default: Optional[str] = None
+    # Environment variable overrides
+    env_prefix: str = "AUTO_CODER_"
+    # Configuration file path - relative to user's home directory
+    config_file_path: str = "~/.auto-coder/llm_config.toml"
+
+    def __post_init__(self) -> None:
+        """Initialize default backends if none are configured."""
+        if not self.backends:
+            # Add default configurations for known backends
+            default_backends = ["codex", "antigravity", "qwen", "auggie", "claude", "jules", "codex-mcp", "aider"]
+            for backend_name in default_backends:
+                self.backends[backend_name] = BackendConfig(name=backend_name)
+
+            # Set default options for backends that require them
+            # All backends here are newly created, so set required options for those that need them
+            for backend_name, required_options in REQUIRED_OPTIONS_BY_BACKEND.items():
+                if backend_name in self.backends and required_options:
+                    # Set required options since these backends were just created
+                    self.backends[backend_name].options = list(required_options)
+
+    @classmethod
+    def load_from_file(
+        cls,
+        config_path: Optional[str] = None,
+        repo_name: Optional[str] = None,
+    ) -> "LLMBackendConfiguration":
+        """Load configuration from TOML file, optionally merging a repository override."""
+        config_path = resolve_config_path(config_path)
+
+        if not os.path.exists(config_path):
+            if repo_name is None:
+                # Create a default configuration file if none exists
+                config = cls()
+                config.save_to_file(config_path)
+                return config
+            base_data: Dict[str, Any] = {}
+        else:
+            try:
+                with open(config_path, "rb") as f:
+                    base_data = tomllib.load(f)
+            except Exception as e:
+                raise ValueError(f"Error loading configuration from {config_path}: {e}")
+
+        base_data = _normalize_config_dict(base_data)
+        if "backend_cloud" in base_data:
+            raise ValueError(f"Retired key 'backend_cloud' is present in {config_path}; move ordinary selection to [backend]")
+        effective_data = base_data
+
+        # If repo_name is provided, check for repository-specific override
+        if repo_name:
+            override_path = resolve_repo_override_path(repo_name)
+            if override_path and os.path.exists(override_path):
+                try:
+                    with open(override_path, "rb") as f:
+                        override_data = tomllib.load(f)
+                except Exception as e:
+                    raise ValueError(f"Error loading repository configuration override from {override_path}: {e}")
+
+                if not isinstance(override_data, dict):
+                    raise ValueError(f"Repository configuration override at {override_path} must be a TOML table")
+
+                override_data = _normalize_config_dict(override_data)
+                if "backend_cloud" in override_data:
+                    raise ValueError(f"Retired key 'backend_cloud' is present in {override_path}; move ordinary selection to [backend]")
+                effective_data = deep_merge_config_dict(base_data, override_data)
+
+        try:
+            return cls._load_from_data(effective_data, config_path=config_path)
+        except Exception as e:
+            if isinstance(e, ValueError):
+                raise
+            raise ValueError(f"Error loading configuration: {e}")
+
+    @classmethod
+    def load_from_dict(cls, data: Dict[str, Any]) -> "LLMBackendConfiguration":
+        """Load configuration directly from a dictionary of configuration data."""
+
+        try:
+            return cls._load_from_data(_normalize_config_dict(data), config_path="<dict>")
+        except Exception as e:
+            raise ValueError(f"Error loading configuration from dict: {e}")
+
+    @classmethod
+    def _load_from_data(cls, data: Dict[str, Any], config_path: Optional[str] = None) -> "LLMBackendConfiguration":
+        data = _normalize_config_dict(data)
+
+        if "backend_cloud" in data:
+            source = config_path or "<configuration>"
+            raise ValueError(f"Retired key 'backend_cloud' is present in {source}; move ordinary selection to [backend]")
+
+        # Handle legacy "gemini" backend name translation
+        def _translate_backend(val: Any) -> Any:
+            if isinstance(val, str) and val == "gemini":
+                return "antigravity"
+            if isinstance(val, list):
+                return [_translate_backend(v) for v in val]
+            return val
+
+        # Parse general backend settings
+        backend_data = data.get("backend", {})
+        if not isinstance(backend_data, dict):
+            raise ValueError("backend must be a TOML table")
+        if "order" in backend_data and "priority_groups" in backend_data:
+            raise ValueError("backend.order and backend.priority_groups are mutually exclusive")
+
+        def _validate_identifiers(value: Any, label: str) -> List[str]:
+            if not isinstance(value, list):
+                raise ValueError(f"{label} must be an array of backend-name strings")
+            normalized: List[str] = []
+            for entry in value:
+                if not isinstance(entry, str) or not entry.strip():
+                    raise ValueError(f"each {label} member must be a non-blank backend name string")
+                normalized.append(_translate_backend(entry.strip()))
+            return normalized
+
+        backend_selector_explicit = "order" in backend_data or "priority_groups" in backend_data
+        backend_selector_kind = "priority_groups" if "priority_groups" in backend_data else "order" if "order" in backend_data else None
+        backend_order = _validate_identifiers(backend_data["order"], "backend.order") if "order" in backend_data else []
+        backend_for_failed_pr_explicit = "backend_for_failed_pr" in data
+        failed_pr_data = data.get("backend_for_failed_pr", {})
+        if not isinstance(failed_pr_data, dict) or (backend_for_failed_pr_explicit and set(failed_pr_data) != {"order"}):
+            raise ValueError("backend_for_failed_pr must be a TOML table containing only order")
+        backend_for_failed_pr_order = _validate_identifiers(failed_pr_data.get("order", []), "backend_for_failed_pr.order")
+        backend_priority_groups: List[List[str]] = []
+        if "priority_groups" in backend_data:
+            raw_groups = backend_data["priority_groups"]
+            if not isinstance(raw_groups, list):
+                raise ValueError("backend.priority_groups must be an array of non-empty backend-name arrays")
+            for group in raw_groups:
+                names = _validate_identifiers(group, "backend.priority_groups")
+                if not names:
+                    raise ValueError("each backend.priority_groups entry must be non-empty")
+                backend_priority_groups.append(names)
+        quota_selection_strategy = data.get("quota_selection", {}).get("strategy", "surplus")
+        if quota_selection_strategy not in ("surplus", "burst"):
+            raise ValueError("quota_selection.strategy must be 'surplus' or 'burst'")
+
+        # Determine default backend - prioritize explicit "default" field, then order[0], then fallback to "codex"
+        default_backend = _translate_backend(backend_data.get("default"))
+        if "default" in backend_data and (not isinstance(default_backend, str) or not default_backend.strip()):
+            raise ValueError("backend.default must be a non-blank backend name string")
+        if not default_backend:
+            if backend_order:
+                default_backend = backend_order[0]
+            else:
+                default_backend = "codex"
+        default_backend = default_backend.strip()
+
+        # Parse backends
+        backends_data = data.get("backends", {})
+        if "gemini" in backends_data and "antigravity" not in backends_data:
+            backends_data["antigravity"] = backends_data.pop("gemini")
+
+        backends: Dict[str, BackendConfig] = {}
+
+        # Helper to parse a backend config dict
+        def parse_backend_config(name: str, config_data: dict) -> BackendConfig:
+            # Set explicit flags based on whether options were actually specified in config
+            options_explicitly_set = "options" in config_data
+            options_for_noedit_explicitly_set = "options_for_noedit" in config_data
+
+            known_keys = {
+                "name",
+                "enabled",
+                "model",
+                "api_key",
+                "base_url",
+                "temperature",
+                "timeout",
+                "max_retries",
+                "openai_api_key",
+                "openai_base_url",
+                "openrouter_api_key",
+                "openrouter_base_url",
+                "claude_code_oauth_token",
+                "claude_code_routine_token",
+                "url",
+                "environment_id",
+                "environment",
+                "env_id",
+                "attempts",
+                "extra_args",
+                "providers",
+                "usage_limit_retry_count",
+                "usage_limit_retry_wait_seconds",
+                "options",
+                "backend_type",
+                "model_provider",
+                "always_switch_after_execution",
+                "settings",
+                "usage_markers",
+                "options_for_noedit",
+                "options_for_resume",
+                "options_explicitly_set",
+                "options_for_noedit_explicitly_set",
+                "order",
+                "priority_groups",
+            }
+
+            raw_extra_args = config_data.get("extra_args", {})
+            extra_args = dict(raw_extra_args) if isinstance(raw_extra_args, dict) else {}
+            for k, v in config_data.items():
+                if k not in known_keys:
+                    extra_args[k] = v
+
+            return BackendConfig(
+                name=name,
+                enabled=config_data.get("enabled", True),
+                model=config_data.get("model"),
+                api_key=config_data.get("api_key"),
+                base_url=config_data.get("base_url"),
+                temperature=config_data.get("temperature"),
+                timeout=config_data.get("timeout"),
+                max_retries=config_data.get("max_retries"),
+                openai_api_key=config_data.get("openai_api_key"),
+                openai_base_url=config_data.get("openai_base_url"),
+                openrouter_api_key=config_data.get("openrouter_api_key"),
+                openrouter_base_url=config_data.get("openrouter_base_url"),
+                claude_code_oauth_token=config_data.get("claude_code_oauth_token"),
+                claude_code_routine_token=config_data.get("claude_code_routine_token"),
+                url=config_data.get("url"),
+                environment_id=config_data.get("environment_id") or config_data.get("environment") or config_data.get("env_id"),
+                attempts=config_data.get("attempts", 1),
+                extra_args=extra_args,
+                providers=config_data.get("providers", []),
+                usage_limit_retry_count=config_data.get("usage_limit_retry_count", 0),
+                usage_limit_retry_wait_seconds=config_data.get("usage_limit_retry_wait_seconds", 0),
+                options=config_data.get("options", []),
+                backend_type=config_data.get("backend_type"),
+                model_provider=config_data.get("model_provider"),
+                always_switch_after_execution=config_data.get("always_switch_after_execution", False),
+                settings=config_data.get("settings"),
+                usage_markers=config_data.get("usage_markers", []),
+                options_for_noedit=config_data.get("options_for_noedit", []),
+                options_for_resume=config_data.get("options_for_resume", []),
+                options_explicitly_set=options_explicitly_set,
+                options_for_noedit_explicitly_set=options_for_noedit_explicitly_set,
+            )
+
+        # 1. Parse explicit [backends] section
+        # Track which backends were explicitly configured
+        explicitly_configured_backends = set()
+        for name, config_data in backends_data.items():
+            if isinstance(config_data, dict):
+                backends[name] = parse_backend_config(name, config_data)
+                explicitly_configured_backends.add(name)
+
+        # 2. Parse top-level backend definitions (e.g. [grok-4.1-fast])
+        # This handles cases where TOML parses dotted keys as nested dictionaries
+        # e.g. [grok-4.1-fast] -> {'grok-4': {'1-fast': {...}}}
+
+        def is_potential_backend_config(d: dict) -> bool:
+            # Heuristic: if it has specific backend keys, it's likely a config
+            # We check for keys that are commonly used in backend definitions
+            common_keys = {
+                "backend_type",
+                "model",
+                "api_key",
+                "base_url",
+                "url",
+                "claude_code_routine_token",
+                "openai_api_key",
+                "openai_base_url",
+                "openrouter_api_key",
+                "openrouter_base_url",
+                "providers",
+                "model_provider",
+                "always_switch_after_execution",
+                "settings",
+                "options",
+                "options_for_noedit",
+                "options_for_resume",
+            }
+            # Also check if 'enabled' is present, but it's very common so we combine it
+            # with the fact that we are looking for backends.
+            # If a dict has 'enabled' and is in the top-level (or nested from top-level),
+            # it's a strong candidate.
+            if "enabled" in d:
+                return True
+            return any(k in d for k in common_keys)
+
+        def find_backends_recursive(current_data: dict, prefix: str = ""):
+            for key, value in current_data.items():
+                if not isinstance(value, dict):
+                    continue
+
+                # Skip known non-backend dict fields to avoid false positives
+                if key in {"extra_args"}:
+                    continue
+
+                full_key = f"{prefix}.{key}" if prefix else key
+
+                # Check if this node itself is a backend config
+                if is_potential_backend_config(value):
+                    if full_key not in backends:
+                        backends[full_key] = parse_backend_config(full_key, value)
+                        explicitly_configured_backends.add(full_key)
+
+                # Recurse to find nested backends (e.g. grok-4.1-fast)
+                find_backends_recursive(value, full_key)
+
+        # Exclude reserved top-level keys from recursion
+        reserved_keys = {
+            "backend",
+            "backend_cloud",
+            "message_backend",
+            "backend_for_noedit",
+            "backend_for_failed_pr",
+            "backends",
+            "backend_with_high_score",
+            "backend_with_high_score_cloud",
+            "backend_adversarial_validation",
+            "backend_issue_adversarial_validation",
+            "backend_pr_adversarial_validation",
+        }
+        # Create a dict of potential top-level backends to recurse
+        potential_roots = {k: v for k, v in data.items() if k not in reserved_keys and isinstance(v, dict)}
+
+        find_backends_recursive(potential_roots)
+
+        # Post-processing: inherit options from parent backend if backend_type matches
+        # and options were not explicitly set in the child configuration
+        for backend_name, backend_config in backends.items():
+            if backend_config.backend_type and backend_config.backend_type in backends:
+                parent_config = backends[backend_config.backend_type]
+                # Inherit options if not explicitly set
+                if not backend_config.options_explicitly_set:
+                    backend_config.options = list(parent_config.options)
+                # Inherit options_for_noedit if not explicitly set
+                if not backend_config.options_for_noedit_explicitly_set:
+                    backend_config.options_for_noedit = list(parent_config.options_for_noedit)
+
+        # Add default backends if they are not already in the configuration
+        # This ensures that backends like 'jules' are available even if not explicitly defined in the file
+        default_backends = ["codex", "antigravity", "qwen", "auggie", "claude", "jules", "codex-mcp", "aider"]
+        for backend_name in default_backends:
+            if backend_name not in backends:
+                backends[backend_name] = BackendConfig(name=backend_name)
+
+        # Set default options for backends that require them
+        # Only add required options to backends that were NOT explicitly configured in the dict
+        # This preserves backward compatibility with old config dicts that don't have options field
+        for backend_name, required_options in REQUIRED_OPTIONS_BY_BACKEND.items():
+            if backend_name in backends and required_options:
+                backend = backends[backend_name]
+                # Only set required options if the backend was NOT explicitly configured
+                if backend_name not in explicitly_configured_backends:
+                    backend.options = list(required_options)
+
+        # Parse backend for non-editing operations settings
+        # Try new key first, then fall back to old key for backward compatibility
+        backend_for_noedit_order = _translate_backend(data.get("backend_for_noedit", {}).get("order", []))
+        backend_for_noedit_explicit = "backend_for_noedit" in data
+
+        # Determine default for noedit - prioritize explicit "default" field, then order[0]
+        backend_for_noedit_default = _translate_backend(data.get("backend_for_noedit", {}).get("default"))
+        if not backend_for_noedit_default and backend_for_noedit_order:
+            backend_for_noedit_default = backend_for_noedit_order[0]
+
+        # Backward compatibility: check old key if new key not found
+        if not backend_for_noedit_order:
+            old_order = _translate_backend(data.get("message_backend", {}).get("order", []))
+            if old_order:
+                logger = get_logger(__name__)
+                logger.warning("Configuration uses deprecated 'message_backend' key. " "Please update to 'backend_for_noedit' in your config file.")
+                backend_for_noedit_order = old_order
+                backend_for_noedit_explicit = True
+                if backend_for_noedit_order:
+                    backend_for_noedit_default = backend_for_noedit_order[0]
+
+        # If no specific default for noedit, fallback to general default
+        if not backend_for_noedit_default:
+            backend_for_noedit_default = default_backend
+
+        # Parse backend_with_high_score section
+        backend_with_high_score_data = data.get("backend_with_high_score", {})
+        backend_with_high_score = None
+        backend_with_high_score_order = []
+
+        if backend_with_high_score_data:
+            # Check for order
+            backend_with_high_score_order = backend_with_high_score_data.get("order", [])
+
+            # Use "backend_with_high_score" as default name if not specified in data
+            # Only parse as a backend config if it has backend-like fields or if order is empty
+            # If it has order, it might still have backend fields, but we prioritize order for the manager
+            # We still parse it as a config in case it's used as a backend definition too
+            fallback_name = backend_with_high_score_data.get("name", "backend_with_high_score")
+            backend_with_high_score = parse_backend_config(fallback_name, backend_with_high_score_data)
+
+        # Parse backend_cloud section
+        backend_cloud_data = data.get("backend_cloud", {})
+        backend_cloud = None
+        backend_cloud_order = []
+        backend_cloud_priority_groups = []
+
+        if backend_cloud_data:
+            if not isinstance(backend_cloud_data, dict):
+                raise ValueError("backend_cloud must be a TOML table")
+            if "order" in backend_cloud_data and "priority_groups" in backend_cloud_data:
+                raise ValueError("backend_cloud.order and backend_cloud.priority_groups are mutually exclusive")
+
+            backend_cloud_order = _translate_backend(backend_cloud_data.get("order", []))
+            raw_priority_groups = backend_cloud_data.get("priority_groups", [])
+            if "priority_groups" in backend_cloud_data:
+                if not isinstance(raw_priority_groups, list):
+                    raise ValueError("backend_cloud.priority_groups must be an array of non-empty backend-name arrays")
+                for group in raw_priority_groups:
+                    if not isinstance(group, list) or not group:
+                        raise ValueError("each backend_cloud.priority_groups entry must be a non-empty backend-name array")
+                    if any(not isinstance(member, str) for member in group):
+                        raise ValueError("each backend_cloud.priority_groups member must be a backend name string")
+                backend_cloud_priority_groups = _translate_backend(raw_priority_groups)
+            fallback_name = backend_cloud_data.get("name", "backend_cloud")
+            backend_cloud = parse_backend_config(fallback_name, backend_cloud_data)
+
+        # Parse backend_with_high_score_cloud section
+        backend_with_high_score_cloud_data = data.get("backend_with_high_score_cloud", {})
+        backend_with_high_score_cloud = None
+        backend_with_high_score_cloud_order = []
+
+        if backend_with_high_score_cloud_data:
+            backend_with_high_score_cloud_order = backend_with_high_score_cloud_data.get("order", [])
+            fallback_name = backend_with_high_score_cloud_data.get("name", "backend_with_high_score_cloud")
+            backend_with_high_score_cloud = parse_backend_config(fallback_name, backend_with_high_score_cloud_data)
+
+        # Parse backend_adversarial_validation section
+        backend_adversarial_validation_data = data.get("backend_adversarial_validation", {})
+        backend_adversarial_validation = None
+        backend_adversarial_validation_order = []
+        backend_adversarial_validation_default = None
+
+        if backend_adversarial_validation_data:
+            backend_adversarial_validation_order = backend_adversarial_validation_data.get("order", [])
+            backend_adversarial_validation_default = backend_adversarial_validation_data.get("default")
+            fallback_name = backend_adversarial_validation_data.get("name", "backend_adversarial_validation")
+            backend_adversarial_validation = parse_backend_config(fallback_name, backend_adversarial_validation_data)
+
+        # Parse backend_issue_adversarial_validation section
+        backend_issue_adversarial_validation_data = data.get("backend_issue_adversarial_validation", {})
+        backend_issue_adversarial_validation = None
+        backend_issue_adversarial_validation_order = []
+        backend_issue_adversarial_validation_default = None
+
+        if backend_issue_adversarial_validation_data:
+            backend_issue_adversarial_validation_order = backend_issue_adversarial_validation_data.get("order", [])
+            backend_issue_adversarial_validation_default = backend_issue_adversarial_validation_data.get("default")
+            fallback_name = backend_issue_adversarial_validation_data.get("name", "backend_issue_adversarial_validation")
+            backend_issue_adversarial_validation = parse_backend_config(fallback_name, backend_issue_adversarial_validation_data)
+
+        # Parse backend_pr_adversarial_validation section
+        backend_pr_adversarial_validation_data = data.get("backend_pr_adversarial_validation", {})
+        backend_pr_adversarial_validation = None
+        backend_pr_adversarial_validation_order = []
+        backend_pr_adversarial_validation_default = None
+
+        if backend_pr_adversarial_validation_data:
+            backend_pr_adversarial_validation_order = backend_pr_adversarial_validation_data.get("order", [])
+            backend_pr_adversarial_validation_default = backend_pr_adversarial_validation_data.get("default")
+            fallback_name = backend_pr_adversarial_validation_data.get("name", "backend_pr_adversarial_validation")
+            backend_pr_adversarial_validation = parse_backend_config(fallback_name, backend_pr_adversarial_validation_data)
+
+        # Parse backend_strong_pr_adversarial_validation section
+        backend_strong_pr_adversarial_validation_data = data.get("backend_strong_pr_adversarial_validation", {})
+        backend_strong_pr_adversarial_validation = None
+        backend_strong_pr_adversarial_validation_order = []
+        backend_strong_pr_adversarial_validation_default = None
+
+        if backend_strong_pr_adversarial_validation_data:
+            backend_strong_pr_adversarial_validation_order = backend_strong_pr_adversarial_validation_data.get("order", [])
+            backend_strong_pr_adversarial_validation_default = backend_strong_pr_adversarial_validation_data.get("default")
+            fallback_name = backend_strong_pr_adversarial_validation_data.get("name", "backend_strong_pr_adversarial_validation")
+            backend_strong_pr_adversarial_validation = parse_backend_config(fallback_name, backend_strong_pr_adversarial_validation_data)
+
+        config = cls(
+            backend_order=backend_order,
+            backend_priority_groups=backend_priority_groups,
+            backend_selector_explicit=backend_selector_explicit,
+            backend_selector_kind=backend_selector_kind,
+            backend_for_failed_pr_order=backend_for_failed_pr_order,
+            backend_for_failed_pr_explicit=backend_for_failed_pr_explicit,
+            default_backend=default_backend,
+            quota_selection_strategy=quota_selection_strategy,
+            backends=backends,
+            backend_for_noedit_order=backend_for_noedit_order,
+            backend_for_noedit_default=backend_for_noedit_default,
+            backend_for_noedit_explicit=backend_for_noedit_explicit,
+            backend_with_high_score=backend_with_high_score,
+            backend_with_high_score_order=backend_with_high_score_order,
+            backend_with_high_score_cloud=backend_with_high_score_cloud,
+            backend_with_high_score_cloud_order=backend_with_high_score_cloud_order,
+            backend_adversarial_validation=backend_adversarial_validation,
+            backend_adversarial_validation_order=backend_adversarial_validation_order,
+            backend_adversarial_validation_default=backend_adversarial_validation_default,
+            backend_issue_adversarial_validation=backend_issue_adversarial_validation,
+            backend_issue_adversarial_validation_order=backend_issue_adversarial_validation_order,
+            backend_issue_adversarial_validation_default=backend_issue_adversarial_validation_default,
+            backend_pr_adversarial_validation=backend_pr_adversarial_validation,
+            backend_pr_adversarial_validation_order=backend_pr_adversarial_validation_order,
+            backend_pr_adversarial_validation_default=backend_pr_adversarial_validation_default,
+            backend_strong_pr_adversarial_validation=backend_strong_pr_adversarial_validation,
+            backend_strong_pr_adversarial_validation_order=backend_strong_pr_adversarial_validation_order,
+            backend_strong_pr_adversarial_validation_default=backend_strong_pr_adversarial_validation_default,
+            config_file_path=config_path or "~/.auto-coder/llm_config.toml",
+        )
+
+        # Resolve the public selector during loading so malformed aliases/types
+        # cannot survive until a mutating startup path.
+        config.get_ordinary_priority_groups()
+        config.get_local_pr_repair_backends()
+        return config
+
+    def save_to_file(self, config_path: Optional[str] = None) -> None:
+        """Save configuration to TOML file."""
+        if config_path is None:
+            config_path = self.config_file_path
+        config_path = os.path.expanduser(config_path)
+
+        # Create directory if it doesn't exist
+        Path(config_path).parent.mkdir(parents=True, exist_ok=True)
+
+        # Prepare data for TOML
+        backend_data = {}
+        for name, config in self.backends.items():
+            raw_config = {
+                "enabled": config.enabled,
+                "model": config.model,
+                "api_key": config.api_key,
+                "base_url": config.base_url,
+                "temperature": config.temperature,
+                "timeout": config.timeout,
+                "max_retries": config.max_retries,
+                "openai_api_key": config.openai_api_key,
+                "openai_base_url": config.openai_base_url,
+                "openrouter_api_key": config.openrouter_api_key,
+                "openrouter_base_url": config.openrouter_base_url,
+                "claude_code_oauth_token": config.claude_code_oauth_token,
+                "claude_code_routine_token": config.claude_code_routine_token,
+                "url": config.url,
+                "environment_id": config.environment_id,
+                "attempts": config.attempts,
+                "extra_args": config.extra_args,
+                "providers": config.providers,
+                "usage_limit_retry_count": config.usage_limit_retry_count,
+                "usage_limit_retry_wait_seconds": config.usage_limit_retry_wait_seconds,
+                "options": config.options,
+                "options_for_noedit": config.options_for_noedit,
+                "options_for_resume": config.options_for_resume,
+                "backend_type": config.backend_type,
+                "model_provider": config.model_provider,
+                "always_switch_after_execution": config.always_switch_after_execution,
+                "settings": config.settings,
+                "usage_markers": config.usage_markers,
+                "options_explicitly_set": config.options_explicitly_set,
+                "options_for_noedit_explicitly_set": config.options_for_noedit_explicitly_set,
+            }
+            backend_data[name] = {k: v for k, v in raw_config.items() if v is not None}
+
+        # Prepare backend_with_high_score data
+        backend_with_high_score_data = {}
+        if self.backend_with_high_score:
+            config = self.backend_with_high_score
+            raw_config = {
+                "name": config.name,
+                "enabled": config.enabled,
+                "model": config.model,
+                "api_key": config.api_key,
+                "base_url": config.base_url,
+                "temperature": config.temperature,
+                "timeout": config.timeout,
+                "max_retries": config.max_retries,
+                "openai_api_key": config.openai_api_key,
+                "openai_base_url": config.openai_base_url,
+                "openrouter_api_key": config.openrouter_api_key,
+                "openrouter_base_url": config.openrouter_base_url,
+                "claude_code_oauth_token": config.claude_code_oauth_token,
+                "claude_code_routine_token": config.claude_code_routine_token,
+                "url": config.url,
+                "environment_id": config.environment_id,
+                "attempts": config.attempts,
+                "extra_args": config.extra_args,
+                "providers": config.providers,
+                "usage_limit_retry_count": config.usage_limit_retry_count,
+                "usage_limit_retry_wait_seconds": config.usage_limit_retry_wait_seconds,
+                "options": config.options,
+                "options_for_noedit": config.options_for_noedit,
+                "options_for_resume": config.options_for_resume,
+                "backend_type": config.backend_type,
+                "model_provider": config.model_provider,
+                "always_switch_after_execution": config.always_switch_after_execution,
+                "settings": config.settings,
+                "usage_markers": config.usage_markers,
+                "options_explicitly_set": config.options_explicitly_set,
+                "options_for_noedit_explicitly_set": config.options_for_noedit_explicitly_set,
+            }
+            backend_with_high_score_data = {k: v for k, v in raw_config.items() if v is not None}
+            if self.backend_with_high_score_order:
+                backend_with_high_score_data["order"] = self.backend_with_high_score_order
+        elif self.backend_with_high_score_order:
+            backend_with_high_score_data = {"order": self.backend_with_high_score_order}
+
+        # Prepare backend_cloud data
+        backend_cloud_data: Dict[str, Any] = {}
+        if self.backend_cloud:
+            config = self.backend_cloud
+            raw_config = {
+                "name": config.name,
+                "enabled": config.enabled,
+                "model": config.model,
+                "api_key": config.api_key,
+                "base_url": config.base_url,
+                "temperature": config.temperature,
+                "timeout": config.timeout,
+                "max_retries": config.max_retries,
+                "openai_api_key": config.openai_api_key,
+                "openai_base_url": config.openai_base_url,
+                "openrouter_api_key": config.openrouter_api_key,
+                "openrouter_base_url": config.openrouter_base_url,
+                "claude_code_oauth_token": config.claude_code_oauth_token,
+                "claude_code_routine_token": config.claude_code_routine_token,
+                "url": config.url,
+                "environment_id": config.environment_id,
+                "attempts": config.attempts,
+                "extra_args": config.extra_args,
+                "providers": config.providers,
+                "usage_limit_retry_count": config.usage_limit_retry_count,
+                "usage_limit_retry_wait_seconds": config.usage_limit_retry_wait_seconds,
+                "options": config.options,
+                "options_for_noedit": config.options_for_noedit,
+                "options_for_resume": config.options_for_resume,
+                "backend_type": config.backend_type,
+                "model_provider": config.model_provider,
+                "always_switch_after_execution": config.always_switch_after_execution,
+                "settings": config.settings,
+                "usage_markers": config.usage_markers,
+                "options_explicitly_set": config.options_explicitly_set,
+                "options_for_noedit_explicitly_set": config.options_for_noedit_explicitly_set,
+            }
+            backend_cloud_data = {k: v for k, v in raw_config.items() if v is not None}
+            if self.backend_cloud_order:
+                backend_cloud_data["order"] = self.backend_cloud_order
+            elif self.backend_cloud_priority_groups:
+                backend_cloud_data["priority_groups"] = self.backend_cloud_priority_groups
+        elif self.backend_cloud_order:
+            backend_cloud_data = {"order": self.backend_cloud_order}
+        elif self.backend_cloud_priority_groups:
+            backend_cloud_data = {"priority_groups": self.backend_cloud_priority_groups}
+
+        # Prepare backend_with_high_score_cloud data
+        backend_with_high_score_cloud_data = {}
+        if self.backend_with_high_score_cloud:
+            config = self.backend_with_high_score_cloud
+            raw_config = {
+                "name": config.name,
+                "enabled": config.enabled,
+                "model": config.model,
+                "api_key": config.api_key,
+                "base_url": config.base_url,
+                "temperature": config.temperature,
+                "timeout": config.timeout,
+                "max_retries": config.max_retries,
+                "openai_api_key": config.openai_api_key,
+                "openai_base_url": config.openai_base_url,
+                "openrouter_api_key": config.openrouter_api_key,
+                "openrouter_base_url": config.openrouter_base_url,
+                "claude_code_oauth_token": config.claude_code_oauth_token,
+                "claude_code_routine_token": config.claude_code_routine_token,
+                "url": config.url,
+                "environment_id": config.environment_id,
+                "attempts": config.attempts,
+                "extra_args": config.extra_args,
+                "providers": config.providers,
+                "usage_limit_retry_count": config.usage_limit_retry_count,
+                "usage_limit_retry_wait_seconds": config.usage_limit_retry_wait_seconds,
+                "options": config.options,
+                "options_for_noedit": config.options_for_noedit,
+                "options_for_resume": config.options_for_resume,
+                "backend_type": config.backend_type,
+                "model_provider": config.model_provider,
+                "always_switch_after_execution": config.always_switch_after_execution,
+                "settings": config.settings,
+                "usage_markers": config.usage_markers,
+                "options_explicitly_set": config.options_explicitly_set,
+                "options_for_noedit_explicitly_set": config.options_for_noedit_explicitly_set,
+            }
+            backend_with_high_score_cloud_data = {k: v for k, v in raw_config.items() if v is not None}
+            if self.backend_with_high_score_cloud_order:
+                backend_with_high_score_cloud_data["order"] = self.backend_with_high_score_cloud_order
+        elif self.backend_with_high_score_cloud_order:
+            backend_with_high_score_cloud_data = {"order": self.backend_with_high_score_cloud_order}
+
+        # Prepare backend_adversarial_validation data
+        backend_adversarial_validation_data = {}
+        if self.backend_adversarial_validation:
+            config = self.backend_adversarial_validation
+            raw_config = {
+                "name": config.name,
+                "enabled": config.enabled,
+                "model": config.model,
+                "api_key": config.api_key,
+                "base_url": config.base_url,
+                "temperature": config.temperature,
+                "timeout": config.timeout,
+                "max_retries": config.max_retries,
+                "openai_api_key": config.openai_api_key,
+                "openai_base_url": config.openai_base_url,
+                "openrouter_api_key": config.openrouter_api_key,
+                "openrouter_base_url": config.openrouter_base_url,
+                "claude_code_oauth_token": config.claude_code_oauth_token,
+                "claude_code_routine_token": config.claude_code_routine_token,
+                "url": config.url,
+                "environment_id": config.environment_id,
+                "attempts": config.attempts,
+                "extra_args": config.extra_args,
+                "providers": config.providers,
+                "usage_limit_retry_count": config.usage_limit_retry_count,
+                "usage_limit_retry_wait_seconds": config.usage_limit_retry_wait_seconds,
+                "options": config.options,
+                "options_for_noedit": config.options_for_noedit,
+                "options_for_resume": config.options_for_resume,
+                "backend_type": config.backend_type,
+                "model_provider": config.model_provider,
+                "always_switch_after_execution": config.always_switch_after_execution,
+                "settings": config.settings,
+                "usage_markers": config.usage_markers,
+                "options_explicitly_set": config.options_explicitly_set,
+                "options_for_noedit_explicitly_set": config.options_for_noedit_explicitly_set,
+            }
+            backend_adversarial_validation_data = {k: v for k, v in raw_config.items() if v is not None}
+        elif self.backend_adversarial_validation_order:
+            backend_adversarial_validation_data = {"order": self.backend_adversarial_validation_order}
+            if self.backend_adversarial_validation_default:
+                backend_adversarial_validation_data["default"] = self.backend_adversarial_validation_default
+
+        # Prepare backend_issue_adversarial_validation data
+        backend_issue_adversarial_validation_data = {}
+        if self.backend_issue_adversarial_validation:
+            config = self.backend_issue_adversarial_validation
+            raw_config = {
+                "name": config.name,
+                "enabled": config.enabled,
+                "model": config.model,
+                "api_key": config.api_key,
+                "base_url": config.base_url,
+                "temperature": config.temperature,
+                "timeout": config.timeout,
+                "max_retries": config.max_retries,
+                "openai_api_key": config.openai_api_key,
+                "openai_base_url": config.openai_base_url,
+                "openrouter_api_key": config.openrouter_api_key,
+                "openrouter_base_url": config.openrouter_base_url,
+                "claude_code_oauth_token": config.claude_code_oauth_token,
+                "claude_code_routine_token": config.claude_code_routine_token,
+                "url": config.url,
+                "environment_id": config.environment_id,
+                "attempts": config.attempts,
+                "extra_args": config.extra_args,
+                "providers": config.providers,
+                "usage_limit_retry_count": config.usage_limit_retry_count,
+                "usage_limit_retry_wait_seconds": config.usage_limit_retry_wait_seconds,
+                "options": config.options,
+                "options_for_noedit": config.options_for_noedit,
+                "options_for_resume": config.options_for_resume,
+                "backend_type": config.backend_type,
+                "model_provider": config.model_provider,
+                "always_switch_after_execution": config.always_switch_after_execution,
+                "settings": config.settings,
+                "usage_markers": config.usage_markers,
+                "options_explicitly_set": config.options_explicitly_set,
+                "options_for_noedit_explicitly_set": config.options_for_noedit_explicitly_set,
+            }
+            backend_issue_adversarial_validation_data = {k: v for k, v in raw_config.items() if v is not None}
+            if self.backend_issue_adversarial_validation_order:
+                backend_issue_adversarial_validation_data["order"] = self.backend_issue_adversarial_validation_order
+            if self.backend_issue_adversarial_validation_default:
+                backend_issue_adversarial_validation_data["default"] = self.backend_issue_adversarial_validation_default
+        elif self.backend_issue_adversarial_validation_order:
+            backend_issue_adversarial_validation_data = {"order": self.backend_issue_adversarial_validation_order}
+            if self.backend_issue_adversarial_validation_default:
+                backend_issue_adversarial_validation_data["default"] = self.backend_issue_adversarial_validation_default
+
+        # Prepare backend_pr_adversarial_validation data
+        backend_pr_adversarial_validation_data = {}
+        if self.backend_pr_adversarial_validation:
+            config = self.backend_pr_adversarial_validation
+            raw_config = {
+                "name": config.name,
+                "enabled": config.enabled,
+                "model": config.model,
+                "api_key": config.api_key,
+                "base_url": config.base_url,
+                "temperature": config.temperature,
+                "timeout": config.timeout,
+                "max_retries": config.max_retries,
+                "openai_api_key": config.openai_api_key,
+                "openai_base_url": config.openai_base_url,
+                "openrouter_api_key": config.openrouter_api_key,
+                "openrouter_base_url": config.openrouter_base_url,
+                "claude_code_oauth_token": config.claude_code_oauth_token,
+                "claude_code_routine_token": config.claude_code_routine_token,
+                "url": config.url,
+                "environment_id": config.environment_id,
+                "attempts": config.attempts,
+                "extra_args": config.extra_args,
+                "providers": config.providers,
+                "usage_limit_retry_count": config.usage_limit_retry_count,
+                "usage_limit_retry_wait_seconds": config.usage_limit_retry_wait_seconds,
+                "options": config.options,
+                "options_for_noedit": config.options_for_noedit,
+                "options_for_resume": config.options_for_resume,
+                "backend_type": config.backend_type,
+                "model_provider": config.model_provider,
+                "always_switch_after_execution": config.always_switch_after_execution,
+                "settings": config.settings,
+                "usage_markers": config.usage_markers,
+                "options_explicitly_set": config.options_explicitly_set,
+                "options_for_noedit_explicitly_set": config.options_for_noedit_explicitly_set,
+            }
+            backend_pr_adversarial_validation_data = {k: v for k, v in raw_config.items() if v is not None}
+            if self.backend_pr_adversarial_validation_order:
+                backend_pr_adversarial_validation_data["order"] = self.backend_pr_adversarial_validation_order
+            if self.backend_pr_adversarial_validation_default:
+                backend_pr_adversarial_validation_data["default"] = self.backend_pr_adversarial_validation_default
+        elif self.backend_pr_adversarial_validation_order:
+            backend_pr_adversarial_validation_data = {"order": self.backend_pr_adversarial_validation_order}
+            if self.backend_pr_adversarial_validation_default:
+                backend_pr_adversarial_validation_data["default"] = self.backend_pr_adversarial_validation_default
+
+        # Prepare backend_pr_adversarial_validation data
+        backend_pr_adversarial_validation_data = {}
+        if self.backend_pr_adversarial_validation:
+            config = self.backend_pr_adversarial_validation
+            raw_config = {
+                "name": config.name,
+                "enabled": config.enabled,
+                "model": config.model,
+                "api_key": config.api_key,
+                "base_url": config.base_url,
+                "temperature": config.temperature,
+                "timeout": config.timeout,
+                "max_retries": config.max_retries,
+                "openai_api_key": config.openai_api_key,
+                "openai_base_url": config.openai_base_url,
+                "openrouter_api_key": config.openrouter_api_key,
+                "openrouter_base_url": config.openrouter_base_url,
+                "claude_code_oauth_token": config.claude_code_oauth_token,
+                "claude_code_routine_token": config.claude_code_routine_token,
+                "url": config.url,
+                "environment_id": config.environment_id,
+                "attempts": config.attempts,
+                "extra_args": config.extra_args,
+                "providers": config.providers,
+                "usage_limit_retry_count": config.usage_limit_retry_count,
+                "usage_limit_retry_wait_seconds": config.usage_limit_retry_wait_seconds,
+                "options": config.options,
+                "options_for_noedit": config.options_for_noedit,
+                "options_for_resume": config.options_for_resume,
+                "backend_type": config.backend_type,
+                "model_provider": config.model_provider,
+                "always_switch_after_execution": config.always_switch_after_execution,
+                "settings": config.settings,
+                "usage_markers": config.usage_markers,
+                "options_explicitly_set": config.options_explicitly_set,
+                "options_for_noedit_explicitly_set": config.options_for_noedit_explicitly_set,
+            }
+            backend_pr_adversarial_validation_data = {k: v for k, v in raw_config.items() if v is not None}
+            if self.backend_pr_adversarial_validation_order:
+                backend_pr_adversarial_validation_data["order"] = self.backend_pr_adversarial_validation_order
+            if self.backend_pr_adversarial_validation_default:
+                backend_pr_adversarial_validation_data["default"] = self.backend_pr_adversarial_validation_default
+        elif self.backend_pr_adversarial_validation_order:
+            backend_pr_adversarial_validation_data = {"order": self.backend_pr_adversarial_validation_order}
+            if self.backend_pr_adversarial_validation_default:
+                backend_pr_adversarial_validation_data["default"] = self.backend_pr_adversarial_validation_default
+
+        # Prepare backend_strong_pr_adversarial_validation data
+        backend_strong_pr_adversarial_validation_data = {}
+        if self.backend_strong_pr_adversarial_validation:
+            config = self.backend_strong_pr_adversarial_validation
+            raw_config = {
+                "name": config.name,
+                "enabled": config.enabled,
+                "model": config.model,
+                "api_key": config.api_key,
+                "base_url": config.base_url,
+                "temperature": config.temperature,
+                "timeout": config.timeout,
+                "max_retries": config.max_retries,
+                "openai_api_key": config.openai_api_key,
+                "openai_base_url": config.openai_base_url,
+                "openrouter_api_key": config.openrouter_api_key,
+                "openrouter_base_url": config.openrouter_base_url,
+                "claude_code_oauth_token": config.claude_code_oauth_token,
+                "claude_code_routine_token": config.claude_code_routine_token,
+                "url": config.url,
+                "environment_id": config.environment_id,
+                "attempts": config.attempts,
+                "extra_args": config.extra_args,
+                "providers": config.providers,
+                "usage_limit_retry_count": config.usage_limit_retry_count,
+                "usage_limit_retry_wait_seconds": config.usage_limit_retry_wait_seconds,
+                "options": config.options,
+                "options_for_noedit": config.options_for_noedit,
+                "options_for_resume": config.options_for_resume,
+                "backend_type": config.backend_type,
+                "model_provider": config.model_provider,
+                "always_switch_after_execution": config.always_switch_after_execution,
+                "settings": config.settings,
+                "usage_markers": config.usage_markers,
+                "options_explicitly_set": config.options_explicitly_set,
+                "options_for_noedit_explicitly_set": config.options_for_noedit_explicitly_set,
+            }
+            backend_strong_pr_adversarial_validation_data = {k: v for k, v in raw_config.items() if v is not None}
+            if self.backend_strong_pr_adversarial_validation_order:
+                backend_strong_pr_adversarial_validation_data["order"] = self.backend_strong_pr_adversarial_validation_order
+            if self.backend_strong_pr_adversarial_validation_default:
+                backend_strong_pr_adversarial_validation_data["default"] = self.backend_strong_pr_adversarial_validation_default
+        elif self.backend_strong_pr_adversarial_validation_order:
+            backend_strong_pr_adversarial_validation_data = {"order": self.backend_strong_pr_adversarial_validation_order}
+            if self.backend_strong_pr_adversarial_validation_default:
+                backend_strong_pr_adversarial_validation_data["default"] = self.backend_strong_pr_adversarial_validation_default
+
+        if self.backend_selector_kind == "priority_groups":
+            serialized_backend_selector: Dict[str, Any] = {"priority_groups": self.backend_priority_groups}
+        elif self.backend_selector_kind == "order" or self.backend_order:
+            serialized_backend_selector = {"order": self.backend_order}
+        else:
+            serialized_backend_selector = {}
+        serialized_backend_selector["default"] = self.default_backend
+
+        data = {
+            "backend": serialized_backend_selector,
+            "quota_selection": {"strategy": self.quota_selection_strategy},
+            "backend_for_noedit": {"order": self.backend_for_noedit_order, "default": self.backend_for_noedit_default or self.default_backend},
+            "backends": backend_data,
+        }
+        if self.backend_for_failed_pr_explicit or self.backend_for_failed_pr_order:
+            data["backend_for_failed_pr"] = {"order": self.backend_for_failed_pr_order}
+
+        # Add backend_with_high_score section if configured
+        if backend_with_high_score_data:
+            data["backend_with_high_score"] = backend_with_high_score_data
+
+        # Add backend_with_high_score_cloud section if configured
+        if backend_with_high_score_cloud_data:
+            data["backend_with_high_score_cloud"] = backend_with_high_score_cloud_data
+
+        # Add backend_adversarial_validation section if configured
+        if backend_adversarial_validation_data:
+            data["backend_adversarial_validation"] = backend_adversarial_validation_data
+
+        # Add backend_issue_adversarial_validation section if configured
+        if backend_issue_adversarial_validation_data:
+            data["backend_issue_adversarial_validation"] = backend_issue_adversarial_validation_data
+
+        # Add backend_pr_adversarial_validation section if configured
+        if backend_pr_adversarial_validation_data:
+            data["backend_pr_adversarial_validation"] = backend_pr_adversarial_validation_data
+
+        # Add backend_strong_pr_adversarial_validation section if configured
+        if backend_strong_pr_adversarial_validation_data:
+            data["backend_strong_pr_adversarial_validation"] = backend_strong_pr_adversarial_validation_data
+        # Use os.open to ensure file is created with 600 permissions
+        try:
+            fd = os.open(config_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        except OSError:
+            # Fallback to standard open if os.open fails (e.g. some file systems)
+            with open(config_path, "wb") as f:
+                try:
+                    os.chmod(config_path, 0o600)
+                except OSError:
+                    pass  # Ignore permission errors on systems that don't support it
+                tomli_w.dump(data, f)
+            return
+
+        # File opened successfully with os.open
+        try:
+            f = os.fdopen(fd, "wb")
+        except Exception:
+            os.close(fd)
+            raise
+
+        with f:
+            # Ensure permissions are correct even if file already existed
+            try:
+                os.chmod(config_path, 0o600)
+            except OSError:
+                pass  # Ignore permission errors on systems that don't support it
+            tomli_w.dump(data, f)
+
+    def get_backend_config(self, backend_name: str) -> Optional[BackendConfig]:
+        """Get configuration for a specific backend."""
+        config = self.backends.get(backend_name)
+        if config:
+            return config
+        if self.backend_cloud and self.backend_cloud.name == backend_name:
+            return self.backend_cloud
+        if self.backend_with_high_score and self.backend_with_high_score.name == backend_name:
+            return self.backend_with_high_score
+        if self.backend_with_high_score_cloud and self.backend_with_high_score_cloud.name == backend_name:
+            return self.backend_with_high_score_cloud
+        if self.backend_adversarial_validation and self.backend_adversarial_validation.name == backend_name:
+            return self.backend_adversarial_validation
+        if self.backend_issue_adversarial_validation and self.backend_issue_adversarial_validation.name == backend_name:
+            return self.backend_issue_adversarial_validation
+        if self.backend_pr_adversarial_validation and self.backend_pr_adversarial_validation.name == backend_name:
+            return self.backend_pr_adversarial_validation
+        if self.backend_strong_pr_adversarial_validation and self.backend_strong_pr_adversarial_validation.name == backend_name:
+            return self.backend_strong_pr_adversarial_validation
+        return None
+
+    def get_active_backends(self) -> List[str]:
+        """Get list of enabled backends in the configured order."""
+        if self.backend_order:
+            # Filter to only include enabled backends that are in order
+            return [name for name in self.backend_order if self.backends.get(name, BackendConfig(name=name)).enabled]
+        else:
+            # If no order is specified, return all enabled backends
+            return [name for name, config in self.backends.items() if config.enabled]
+
+    def get_ordinary_priority_groups(self) -> List[List[str]]:
+        """Return the validated ordinary selector without inventing candidates."""
+        if self.backend_priority_groups:
+            groups = self.backend_priority_groups
+        elif self.backend_order:
+            groups = [[name] for name in self.backend_order]
+        elif self.backend_selector_explicit:
+            return []
+        else:
+            groups = [[self.default_backend or "codex"]]
+
+        seen = set()
+        result: List[List[str]] = []
+        for group in groups:
+            retained: List[str] = []
+            for name in group:
+                if name in seen:
+                    continue
+                backend = self.get_backend_config(name)
+                if backend is None:
+                    raise ValueError(f"backend selector references unresolvable backend '{name}'")
+                self.resolve_backend_type(name)
+                seen.add(name)
+                if backend.enabled:
+                    retained.append(name)
+            if retained:
+                result.append(retained)
+        return result
+
+    def get_local_pr_repair_backends(self) -> List[str]:
+        """Resolve configured local repair candidates without constructing clients."""
+        explicit = self.backend_for_failed_pr_explicit or bool(self.backend_for_failed_pr_order)
+        candidates = self.backend_for_failed_pr_order if explicit else [name for group in self.get_ordinary_priority_groups() for name in group]
+        selected: List[str] = []
+        for name in candidates:
+            backend = self.get_backend_config(name)
+            if backend is None:
+                raise ValueError(f"backend_for_failed_pr references unresolvable backend '{name}'")
+            if not backend.enabled:
+                continue
+            if self.resolve_backend_type(name) in TASK_ONLY_BACKEND_TYPES:
+                if explicit:
+                    raise ValueError(f"backend_for_failed_pr requires a local backend; '{name}' is task-only")
+                continue
+            if name not in selected:
+                selected.append(name)
+        return selected
+
+    def resolve_backend_type(self, backend_name: str) -> str:
+        """Resolve an alias to a supported executable implementation type."""
+        supported = set(REQUIRED_OPTIONS_BY_BACKEND) | {"codex-cloud", "claude-routine"}
+        current = backend_name
+        visited = set()
+        while current not in supported:
+            if current in visited:
+                raise ValueError(f"backend '{backend_name}' has a cyclic backend_type chain")
+            visited.add(current)
+            config = self.get_backend_config(current)
+            if config is None or not config.backend_type:
+                raise ValueError(f"backend '{backend_name}' has no resolvable implementation type")
+            current = config.backend_type
+        return current
+
+    def get_active_noedit_backends(self) -> List[str]:
+        """Get list of enabled backends for non-editing operations in the configured order.
+
+        Returns backend_for_noedit order if specifically configured, otherwise falls back to general backends.
+        """
+        if self.backend_for_noedit_explicit:
+            # Filter to only include enabled backends that are in noedit order
+            candidates = self.backend_for_noedit_order or ([self.backend_for_noedit_default] if self.backend_for_noedit_default else [])
+        else:
+            candidates = [name for group in self.get_ordinary_priority_groups() for name in group]
+        return [name for name in candidates if self.backends.get(name, BackendConfig(name=name)).enabled and self.resolve_backend_type(name) not in TASK_ONLY_BACKEND_TYPES]
+
+    # Deprecated alias for backward compatibility
+    def get_active_message_backends(self) -> List[str]:
+        """Deprecated: Use get_active_noedit_backends() instead."""
+        logger = get_logger(__name__)
+        logger.warning("get_active_message_backends() is deprecated. Use get_active_noedit_backends() instead.")
+        return self.get_active_noedit_backends()
+
+    def get_noedit_default_backend(self) -> str:
+        """Get the default backend for non-editing operations.
+
+        Returns backend_for_noedit default if specifically configured, otherwise falls back to general default.
+        """
+        active = self.get_active_noedit_backends()
+        if self.backend_for_noedit_default in active:
+            return self.backend_for_noedit_default
+        if active:
+            return active[0]
+        raise ValueError("No synchronous backend is available for no-edit operations")
+
+    # Deprecated alias for backward compatibility
+    def get_message_default_backend(self) -> str:
+        """Deprecated: Use get_noedit_default_backend() instead."""
+        logger = get_logger(__name__)
+        logger.warning("get_message_default_backend() is deprecated. Use get_noedit_default_backend() instead.")
+        return self.get_noedit_default_backend()
+
+    def has_dual_configuration(self) -> bool:
+        """Check if both general backend and non-editing backend configurations are explicitly set."""
+        # Check if noedit-specific configurations exist
+        has_noedit_config = bool(self.backend_for_noedit_order or self.backend_for_noedit_default)
+        has_general_config = bool(self.backend_order or self.default_backend)
+        return has_noedit_config and has_general_config
+
+    def get_backend_with_high_score(self) -> Optional[BackendConfig]:
+        """Get the fallback backend configuration for failed PRs.
+
+        Returns the backend_with_high_score configuration if configured, None otherwise.
+        """
+        return self.backend_with_high_score
+
+    def get_model_for_backend_with_high_score(self) -> Optional[str]:
+        """Get the model for the fallback backend for high-scoring PRs.
+
+        Returns the model name if a fallback backend is configured and has a model,
+        None otherwise.
+        """
+        if self.backend_with_high_score and self.backend_with_high_score.model:
+            return self.backend_with_high_score.model
+        return None
+
+    def get_backend_cloud(self) -> Optional[BackendConfig]:
+        """Get the cloud backend configuration.
+
+        Returns the backend_cloud configuration if configured, None otherwise.
+        """
+        return self.backend_cloud
+
+    def get_model_for_backend_cloud(self) -> Optional[str]:
+        """Get the model for the cloud backend.
+
+        Returns the model name if configured, None otherwise.
+        """
+        if self.backend_cloud and self.backend_cloud.model:
+            return self.backend_cloud.model
+        return None
+
+    def get_backend_with_high_score_cloud(self) -> Optional[BackendConfig]:
+        """Get the cloud backend configuration with high score.
+
+        Returns the backend_with_high_score_cloud configuration if configured, None otherwise.
+        """
+        return self.backend_with_high_score_cloud
+
+    def get_model_for_backend_with_high_score_cloud(self) -> Optional[str]:
+        """Get the model for the high-scoring cloud backend.
+
+        Returns the model name if configured, None otherwise.
+        """
+        if self.backend_with_high_score_cloud and self.backend_with_high_score_cloud.model:
+            return self.backend_with_high_score_cloud.model
+        return None
+
+    def get_backend_adversarial_validation(self) -> Optional[BackendConfig]:
+        """Get the adversarial validation backend configuration."""
+        return self.backend_adversarial_validation
+
+    def get_adversarial_validation_backend_order(self) -> List[str]:
+        """Get the adversarial validation backend order."""
+        return list(self.backend_adversarial_validation_order)
+
+    def get_adversarial_validation_default_backend(self) -> Optional[str]:
+        """Get the default backend for adversarial validation."""
+        if self.backend_adversarial_validation_default:
+            return self.backend_adversarial_validation_default
+        if self.backend_adversarial_validation_order:
+            return self.backend_adversarial_validation_order[0]
+        if self.backend_adversarial_validation:
+            return self.backend_adversarial_validation.name
+        return None
+
+    def get_model_for_backend_adversarial_validation(self) -> Optional[str]:
+        """Get the model for the adversarial validation backend."""
+        if self.backend_adversarial_validation and self.backend_adversarial_validation.model:
+            return self.backend_adversarial_validation.model
+        return None
+
+    def get_backend_issue_adversarial_validation(self) -> Optional[BackendConfig]:
+        """Get the dedicated Issue adversarial-validation backend configuration, if present."""
+        return self.backend_issue_adversarial_validation
+
+    def get_issue_adversarial_validation_backend_order(self) -> List[str]:
+        """Get the dedicated Issue adversarial-validation backend order."""
+        return list(self.backend_issue_adversarial_validation_order)
+
+    def get_issue_adversarial_validation_default_backend(self) -> Optional[str]:
+        """Get the default backend for the dedicated Issue adversarial-validation configuration."""
+        if self.backend_issue_adversarial_validation_default:
+            return self.backend_issue_adversarial_validation_default
+        if self.backend_issue_adversarial_validation_order:
+            return self.backend_issue_adversarial_validation_order[0]
+        if self.backend_issue_adversarial_validation:
+            return self.backend_issue_adversarial_validation.name
+        return None
+
+    def get_model_for_backend_issue_adversarial_validation(self) -> Optional[str]:
+        """Get the model for the dedicated Issue adversarial-validation backend."""
+        if self.backend_issue_adversarial_validation and self.backend_issue_adversarial_validation.model:
+            return self.backend_issue_adversarial_validation.model
+        return None
+
+    def get_backend_pr_adversarial_validation(self) -> Optional[BackendConfig]:
+        """Get the dedicated PR adversarial-validation backend configuration, if present."""
+        return self.backend_pr_adversarial_validation
+
+    def get_pr_adversarial_validation_backend_order(self) -> List[str]:
+        """Get the dedicated PR adversarial-validation backend order."""
+        return list(self.backend_pr_adversarial_validation_order)
+
+    def get_pr_adversarial_validation_default_backend(self) -> Optional[str]:
+        """Get the default backend for the dedicated PR adversarial-validation configuration."""
+        if self.backend_pr_adversarial_validation_default:
+            return self.backend_pr_adversarial_validation_default
+        if self.backend_pr_adversarial_validation_order:
+            return self.backend_pr_adversarial_validation_order[0]
+        if self.backend_pr_adversarial_validation:
+            return self.backend_pr_adversarial_validation.name
+        return None
+
+    def get_model_for_backend_pr_adversarial_validation(self) -> Optional[str]:
+        """Get the model for the dedicated PR adversarial-validation backend."""
+        if self.backend_pr_adversarial_validation and self.backend_pr_adversarial_validation.model:
+            return self.backend_pr_adversarial_validation.model
+        return None
+
+    def get_backend_strong_pr_adversarial_validation(self) -> Optional[BackendConfig]:
+        """Get the dedicated strong PR adversarial-validation backend configuration, if present."""
+        return self.backend_strong_pr_adversarial_validation
+
+    def get_strong_pr_adversarial_validation_backend_order(self) -> List[str]:
+        """Get the dedicated strong PR adversarial-validation backend order."""
+        return list(self.backend_strong_pr_adversarial_validation_order)
+
+    def get_strong_pr_adversarial_validation_default_backend(self) -> Optional[str]:
+        """Get the default backend for the dedicated strong PR adversarial-validation configuration."""
+        if self.backend_strong_pr_adversarial_validation_default:
+            return self.backend_strong_pr_adversarial_validation_default
+        if self.backend_strong_pr_adversarial_validation_order:
+            return self.backend_strong_pr_adversarial_validation_order[0]
+        if self.backend_strong_pr_adversarial_validation:
+            return self.backend_strong_pr_adversarial_validation.name
+        return None
+
+    def get_model_for_backend_strong_pr_adversarial_validation(self) -> Optional[str]:
+        """Get the model for the dedicated strong PR adversarial-validation backend."""
+        if self.backend_strong_pr_adversarial_validation and self.backend_strong_pr_adversarial_validation.model:
+            return self.backend_strong_pr_adversarial_validation.model
+        return None
+
+    def get_model_for_backend(self, backend_name: str) -> Optional[str]:
+        """Get the model for a specific backend, with fallback to backend defaults."""
+        config = self.get_backend_config(backend_name)
+        if config and config.model:
+            return config.model
+
+        # Default models for known backends
+        default_models = {"antigravity": "gemini-2.5-pro", "qwen": "qwen3-coder-plus", "auggie": "GPT-5", "claude": "sonnet", "codex": "codex", "jules": "jules", "codex-mcp": "codex-mcp", "aider": "aider"}
+        return default_models.get(backend_name)
+
+    def apply_env_overrides(self) -> None:
+        """Apply environment variable overrides to the configuration."""
+        # Map environment variable names to backend settings
+        for backend_name, backend_config in self.backends.items():
+            # Check for specific backend env overrides
+            api_key_env = os.environ.get(f"AUTO_CODER_{backend_name.upper()}_API_KEY")
+            if api_key_env:
+                backend_config.api_key = api_key_env
+
+            openai_api_key_env = os.environ.get(f"AUTO_CODER_OPENAI_API_KEY") or os.environ.get(f"AUTO_CODER_{backend_name.upper()}_OPENAI_API_KEY")
+            if openai_api_key_env:
+                backend_config.openai_api_key = openai_api_key_env
+
+            openai_base_url_env = os.environ.get(f"AUTO_CODER_OPENAI_BASE_URL") or os.environ.get(f"AUTO_CODER_{backend_name.upper()}_OPENAI_BASE_URL")
+            if openai_base_url_env:
+                backend_config.openai_base_url = openai_base_url_env
+
+            claude_code_oauth_token_env = os.environ.get(f"AUTO_CODER_{backend_name.upper()}_CLAUDE_CODE_OAUTH_TOKEN")
+            if claude_code_oauth_token_env:
+                backend_config.claude_code_oauth_token = claude_code_oauth_token_env
+
+        # Also check for general environment overrides
+        default_backend_env = os.environ.get("AUTO_CODER_DEFAULT_BACKEND")
+        if default_backend_env:
+            self.default_backend = default_backend_env
+
+        # Check new environment variable first, fall back to old one
+        noedit_default_backend_env = os.environ.get("AUTO_CODER_NOEDIT_DEFAULT_BACKEND") or os.environ.get("AUTO_CODER_MESSAGE_DEFAULT_BACKEND")
+        if noedit_default_backend_env:
+            self.backend_for_noedit_default = noedit_default_backend_env
+            # Warn if using old environment variable
+            if os.environ.get("AUTO_CODER_MESSAGE_DEFAULT_BACKEND") and not os.environ.get("AUTO_CODER_NOEDIT_DEFAULT_BACKEND"):
+                logger = get_logger(__name__)
+                logger.warning("Environment variable AUTO_CODER_MESSAGE_DEFAULT_BACKEND is deprecated. " "Use AUTO_CODER_NOEDIT_DEFAULT_BACKEND instead.")
+
+
+_active_repo_name: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("active_repo_name", default=None)
+
+
+def set_active_repo_name(repo_name: Optional[str]) -> None:
+    """Set the active repository name in the current context."""
+    _active_repo_name.set(repo_name)
+
+
+def get_active_repo_name() -> Optional[str]:
+    """Get the active repository name in the current context."""
+    return _active_repo_name.get()
+
+
+@contextmanager
+def active_repo_context(repo_name: Optional[str]):
+    """Context manager to set the active repository for LLM configuration resolution."""
+    token = _active_repo_name.set(repo_name)
+    try:
+        yield
+    finally:
+        _active_repo_name.reset(token)
+
+
+# Global base instance to be used throughout the application
+_llm_config: Optional[LLMBackendConfiguration] = None
+
+
+def get_llm_config(
+    repo_name: Optional[str] = None,
+    config_path: Optional[str] = None,
+) -> LLMBackendConfiguration:
+    """Get the effective LLM backend configuration.
+
+    If repo_name is provided or set via active_repo_context, resolves the effective
+    configuration by loading the base configuration and merging the repository-specific
+    override at ~/.auto-coder/<owner>/<repo>/llm_config.toml.
+
+    Args:
+        repo_name: Optional GitHub repository ('owner/repo')
+        config_path: Optional explicit configuration file path
+
+    Returns:
+        LLMBackendConfiguration instance with effective configuration
+    """
+    effective_repo = repo_name if repo_name is not None else get_active_repo_name()
+
+    if effective_repo:
+        config = LLMBackendConfiguration.load_from_file(config_path=config_path, repo_name=effective_repo)
+        config.apply_env_overrides()
+        return config
+
+    global _llm_config
+    if config_path is not None:
+        config = LLMBackendConfiguration.load_from_file(config_path=config_path)
+        config.apply_env_overrides()
+        return config
+
+    if _llm_config is None:
+        _llm_config = LLMBackendConfiguration.load_from_file()
+        _llm_config.apply_env_overrides()
+    return _llm_config
+
+
+def reset_llm_config() -> None:
+    """Reset the global configuration instance (for testing)."""
+    global _llm_config
+    _llm_config = None
+    _active_repo_name.set(None)
+
+
+FEATURE_SWITCH_NAMES = (
+    "issue_specification_validation",
+    "issue_decomposition_validation",
+    "pr_adversarial_validation",
+    "pr_review_thread_gate",
+    "automatic_test_fix",
+)
+
+
+def validate_feature_switches_in_config_dict(data: Dict[str, Any]) -> None:
+    """Validate that any configured pipeline feature switches are strictly boolean values.
+
+    Args:
+        data: The configuration dictionary to validate.
+
+    Raises:
+        ValueError: If any known feature switch has a non-boolean value.
+    """
+    if not isinstance(data, dict):
+        return
+
+    # Check top-level keys
+    for switch_name in FEATURE_SWITCH_NAMES:
+        if switch_name in data:
+            val = data[switch_name]
+            if type(val) is not bool:
+                raise ValueError(f"Invalid boolean value for feature setting '{switch_name}': {val!r}")
+
+    # Check sections
+    for section_name in ("features", "feature_switches", "feature_gates"):
+        section = data.get(section_name)
+        if isinstance(section, dict):
+            for switch_name in FEATURE_SWITCH_NAMES:
+                if switch_name in section:
+                    val = section[switch_name]
+                    if type(val) is not bool:
+                        raise ValueError(f"Invalid boolean value for feature setting '{switch_name}': {val!r}")
+        elif section is not None:
+            raise ValueError(f"[{section_name}] configuration section must be a TOML table")
+
+
+def _normalize_feature_switches_dict(data: Dict[str, Any]) -> None:
+    """Validate and normalize feature switch keys into data['features']."""
+    if not isinstance(data, dict):
+        return
+
+    validate_feature_switches_in_config_dict(data)
+
+    features = data.setdefault("features", {})
+    if not isinstance(features, dict):
+        raise ValueError("[features] configuration section must be a TOML table")
+
+    for section_name in ("feature_switches", "feature_gates"):
+        section = data.get(section_name)
+        if isinstance(section, dict):
+            for k in FEATURE_SWITCH_NAMES:
+                if k in section and k not in features:
+                    features[k] = section[k]
+
+    for k in FEATURE_SWITCH_NAMES:
+        if k in data:
+            features[k] = data[k]
+
+
+def load_app_config_data(
+    config_path: Optional[str] = None,
+    repo_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Load configuration from config.toml, optionally merging a repository override.
+
+    Args:
+        config_path: Optional explicit path to base config.toml file.
+        repo_name: Optional GitHub repository ('owner/repo'). If not provided,
+                   checks get_active_repo_name().
+
+    Returns:
+        Merged configuration dictionary.
+    """
+    base_data: Dict[str, Any] = {}
+
+    if config_path:
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, "rb") as f:
+                    base_data = tomllib.load(f)
+            except Exception as e:
+                logger = get_logger(__name__)
+                logger.warning(f"Failed to read config.toml from {config_path}: {e}")
+    else:
+        # Check standard locations (local first, then home)
+        config_paths = [
+            os.path.join(os.getcwd(), ".auto-coder", "config.toml"),
+            os.path.expanduser("~/.auto-coder/config.toml"),
+        ]
+        for path in config_paths:
+            if os.path.exists(path):
+                try:
+                    with open(path, "rb") as f:
+                        base_data = tomllib.load(f)
+                    break
+                except Exception as e:
+                    logger = get_logger(__name__)
+                    logger.warning(f"Failed to read config.toml from {path}: {e}")
+                    continue
+
+    if not isinstance(base_data, dict):
+        base_data = {}
+
+    _normalize_feature_switches_dict(base_data)
+
+    effective_repo = repo_name if repo_name is not None else get_active_repo_name()
+    if effective_repo:
+        inline_repo_override = base_data.get("repository", {}).get(effective_repo)
+        if isinstance(inline_repo_override, dict):
+            _normalize_feature_switches_dict(inline_repo_override)
+            base_data = deep_merge_config_dict(base_data, inline_repo_override)
+
+        override_path = resolve_repo_override_path(effective_repo, filename="config.toml")
+        if override_path and os.path.exists(override_path):
+            try:
+                with open(override_path, "rb") as f:
+                    override_data = tomllib.load(f)
+            except Exception as e:
+                raise ValueError(f"Error loading repository configuration override from {override_path}: {e}")
+
+            if not isinstance(override_data, dict):
+                raise ValueError(f"Repository configuration override at {override_path} must be a TOML table")
+
+            _normalize_feature_switches_dict(override_data)
+            base_data = deep_merge_config_dict(base_data, override_data)
+
+    validate_feature_switches_in_config_dict(base_data)
+
+    return base_data
+
+
+def _get_config_value(
+    section: str,
+    key: str,
+    default: Any,
+    config_path: Optional[str] = None,
+    value_type: Optional[type] = None,
+    repo_name: Optional[str] = None,
+) -> Any:
+    """Helper to get a value from config.toml with standard lookup paths and repo overrides.
+
+    Args:
+        section: TOML section name (e.g., 'jules')
+        key: Key name within section (e.g., 'enabled')
+        default: Default value if not found
+        config_path: Optional explicit path to config file
+        value_type: Optional type to cast the value to (e.g., int, bool)
+        repo_name: Optional repository name ('owner/repo') for repository-scoped override.
+
+    Returns:
+        The configured value or default
+    """
+    try:
+        data = load_app_config_data(config_path=config_path, repo_name=repo_name)
+    except ValueError:
+        raise
+    except Exception as e:
+        logger = get_logger(__name__)
+        logger.warning(f"Failed to load config data: {e}")
+        return default
+
+    section_config = data.get(section, {})
+    if isinstance(section_config, dict) and key in section_config:
+        val = section_config[key]
+        return value_type(val) if value_type else val
+
+    return default
+
+
+def get_jules_enabled_from_config(
+    config_path: Optional[str] = None,
+    repo_name: Optional[str] = None,
+) -> bool:
+    """Check if Jules is enabled via [jules].enabled in config.toml.
+
+    This function reads from ~/.auto-coder/config.toml (or local .auto-coder/config.toml)
+    and checks for a [jules] section with an 'enabled' field, applying any repo-scoped override.
+
+    Args:
+        config_path: Optional explicit path to config.toml file. If not provided,
+                    will check standard locations.
+        repo_name: Optional GitHub repository name in 'owner/repo' format.
+
+    Returns:
+        True if Jules is enabled (default), False if explicitly disabled.
+    """
+    return _get_config_value(
+        section="jules",
+        key="enabled",
+        default=True,
+        config_path=config_path,
+        value_type=bool,
+        repo_name=repo_name,
+    )
+
+
+def get_auto_update_enabled_from_config(config_path: Optional[str] = None) -> bool:
+    """Return whether automatic package updates are enabled in config.toml.
+
+    Auto-update remains enabled when the setting is absent so existing
+    installations retain their current behaviour.
+    """
+    return _get_config_value(
+        section="auto_update",
+        key="enabled",
+        default=True,
+        config_path=config_path,
+        value_type=bool,
+    )
+
+
+def is_jules_mode_enabled(repo_name: Optional[str] = None) -> bool:
+    """Check if Jules mode or Cloud mode is enabled.
+
+    Cloud/Jules mode is enabled if:
+    1. A cloud backend is configured via [backend_cloud] in llm_config.toml, OR
+    2. The 'jules' backend is enabled in llm_config.toml and [jules].enabled is true in config.toml
+    """
+    llm_config = get_llm_config(repo_name=repo_name)
+    if llm_config.backend_cloud_order or llm_config.backend_cloud_priority_groups or llm_config.backend_cloud:
+        return True
+
+    # Check [backends.jules] in llm_config.toml
+    jules_config = llm_config.get_backend_config("jules")
+    jules_backend_enabled = jules_config.enabled if jules_config else False
+
+    # Check [jules].enabled in config.toml
+    jules_config_enabled = get_jules_enabled_from_config(repo_name=repo_name)
+
+    return jules_backend_enabled and jules_config_enabled
+
+
+def is_cloud_mode_enabled(repo_name: Optional[str] = None) -> bool:
+    """Check if Cloud mode (backend_cloud or Jules) is enabled."""
+    return is_jules_mode_enabled(repo_name=repo_name)
+
+
+def get_jules_wait_timeout_hours_from_config(
+    config_path: Optional[str] = None,
+    repo_name: Optional[str] = None,
+) -> int:
+    """Get the Jules wait timeout in hours from config.toml.
+
+    Args:
+        config_path: Optional explicit path to config.toml file.
+        repo_name: Optional repository name in 'owner/repo' format.
+
+    Returns:
+        Timeout in hours (default: 2)
+    """
+    return _get_config_value(
+        section="jules",
+        key="wait_timeout_hours",
+        default=2,
+        config_path=config_path,
+        value_type=int,
+        repo_name=repo_name,
+    )
+
+
+def get_jules_issue_pr_timeout_hours_from_config(
+    config_path: Optional[str] = None,
+    repo_name: Optional[str] = None,
+) -> int:
+    """Get the maximum time Jules may work on an issue without opening a PR.
+
+    Args:
+        config_path: Optional explicit path to config.toml file.
+        repo_name: Optional repository name in 'owner/repo' format.
+
+    Returns:
+        Timeout in hours (default: 12)
+    """
+    return _get_config_value(
+        section="jules",
+        key="issue_pr_timeout_hours",
+        default=12,
+        config_path=config_path,
+        value_type=int,
+        repo_name=repo_name,
+    )
+
+
+def get_jules_speculative_parallelism_from_config(
+    config_path: Optional[str] = None,
+    repo_name: Optional[str] = None,
+) -> int:
+    """Return the number of Jules candidates for one Issue implementation.
+
+    Unlike timeout settings this value is deliberately not coerced.  TOML
+    booleans are subclasses of ``int`` in Python, and accepting ``true`` as a
+    width of one would hide an operator error at the dispatch boundary.
+    """
+    value = _get_config_value(
+        section="jules",
+        key="speculative_parallelism",
+        default=1,
+        config_path=config_path,
+        repo_name=repo_name,
+    )
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError("[jules].speculative_parallelism must be a positive integer (booleans are not valid)")
+    return value
+
+
+def get_jules_pr_ci_timeout_hours_from_config(
+    config_path: Optional[str] = None,
+    repo_name: Optional[str] = None,
+) -> int:
+    """Get the maximum time a Jules PR may stay open without passing CI.
+
+    Args:
+        config_path: Optional explicit path to config.toml file.
+        repo_name: Optional repository name in 'owner/repo' format.
+
+    Returns:
+        Timeout in hours (default: 12)
+    """
+    return _get_config_value(
+        section="jules",
+        key="pr_ci_timeout_hours",
+        default=12,
+        config_path=config_path,
+        value_type=int,
+        repo_name=repo_name,
+    )
+
+
+def get_github_action_log_max_length_from_config(
+    config_path: Optional[str] = None,
+    repo_name: Optional[str] = None,
+) -> int:
+    """Get the GitHub Action log max length from config.toml.
+
+    Args:
+        config_path: Optional explicit path to config.toml file.
+        repo_name: Optional repository name in 'owner/repo' format.
+
+    Returns:
+        Max length (default: 50000)
+    """
+    return _get_config_value(
+        section="github_action",
+        key="max_log_length",
+        default=50000,
+        config_path=config_path,
+        value_type=int,
+        repo_name=repo_name,
+    )
+
+
+def get_jules_session_expiration_days_from_config(
+    config_path: Optional[str] = None,
+    repo_name: Optional[str] = None,
+) -> int:
+    """Get the Jules session expiration in days from config.toml.
+
+    Looks for [jules] session_expiration_days in config.toml.
+    Default is 7 days.
+    """
+    return _get_config_value(
+        section="jules",
+        key="session_expiration_days",
+        default=7,
+        config_path=config_path,
+        value_type=int,
+        repo_name=repo_name,
+    )
+
+
+def get_pr_repair_max_failed_corrections(
+    config_path: Optional[str] = None,
+    repo_name: Optional[str] = None,
+) -> int:
+    """Get the maximum failed corrections limit for PR repair from config.toml.
+
+    Reads from [pr_repair].max_failed_corrections in config.toml.
+    Order of precedence (REQ-002):
+    1. Repository override at ~/.auto-coder/<owner>/<repo>/config.toml
+    2. User setting at ~/.auto-coder/config.toml
+    3. Default: 3
+
+    Rejects invalid non-positive integer values before new automatic repair admission.
+
+    Args:
+        config_path: Optional explicit path to config.toml file.
+        repo_name: Optional repository name in 'owner/repo' format.
+
+    Returns:
+        Positive integer limit (default: 3).
+
+    Raises:
+        ValueError: If configured value is not a positive integer.
+    """
+    raw_val = _get_config_value(
+        section="pr_repair",
+        key="max_failed_corrections",
+        default=3,
+        config_path=config_path,
+        value_type=None,
+        repo_name=repo_name,
+    )
+    try:
+        val = int(raw_val)
+    except (ValueError, TypeError):
+        raise ValueError(f"Invalid pr_repair.max_failed_corrections in config.toml: {raw_val!r}. " "Must be a positive integer.")
+    if val <= 0:
+        raise ValueError(f"Invalid pr_repair.max_failed_corrections in config.toml: {val}. " "Must be a positive integer (> 0).")
+    return val
+
+
+def get_process_issues_sleep_time_from_config(
+    config_path: Optional[str] = None,
+    repo_name: Optional[str] = None,
+) -> int:
+    """Get process_issues sleep time from [process_issues].sleep_time in config.toml.
+
+    Args:
+        config_path: Optional explicit path to config.toml file.
+        repo_name: Optional repository name in 'owner/repo' format.
+
+    Returns:
+        Sleep time in seconds (default: 300)
+    """
+    return _get_config_value(
+        section="process_issues",
+        key="sleep_time",
+        default=300,
+        config_path=config_path,
+        value_type=int,
+        repo_name=repo_name,
+    )
+
+
+def get_process_issues_empty_sleep_time_from_config(
+    config_path: Optional[str] = None,
+    repo_name: Optional[str] = None,
+) -> int:
+    """Get process_issues empty sleep time from [process_issues].empty_sleep_time in config.toml.
+
+    Args:
+        config_path: Optional explicit path to config.toml file.
+        repo_name: Optional repository name in 'owner/repo' format.
+
+    Returns:
+        Sleep time in seconds (default: 600)
+    """
+    return _get_config_value(
+        section="process_issues",
+        key="empty_sleep_time",
+        default=600,
+        config_path=config_path,
+        value_type=int,
+        repo_name=repo_name,
+    )
+
+
+def get_validation_concurrency_from_config(
+    config_path: Optional[str] = None,
+    repo_name: Optional[str] = None,
+) -> int:
+    """Get the one global semantic-validation concurrency bound."""
+    value = _get_config_value(
+        section="process_issues",
+        key="validation_concurrency",
+        default=2,
+        config_path=config_path,
+        value_type=int,
+        repo_name=repo_name,
+    )
+    if type(value) is not int or value < 1:
+        raise ValueError("[process_issues].validation_concurrency must be a positive integer")
+    return value
+
+
+def get_adversarial_validation_concurrency_from_config(
+    config_path: Optional[str] = None,
+    repo_name: Optional[str] = None,
+) -> int:
+    """Get the independent adversarial PR-validation concurrency bound."""
+    value = _get_config_value(
+        section="process_issues",
+        key="adversarial_validation_concurrency",
+        default=2,
+        config_path=config_path,
+        value_type=int,
+        repo_name=repo_name,
+    )
+    if type(value) is not int or value < 1:
+        raise ValueError("[process_issues].adversarial_validation_concurrency must be a positive integer")
+    return value
+
+
+def get_max_concurrent_implementations_from_config(
+    config_path: Optional[str] = None,
+    repo_name: Optional[str] = None,
+) -> int:
+    """Get the instance-wide durable logical implementation limit."""
+    value = _get_config_value(
+        section="process_issues",
+        key="max_concurrent_implementations",
+        default=1,
+        config_path=config_path,
+        repo_name=repo_name,
+    )
+    if type(value) is not int or value < 1:
+        raise ValueError("[process_issues].max_concurrent_implementations must be a positive integer")
+    return value
+
+
+def get_isolate_single_test_on_failure_from_config(
+    config_path: Optional[str] = None,
+    repo_name: Optional[str] = None,
+) -> bool:
+    """Get isolate_single_test_on_failure setting from [test] section in config.toml.
+
+    When enabled, if multiple tests fail, the system will extract and re-run only
+    the first failed test in isolation. This can help identify flaky or unstable tests.
+
+    Args:
+        config_path: Optional explicit path to config.toml file.
+        repo_name: Optional repository name in 'owner/repo' format.
+
+    Returns:
+        True if isolation is enabled, False otherwise (default: False)
+    """
+    return _get_config_value(
+        section="test",
+        key="isolate_single_test_on_failure",
+        default=False,
+        config_path=config_path,
+        value_type=bool,
+        repo_name=repo_name,
+    )
+
+
+def get_issue_allowlist_from_config(
+    config_path: Optional[str] = None,
+    repo_name: Optional[str] = None,
+) -> Optional[List[int]]:
+    """Get the issue author allowlist from config.toml [github].issue_allowlist.
+
+    Args:
+        config_path: Optional explicit path to config.toml file.
+        repo_name: Optional repository name in 'owner/repo' format.
+
+    Returns:
+        List of allowed GitHub user IDs (ints) or None if not configured.
+    """
+    raw_list = _get_config_value(
+        section="github",
+        key="issue_allowlist",
+        default=None,
+        config_path=config_path,
+        repo_name=repo_name,
+    )
+    if raw_list is None:
+        return None
+    result: List[int] = []
+    for item in raw_list:
+        try:
+            result.append(int(item))
+        except (ValueError, TypeError):
+            pass
+    return result
+
+
+def get_pr_allowlist_from_config(
+    config_path: Optional[str] = None,
+    repo_name: Optional[str] = None,
+) -> Optional[List[int]]:
+    """Get the pull request author allowlist from config.toml [github].pr_allowlist.
+
+    Args:
+        config_path: Optional explicit path to config.toml file.
+        repo_name: Optional repository name in 'owner/repo' format.
+
+    Returns:
+        List of allowed GitHub user IDs (ints) or None if not configured.
+    """
+    raw_list = _get_config_value(
+        section="github",
+        key="pr_allowlist",
+        default=None,
+        config_path=config_path,
+        repo_name=repo_name,
+    )
+    if raw_list is None:
+        return None
+    result: List[int] = []
+    for item in raw_list:
+        try:
+            result.append(int(item))
+        except (ValueError, TypeError):
+            pass
+    return result
+
+
+def get_pr_review_allowlist_from_config(
+    config_path: Optional[str] = None,
+    repo_name: Optional[str] = None,
+) -> Optional[List[int]]:
+    """Get stable reviewer identity IDs allowed to enter automatic adjudication.
+
+    Unlike the legacy issue/PR author allowlists, this security boundary is
+    intentionally strict: values must already be positive integers. In
+    particular, booleans and numeric strings are not coerced.
+    """
+    raw_list = _get_config_value(
+        section="github",
+        key="pr_review_allowlist",
+        default=None,
+        config_path=config_path,
+        repo_name=repo_name,
+    )
+    if raw_list is None:
+        return None
+    if not isinstance(raw_list, list):
+        raise ValueError("[github].pr_review_allowlist must be a list of positive integer GitHub identity IDs")
+    if any(not isinstance(item, int) or isinstance(item, bool) or item <= 0 for item in raw_list):
+        raise ValueError("[github].pr_review_allowlist must contain only positive integer GitHub identity IDs")
+    return list(raw_list)
+
+
+def get_review_adjudicator_allowlist_from_config(
+    config_path: Optional[str] = None,
+    repo_name: Optional[str] = None,
+) -> Optional[List[int]]:
+    """Return stable identities allowed to author review adjudications.
+
+    This is deliberately independent of ``pr_review_allowlist``: the latter
+    authenticates the automated reviewer that opened the root thread.
+    """
+    raw_list = _get_config_value(
+        section="github",
+        key="review_adjudicator_allowlist",
+        default=None,
+        config_path=config_path,
+        repo_name=repo_name,
+    )
+    if raw_list is None:
+        return None
+    message = "[github].review_adjudicator_allowlist must be a list of positive integer GitHub identity IDs"
+    if not isinstance(raw_list, list):
+        raise ValueError(message)
+    if any(not isinstance(item, int) or isinstance(item, bool) or item <= 0 for item in raw_list):
+        raise ValueError(message)
+    return list(raw_list)
+
+
+@dataclass(frozen=True)
+class DashboardAdjudicationConfig:
+    """Resolved ``[dashboard_adjudication]`` policy (Issue #2022, REQ-001).
+
+    ``enabled`` is the only field callers should branch on to decide whether
+    the write boundary may use GitHub credentials at all: any configuration
+    defect collapses this to ``enabled=False`` with a non-empty
+    ``diagnostic`` rather than raising, a default secret, or falling back to
+    another credential (webhook secret, controller ``GH_TOKEN``, or a
+    reviewer-App credential).
+    """
+
+    enabled: bool
+    operator_secret_file: str = ""
+    github_token_file: str = ""
+    allowed_origin: str = ""
+    diagnostic: str = ""
+
+
+def _dashboard_adjudication_origin_diagnostic(allowed_origin: str) -> Optional[str]:
+    if not allowed_origin:
+        return "[dashboard_adjudication].allowed_origin is required"
+    parsed = urlparse(allowed_origin)
+    reconstructed = f"{parsed.scheme}://{parsed.netloc}"
+    if reconstructed != allowed_origin or parsed.path or parsed.params or parsed.query or parsed.fragment or not parsed.hostname:
+        return "[dashboard_adjudication].allowed_origin must be exactly one origin with no path, query, or fragment"
+    if parsed.scheme == "https":
+        return None
+    if parsed.scheme == "http" and parsed.hostname in ("127.0.0.1", "localhost", "::1"):
+        return None
+    return "[dashboard_adjudication].allowed_origin must be one exact HTTPS origin or a direct loopback HTTP origin"
+
+
+def get_dashboard_adjudication_config(
+    config_path: Optional[str] = None,
+    repo_name: Optional[str] = None,
+) -> DashboardAdjudicationConfig:
+    """Read and strictly validate the repository-scoped ``[dashboard_adjudication]`` policy.
+
+    Enabling the Dashboard operator write boundary (Issue #2022) requires
+    ``enabled = true`` plus all three of ``operator_secret_file``,
+    ``github_token_file``, and ``allowed_origin`` to be independently valid;
+    any single defect disables authoring entirely rather than degrading to a
+    partially-authorized mode. This never affects the existing read-only
+    Dashboard.
+    """
+    enabled = _get_config_value(
+        section="dashboard_adjudication",
+        key="enabled",
+        default=False,
+        config_path=config_path,
+        value_type=bool,
+        repo_name=repo_name,
+    )
+    disabled = DashboardAdjudicationConfig(enabled=False)
+    if not enabled:
+        return disabled
+
+    operator_secret_file = _get_config_value(section="dashboard_adjudication", key="operator_secret_file", default="", config_path=config_path, repo_name=repo_name)
+    github_token_file = _get_config_value(section="dashboard_adjudication", key="github_token_file", default="", config_path=config_path, repo_name=repo_name)
+    allowed_origin = _get_config_value(section="dashboard_adjudication", key="allowed_origin", default="", config_path=config_path, repo_name=repo_name)
+
+    if not isinstance(operator_secret_file, str) or not operator_secret_file or not isinstance(github_token_file, str) or not github_token_file or not isinstance(allowed_origin, str) or not allowed_origin:
+        logger = get_logger(__name__)
+        logger.error("dashboard_adjudication is enabled but operator_secret_file, github_token_file, and allowed_origin must all be explicitly set; disabling authoring")
+        return DashboardAdjudicationConfig(enabled=False, diagnostic="operator_secret_file, github_token_file, and allowed_origin are all required")
+
+    origin_diagnostic = _dashboard_adjudication_origin_diagnostic(allowed_origin)
+    if origin_diagnostic:
+        logger = get_logger(__name__)
+        logger.error(f"Disabling dashboard_adjudication write capability: {origin_diagnostic}")
+        return DashboardAdjudicationConfig(enabled=False, diagnostic=origin_diagnostic)
+
+    try:
+        secret_bytes = Path(os.path.expanduser(operator_secret_file)).read_bytes()
+    except OSError as exc:
+        logger = get_logger(__name__)
+        diagnostic = f"operator_secret_file is not readable: {exc}"
+        logger.error(f"Disabling dashboard_adjudication write capability: {diagnostic}")
+        return DashboardAdjudicationConfig(enabled=False, diagnostic=diagnostic)
+    if len(secret_bytes.strip()) < 32:
+        diagnostic = "operator_secret_file must contain at least 32 bytes of secret material"
+        logger = get_logger(__name__)
+        logger.error(f"Disabling dashboard_adjudication write capability: {diagnostic}")
+        return DashboardAdjudicationConfig(enabled=False, diagnostic=diagnostic)
+
+    try:
+        Path(os.path.expanduser(github_token_file)).read_bytes()
+    except OSError as exc:
+        logger = get_logger(__name__)
+        diagnostic = f"github_token_file is not readable: {exc}"
+        logger.error(f"Disabling dashboard_adjudication write capability: {diagnostic}")
+        return DashboardAdjudicationConfig(enabled=False, diagnostic=diagnostic)
+
+    return DashboardAdjudicationConfig(enabled=True, operator_secret_file=operator_secret_file, github_token_file=github_token_file, allowed_origin=allowed_origin)
+
+
+def get_adversarial_validation_max_reviews_from_config(
+    config_path: Optional[str] = None,
+    repo_name: Optional[str] = None,
+) -> Optional[int]:
+    """Get the maximum number of adversarial review executions from config.toml.
+
+    Looks for max_reviews in [adversarial_validation] section in config.toml
+    (or fallback keys: max_validations, max_attempts, max_count).
+
+    Args:
+        config_path: Optional explicit path to config.toml file.
+        repo_name: Optional repository name in 'owner/repo' format.
+
+    Returns:
+        Maximum review executions (int) or None if not configured.
+    """
+    for key in ("max_reviews", "max_validations", "max_attempts", "max_count"):
+        val = _get_config_value(
+            section="adversarial_validation",
+            key=key,
+            default=None,
+            config_path=config_path,
+            value_type=int,
+            repo_name=repo_name,
+        )
+        if val is not None:
+            return val
+    for key in ("max_reviews", "max_validations", "max_attempts"):
+        val = _get_config_value(
+            section="backend_adversarial_validation",
+            key=key,
+            default=None,
+            config_path=config_path,
+            value_type=int,
+            repo_name=repo_name,
+        )
+        if val is not None:
+            return val
+    return None
+
+
+def get_feature_switch_from_config(
+    feature_name: str,
+    config_path: Optional[str] = None,
+    repo_name: Optional[str] = None,
+    default: bool = True,
+    apply_env: bool = True,
+) -> bool:
+    """Get the effective value of a repo-scoped boolean feature switch.
+
+    Checks [features], [feature_switches], [feature_gates] sections as well
+    as top-level keys in config.toml, with repo-specific overrides taking precedence.
+
+    Args:
+        feature_name: The canonical feature name (e.g., 'issue_specification_validation').
+        config_path: Optional explicit path to base config.toml file.
+        repo_name: Optional GitHub repository ('owner/repo') for repo-scoped override.
+        default: Default value if not configured (default: True).
+        apply_env: If True, environment variable overrides (e.g. AUTO_CODER_ENABLE_ADVERSARIAL_VALIDATION)
+                   are applied where supported.
+
+    Returns:
+        Effective boolean value for the active repository.
+
+    Raises:
+        ValueError: If a configured value is not a boolean.
+    """
+    if apply_env and feature_name == "pr_adversarial_validation":
+        adv_val_env = os.environ.get("AUTO_CODER_PR_ADVERSARIAL_VALIDATION") or os.environ.get("AUTO_CODER_ENABLE_ADVERSARIAL_VALIDATION")
+        if adv_val_env is not None:
+            return adv_val_env.strip().lower() not in ("false", "0", "no")
+    if apply_env and feature_name == "pr_review_thread_gate":
+        thread_gate_env = os.environ.get("AUTO_CODER_PR_REVIEW_THREAD_GATE")
+        if thread_gate_env is not None:
+            return thread_gate_env.strip().lower() not in ("false", "0", "no")
+    if apply_env and feature_name == "automatic_test_fix":
+        test_fix_env = os.environ.get("AUTO_CODER_AUTOMATIC_TEST_FIX")
+        if test_fix_env is not None:
+            return test_fix_env.strip().lower() not in ("false", "0", "no")
+
+    data = load_app_config_data(config_path=config_path, repo_name=repo_name)
+
+    features = data.get("features", {})
+    if isinstance(features, dict) and feature_name in features:
+        val = features[feature_name]
+        if type(val) is not bool:
+            raise ValueError(f"Invalid boolean value for feature setting '{feature_name}': {val!r}")
+        return val
+
+    if feature_name in data:
+        val = data[feature_name]
+        if type(val) is not bool:
+            raise ValueError(f"Invalid boolean value for feature setting '{feature_name}': {val!r}")
+        return val
+
+    return default
+
+
+def get_issue_specification_validation_from_config(
+    config_path: Optional[str] = None,
+    repo_name: Optional[str] = None,
+) -> bool:
+    """Get the effective value of issue_specification_validation (default: True)."""
+    return get_feature_switch_from_config("issue_specification_validation", config_path=config_path, repo_name=repo_name)
+
+
+def get_specification_repair_round_limit_from_config(
+    config_path: Optional[str] = None,
+    repo_name: Optional[str] = None,
+) -> int:
+    """Return the positive maximum applied in-place specification repairs."""
+    value = _get_config_value(
+        section="validation",
+        key="repair_round_limit",
+        default=3,
+        config_path=config_path,
+        value_type=int,
+        repo_name=repo_name,
+    )
+    if type(value) is not int or value <= 0:
+        raise ValueError("[validation].repair_round_limit must be a positive integer")
+    return value
+
+
+def get_issue_decomposition_validation_from_config(
+    config_path: Optional[str] = None,
+    repo_name: Optional[str] = None,
+) -> bool:
+    """Get the effective value of issue_decomposition_validation (default: True)."""
+    return get_feature_switch_from_config("issue_decomposition_validation", config_path=config_path, repo_name=repo_name)
+
+
+def get_pr_adversarial_validation_from_config(
+    config_path: Optional[str] = None,
+    repo_name: Optional[str] = None,
+) -> bool:
+    """Get the effective value of pr_adversarial_validation (default: True)."""
+    return get_feature_switch_from_config("pr_adversarial_validation", config_path=config_path, repo_name=repo_name)
+
+
+def get_pr_review_thread_gate_from_config(
+    config_path: Optional[str] = None,
+    repo_name: Optional[str] = None,
+) -> bool:
+    """Get the effective value of pr_review_thread_gate (default: True)."""
+    return get_feature_switch_from_config("pr_review_thread_gate", config_path=config_path, repo_name=repo_name)
+
+
+def get_automatic_test_fix_from_config(
+    config_path: Optional[str] = None,
+    repo_name: Optional[str] = None,
+) -> bool:
+    """Get the effective value of automatic_test_fix (default: True)."""
+    return get_feature_switch_from_config("automatic_test_fix", config_path=config_path, repo_name=repo_name)
+
+
+def get_all_feature_switches_from_config(
+    config_path: Optional[str] = None,
+    repo_name: Optional[str] = None,
+) -> Dict[str, bool]:
+    """Get dictionary of all effective feature switches for the active repository."""
+    return {name: get_feature_switch_from_config(name, config_path=config_path, repo_name=repo_name) for name in FEATURE_SWITCH_NAMES}

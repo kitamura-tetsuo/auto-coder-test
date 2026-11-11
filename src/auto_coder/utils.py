@@ -1,0 +1,1165 @@
+"""
+Utility classes for Auto-Coder automation engine.
+"""
+
+import contextlib
+import os
+import queue
+import re
+import shlex
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from contextvars import ContextVar
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable, Dict, Generator, List, Optional, Tuple
+
+if TYPE_CHECKING:
+    from .invocation_process_supervisor import InvocationProcessSupervisor
+    from .local_execution_boundary import LocalExecutionBoundary
+
+from .logger_config import get_logger
+from .progress_footer import get_progress_footer
+from .security_utils import redact_string
+from .shutdown_context import new_work_allowed
+from .shutdown_interrupt import is_invocation_active
+from .test_log_utils import extract_first_failed_test
+
+logger = get_logger(__name__)
+
+# Repository-bound jobs run in worker threads.  A ContextVar gives each job an
+# inherited subprocess working directory without changing the process-global
+# cwd (which would redirect every other worker in the service).
+_COMMAND_EXECUTION_CWD: ContextVar[Optional[str]] = ContextVar("auto_coder_command_execution_cwd", default=None)
+
+
+@dataclass(frozen=True)
+class _SupervisedCommandContext:
+    supervisor: "InvocationProcessSupervisor"
+    boundary: "LocalExecutionBoundary"
+
+
+_SUPERVISED_COMMAND: ContextVar[Optional[_SupervisedCommandContext]] = ContextVar("auto_coder_supervised_command", default=None)
+
+
+def _chown_tree(root: Path, uid: int, gid: int) -> None:
+    for current, directories, files in os.walk(root):
+        os.chown(current, uid, gid)
+        for name in (*directories, *files):
+            os.chown(Path(current) / name, uid, gid, follow_symlinks=False)
+
+
+def _prepare_invocation_runtime(context: _SupervisedCommandContext, environment: Dict[str, str]) -> Path:
+    """Create private provider state beside the configured production runtime."""
+    binding = context.boundary.binding
+    runtime_base = Path(environment.get("AUTO_CODER_RUNTIME_ROOT", tempfile.gettempdir())) / "local-invocations"
+    runtime = runtime_base / binding.invocation_id
+    retained_provider_state = context.boundary.backend_type.lower() == "opencode"
+    if retained_provider_state:
+        runtime = binding.workspace.parent / "provider-runtime"
+    initialized = runtime.exists()
+    runtime.mkdir(parents=True, exist_ok=retained_provider_state)
+    home = runtime / "home"
+    home.mkdir(exist_ok=retained_provider_state)
+    if context.boundary.backend_type.lower() == "codex":
+        (home / ".codex").mkdir()
+    temporary_directory = runtime / "tmp"
+    temporary_directory.mkdir(exist_ok=retained_provider_state)
+    original_home = Path(environment.get("HOME", str(Path.home())))
+    codex_home = Path(environment.get("CODEX_HOME", str(original_home / ".codex")))
+    for name in ("auth.json", "config.toml"):
+        source = codex_home / name
+        if source.is_file() and not initialized:
+            destination = home / ".codex" / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+    for relative in (Path(".config/opencode"), Path(".local/share/opencode/auth.json")):
+        if initialized:
+            continue
+        source = original_home / relative
+        destination = home / relative
+        if source.is_dir():
+            shutil.copytree(source, destination)
+        elif source.is_file():
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+    owner = getattr(context.supervisor, "owner", None)
+    uid = getattr(owner, "worker_uid", None)
+    gid = getattr(owner, "worker_gid", None)
+    if uid is not None and gid is not None:
+        _chown_tree(runtime, uid, gid)
+    environment["HOME"] = str(home)
+    environment["CODEX_HOME"] = str(home / ".codex")
+    # Provider runtimes such as Bun create executable/cache state in TMPDIR.
+    # Keep that state inside the invocation-owned writable runtime rather than
+    # granting the worker access to the controller's shared /tmp.
+    environment["TMPDIR"] = str(temporary_directory)
+    return runtime
+
+
+def prepare_retained_provider_environment(environment: Dict[str, str]) -> None:
+    """Use the supervised OpenCode runtime for preflight and task commands alike."""
+    context = _SUPERVISED_COMMAND.get()
+    if context is not None and context.boundary.backend_type.lower() == "opencode":
+        _prepare_invocation_runtime(context, environment)
+
+
+@contextlib.contextmanager
+def bind_supervised_command_execution(supervisor: "InvocationProcessSupervisor", boundary: "LocalExecutionBoundary") -> Generator[None, None, None]:
+    """Route the provider's one top-level command through its finite writer owner."""
+    token = _SUPERVISED_COMMAND.set(_SupervisedCommandContext(supervisor, boundary))
+    try:
+        yield
+    finally:
+        _SUPERVISED_COMMAND.reset(token)
+
+
+def bind_command_execution_cwd(cwd: str):
+    """Bind implicit CommandExecutor calls in the current context to ``cwd``."""
+    return _COMMAND_EXECUTION_CWD.set(cwd)
+
+
+def reset_command_execution_cwd(token: object) -> None:
+    """Restore a previous command execution binding."""
+    _COMMAND_EXECUTION_CWD.reset(token)  # type: ignore[arg-type]
+
+
+# CSI/OSC escape sequences emitted by interactive terminal UIs
+_ANSI_ESCAPE_RE = re.compile(r"\x1B(?:\][^\x07\x1B]*(?:\x07|\x1B\\)|[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+
+
+def strip_ansi_sequences(text: str) -> str:
+    """Remove ANSI escape sequences from terminal output."""
+    if not text:
+        return text
+    return _ANSI_ESCAPE_RE.sub("", text)
+
+
+def get_target_container(config: Any) -> Optional[str]:
+    """Determine the target container name based on environment and config.
+
+    When running in a dedicated auto-coder container (AM_I_AUTOCODER_CONTAINER=true),
+    the target container name is derived from the repository name as auto-coder-[repo].
+    """
+    if os.environ.get("AM_I_AUTOCODER_CONTAINER") == "true":
+        # We use Any for config to avoid circular imports
+        repo_name = getattr(config, "repo_name", None) or os.environ.get("REPO_NAME")
+        if repo_name:
+            repo_segment = repo_name.split("/")[-1]
+            return f"auto-coder-{repo_segment}"
+        logger.warning("AM_I_AUTOCODER_CONTAINER is true but no repository name found.")
+    return None
+
+
+def get_pr_author_login(pr_obj: Any) -> Optional[str]:
+    """Extract author login from a PR-like object or dict.
+
+    Supports both PyGithub PR objects (with .user.login) and dictionaries
+    returned from GitHubClient (which may use 'author' or 'user').
+    """
+    try:
+        from unittest.mock import MagicMock as _MagicMock
+        from unittest.mock import Mock as _Mock
+
+        _mock_types = (_Mock, _MagicMock)
+    except Exception:
+        _mock_types = tuple()  # type: ignore
+
+    try:
+        if isinstance(pr_obj, dict):
+            # Try 'author' field first (some custom dicts or GraphQL results).
+            # A present-but-empty/null login (or a non-dict/non-string author)
+            # provides no login and falls through to 'user' rather than
+            # short-circuiting with None.
+            author = pr_obj.get("author")
+            if isinstance(author, str) and author:
+                return author
+            if isinstance(author, dict):
+                author_login = author.get("login")
+                if isinstance(author_login, str) and author_login:
+                    return author_login
+            # If not found, try 'user' -> 'login' (GitHub REST API format)
+            user = pr_obj.get("user")
+            if isinstance(user, dict):
+                user_login = user.get("login")
+                if isinstance(user_login, str) and user_login:
+                    return user_login
+            return None
+        else:
+            # Handle PyGithub objects or Mocks
+            user = getattr(pr_obj, "user", None)
+            if user is None or isinstance(user, _mock_types):
+                # Fallback for some objects where user is not an attribute but author is
+                author = getattr(pr_obj, "author", None)
+                if isinstance(author, str):
+                    return author
+                if author is not None:
+                    return getattr(author, "login", None)
+            return getattr(user, "login", None) if user is not None else None
+    except Exception:
+        return None
+
+
+def is_same_github_login(login1: Optional[str], login2: Optional[str]) -> bool:
+    """Compare two GitHub logins case-insensitively, ignoring any trailing '[bot]' suffix.
+
+    GitHub GraphQL APIs return the slug directly for Bot actors (e.g.
+    'auto-coder-reviewer'), whereas GitHub REST APIs append '[bot]' (e.g.
+    'auto-coder-reviewer[bot]'). This helper treats them as equivalent.
+    """
+    if not isinstance(login1, str) or not isinstance(login2, str):
+        return False
+    norm1 = login1.strip().lower().removesuffix("[bot]")
+    norm2 = login2.strip().lower().removesuffix("[bot]")
+    return bool(norm1 and norm1 == norm2)
+
+
+VERBOSE_ENV_FLAG = "AUTOCODER_VERBOSE"
+
+
+class TemporaryEnvironment:
+    """
+    Context manager for temporarily setting environment variables.
+
+    This context manager allows you to set environment variables for the duration
+    of a block of code and automatically restore them to their previous state
+    (or remove them if they didn't exist before).
+
+    Example:
+        with TemporaryEnvironment({"MY_VAR": "value"}):
+            # MY_VAR is set in os.environ
+            subprocess.run(["my_command"])
+        # MY_VAR is restored or removed
+
+    Note: This modifies os.environ directly and ensures cleanup even on exceptions.
+    """
+
+    def __init__(self, env_vars: Optional[Dict[str, str]] = None):
+        """
+        Initialize the temporary environment context manager.
+
+        Args:
+            env_vars: Dictionary of environment variables to set temporarily.
+                      If None, no environment variables are modified.
+        """
+        self.env_vars = env_vars or {}
+        self._previous_values: Dict[str, Optional[str]] = {}
+
+    def __enter__(self) -> None:
+        """Set the temporary environment variables."""
+        # Save current values and set new ones
+        for key, value in self.env_vars.items():
+            self._previous_values[key] = os.environ.get(key)
+            os.environ[key] = value
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        """Restore the previous environment variable values."""
+        for key, previous_value in self._previous_values.items():
+            if previous_value is None:
+                # Variable didn't exist before, remove it
+                if key in os.environ:
+                    del os.environ[key]
+            else:
+                # Variable existed before, restore it
+                os.environ[key] = previous_value
+
+
+def is_running_in_container() -> bool:
+    """Robustly detect if running inside a container.
+
+    Uses multiple detection methods to determine if we're running in a container:
+    1. Check for /.dockerenv file (Docker)
+    2. Check for /run/.containerenv file (Podman)
+    3. Check for container environment variables
+    4. Check for container-specific cgroup entries
+    5. Check for container-specific parent process names
+
+    This method is environment-agnostic and works across:
+    - Docker containers
+    - Podman containers
+    - Kubernetes pods
+    - GitHub Actions (Linux runners in containers)
+    - Other container runtimes
+
+    Returns:
+        True if running in a container, False otherwise
+    """
+    # Method 1: Check for /.dockerenv (Docker)
+    try:
+        from pathlib import Path
+
+        if Path("/.dockerenv").exists():
+            logger.debug("Container detected: /.dockerenv exists")
+            return True
+    except Exception:
+        pass
+
+    # Method 2: Check for /run/.containerenv (Podman)
+    try:
+        from pathlib import Path
+
+        if Path("/run/.containerenv").exists():
+            logger.debug("Container detected: /run/.containerenv exists")
+            return True
+    except Exception:
+        pass
+
+    # Method 3: Check environment variables set by containers
+    container_env_vars = [
+        "container",  # Docker sets this to "docker" or "docker-runc"
+        "DOCKER_CONTAINER",  # Custom env var sometimes used
+        "KUBERNETES_SERVICE_HOST",  # Kubernetes
+        "KUBERNETES_NAMESPACE",  # Kubernetes
+    ]
+
+    for env_var in container_env_vars:
+        if os.environ.get(env_var):
+            logger.debug(f"Container detected: {env_var} environment variable is set")
+            return True
+
+    # Method 4: Check cgroup for container indicators
+    try:
+        with open("/proc/self/cgroup", "r") as f:
+            cgroup_content = f.read()
+            # Look for container-specific cgroup entries
+            if any(
+                marker in cgroup_content
+                for marker in [
+                    "/docker/",
+                    "/docker-",
+                    "/kubepods/",
+                    "/kubepods/burstable/",
+                    "/lxc/",
+                    "/containerd/",
+                ]
+            ):
+                logger.debug("Container detected: cgroup contains container markers")
+                return True
+    except Exception:
+        pass
+
+    # Method 5: Check for 1 as init process (typical in containers)
+    try:
+        with open("/proc/1/cmdline", "r") as f:
+            cmdline = f.read()
+            # In containers, PID 1 is often the container runtime or the main process
+            if cmdline and len(cmdline.split("\x00")) <= 2:
+                logger.debug("Container detected: PID 1 has limited command line")
+                return True
+    except Exception:
+        pass
+
+    # Method 6: Check parent process for container indicators
+    try:
+        with open("/proc/self/stat", "r") as f:
+            stat_content = f.read()
+            # Extract parent process ID (PPid)
+            parts = stat_content.split()
+            if len(parts) >= 4:
+                ppid = int(parts[3])
+                # Check parent's command line
+                try:
+                    with open(f"/proc/{ppid}/cmdline", "r") as parent_cmdline:
+                        parent_cmd = parent_cmdline.read()
+                        if any(
+                            marker in parent_cmd.lower()
+                            for marker in [
+                                "dockerd",
+                                "containerd",
+                                "runc",
+                                "podman",
+                                "docker-proxy",
+                            ]
+                        ):
+                            logger.debug("Container detected: parent process is container runtime")
+                            return True
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    logger.debug("Not running in a container")
+    return False
+
+
+@dataclass
+class CommandResult:
+    """Result of a command execution."""
+
+    success: bool
+    stdout: str
+    stderr: str
+    returncode: int
+    writer_settled: Optional[bool] = None
+
+
+class CommandExecutor:
+    """Utility class for executing commands with consistent error handling."""
+
+    # Default timeouts for different command types
+    DEFAULT_TIMEOUTS = {
+        "git": 120,
+        "gh": 60,
+        "test": 3600,
+        "auggie": 7200,
+        "claude": 7200,
+        "codex": 7200,
+        "antigravity": 7200,
+        "qwen": 7200,
+        "aider": 7200,
+        "default": 60,
+    }
+
+    DEBUGGER_ENV_MARKERS = (
+        "PYDEVD_USE_FRAME_EVAL",
+        "PYDEVD_LOAD_VALUES_ASYNC",
+        "DEBUGPY_LAUNCHER_PORT",
+        "PYDEV_DEBUG",
+        "VSCODE_PID",
+    )
+
+    # Interval for polling worker queue while streaming output (seconds)
+    STREAM_POLL_INTERVAL = 0.2
+
+    @staticmethod
+    def is_running_in_debugger() -> bool:
+        """Detect if the process is running under a debugger.
+
+        Returns:
+            True if running in debugger, False otherwise
+        """
+        # Detect common debugger environment markers (debugpy, VS Code, PyCharm)
+        for marker in CommandExecutor.DEBUGGER_ENV_MARKERS:
+            value = os.environ.get(marker, "").strip().lower()
+            if value in {"1", "true", "yes"}:
+                return True
+
+        # Heuristic: when a debugger is attached (sys.gettrace), favor streaming
+        try:
+            return sys.gettrace() is not None
+        except Exception:
+            return False
+
+    @staticmethod
+    def _should_stream_output(stream_output: Optional[bool]) -> bool:
+        """Determine whether to stream command output in real time."""
+        if stream_output is not None:
+            return stream_output
+
+        # Allow forcing via env var for manual debugging sessions
+        value = os.environ.get("AUTOCODER_STREAM_COMMANDS", "").strip().lower()
+        if value in {"1", "true", "yes"}:
+            return True
+
+        # Use the debugger detection helper
+        return CommandExecutor.is_running_in_debugger()
+
+    @staticmethod
+    def _spawn_reader(stream, stream_name: str, out_queue: "queue.Queue[Tuple[str, Optional[str]]]") -> threading.Thread:
+        """Spawn a background reader thread for the given stream."""
+
+        def _reader() -> None:
+            try:
+                for line in iter(stream.readline, ""):
+                    out_queue.put((stream_name, line))
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.error(f"Streaming reader failed for {stream_name}: {exc}")
+            finally:
+                out_queue.put((stream_name, None))
+
+        thread = threading.Thread(target=_reader, name=f"CommandStream-{stream_name}", daemon=True)
+        thread.start()
+        return thread
+
+    @staticmethod
+    def _set_pty_window_size(master_fd: int) -> None:
+        """Give the pseudo terminal a sane window size so TUIs render correctly."""
+        try:
+            import fcntl
+            import termios
+
+            size = shutil.get_terminal_size(fallback=(120, 40))
+            packed = struct.pack("HHHH", size.lines, size.columns, 0, 0)
+            fcntl.ioctl(master_fd, termios.TIOCSWINSZ, packed)
+        except Exception:  # pragma: no cover - platform dependent
+            pass
+
+    @staticmethod
+    def _spawn_pty_reader(master_fd: int, out_queue: "queue.Queue[Tuple[str, Optional[str]]]") -> threading.Thread:
+        """Spawn a background reader thread for a pseudo terminal master fd.
+
+        A pty merges stdout and stderr into a single stream, so everything is
+        reported as "stdout". ANSI escape sequences emitted by interactive CLIs
+        are stripped so the captured text stays usable for marker matching.
+        """
+
+        def _reader() -> None:
+            buffer = ""
+            try:
+                while True:
+                    try:
+                        data = os.read(master_fd, 4096)
+                    except OSError:
+                        # Linux raises EIO on the master fd once the child closes the pty
+                        break
+                    if not data:
+                        break
+                    buffer += data.decode("utf-8", errors="replace").replace("\r\n", "\n")
+                    while "\n" in buffer:
+                        line, buffer = buffer.split("\n", 1)
+                        out_queue.put(("stdout", strip_ansi_sequences(line) + "\n"))
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.error(f"Streaming reader failed for pty: {exc}")
+            finally:
+                if buffer:
+                    out_queue.put(("stdout", strip_ansi_sequences(buffer)))
+                out_queue.put(("stdout", None))
+
+        thread = threading.Thread(target=_reader, name="CommandStream-pty", daemon=True)
+        thread.start()
+        return thread
+
+    @classmethod
+    def _run_with_streaming(
+        cls,
+        cmd: List[str],
+        timeout: Optional[int],
+        cwd: Optional[str],
+        env: Optional[Dict[str, str]],
+        on_stream: Optional[Callable[[str, str], None]] = None,
+        dot_format: bool = False,
+        idle_timeout: Optional[int] = None,
+        log_output: bool = True,
+        use_pty: bool = False,
+        stdin_bytes: Optional[bytes] = None,
+    ) -> Tuple[int, str, str]:
+        """Run a command while streaming stdout/stderr to the logger.
+
+        on_stream: optional callback invoked for each chunk (stream_name, chunk).
+        The callback may raise to abort the process early; the exception is propagated.
+        log_output: if False, suppress logging of stdout/stderr chunks (default: True).
+        use_pty: run the command attached to a pseudo terminal so CLIs that require
+        an interactive terminal (e.g. `claude --cloud`) work. stdout and stderr are
+        merged into stdout because a pty exposes a single stream.
+        """
+        process: "subprocess.Popen[Any]"
+        pty_master: Optional[int] = None
+        stdin_write_fd: Optional[int] = None
+        stdin_reader_fd: Optional[int] = None
+        if use_pty and hasattr(os, "openpty"):
+            pty_master, pty_slave = os.openpty()
+            cls._set_pty_window_size(pty_master)
+            try:
+                process = subprocess.Popen(
+                    cmd,
+                    stdin=pty_slave,
+                    stdout=pty_slave,
+                    stderr=pty_slave,
+                    cwd=cwd,
+                    env=env,
+                    close_fds=True,
+                    start_new_session=True,
+                )
+            except Exception:
+                os.close(pty_master)
+                os.close(pty_slave)
+                raise
+            finally:
+                # The child owns the slave end now; keeping it open here would hide EOF.
+                try:
+                    os.close(pty_slave)
+                except OSError:
+                    pass
+        else:
+            if stdin_bytes is not None:
+                stdin_reader_fd, stdin_write_fd = os.pipe()
+            try:
+                if stdin_reader_fd is None:
+                    process = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        bufsize=1,
+                        cwd=cwd,
+                        env=env,
+                    )
+                else:
+                    process = subprocess.Popen(
+                        cmd,
+                        stdin=stdin_reader_fd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        bufsize=1,
+                        cwd=cwd,
+                        env=env,
+                    )
+            except BaseException:
+                for fd in (stdin_reader_fd, stdin_write_fd):
+                    if fd is not None:
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            pass
+                raise
+            if stdin_reader_fd is not None:
+                os.close(stdin_reader_fd)
+                stdin_reader_fd = None
+
+        stdout_lines: List[str] = []
+        stderr_lines: List[str] = []
+
+        streams_active: set[str] = set()
+        output_queue: "queue.Queue[Tuple[str, Optional[str]]]" = queue.Queue()
+        readers: List[threading.Thread] = []
+        input_errors: "queue.Queue[str]" = queue.Queue(maxsize=1)
+        input_writer: Optional[threading.Thread] = None
+
+        if pty_master is not None:
+            streams_active.add("stdout")
+            readers.append(cls._spawn_pty_reader(pty_master, output_queue))
+        else:
+            if process.stdout is not None:
+                streams_active.add("stdout")
+                readers.append(cls._spawn_reader(process.stdout, "stdout", output_queue))
+            if process.stderr is not None:
+                streams_active.add("stderr")
+                readers.append(cls._spawn_reader(process.stderr, "stderr", output_queue))
+
+        if stdin_write_fd is not None:
+            writer_fd = stdin_write_fd
+
+            def _write_input() -> None:
+                written = 0
+                try:
+                    assert stdin_bytes is not None
+                    input_view = memoryview(stdin_bytes)
+                    while written < len(stdin_bytes):
+                        written += os.write(writer_fd, input_view[written:])
+                except BaseException as exc:
+                    if written < len(stdin_bytes or b""):
+                        input_errors.put(f"stdin input delivery failed after {written} bytes: {exc}")
+                finally:
+                    try:
+                        os.close(writer_fd)
+                    except OSError as exc:
+                        if input_errors.empty():
+                            input_errors.put(f"stdin input cleanup failed: {exc}")
+
+            input_writer = threading.Thread(target=_write_input, name="CommandInput-writer", daemon=True)
+            input_writer.start()
+
+        start = time.monotonic()
+        last_output_time = time.monotonic()
+        dots_printed = 0
+        input_error: Optional[str] = None
+        shutdown_interrupted = False
+
+        try:
+            while True:
+                if input_error is None:
+                    try:
+                        input_error = input_errors.get_nowait()
+                        process.kill()
+                    except queue.Empty:
+                        pass
+                # Issue #2010 REQ-003/REQ-004: an unrelated local command (not
+                # part of an admitted LLM invocation's own controlled provider
+                # action or tool tree) must not hold graceful draining open
+                # until its natural completion, external response, or normal
+                # network/process timeout. Once shutdown has closed admission,
+                # stop it immediately instead of waiting; a command that is
+                # itself part of a still in-flight admitted invocation
+                # (``is_invocation_active()``) is never touched here.
+                if not shutdown_interrupted and process.poll() is None and not is_invocation_active() and not new_work_allowed():
+                    shutdown_interrupted = True
+                    logger.info(f"Interrupting unrelated local command during graceful shutdown drain: {shlex.join(cmd) if cmd else ''}")
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
+                now = time.monotonic()
+                if timeout is not None:
+                    elapsed = now - start
+                    remaining = timeout - elapsed
+                    if remaining <= 0:
+                        process.kill()
+                        raise subprocess.TimeoutExpired(cmd, timeout, "".join(stdout_lines), "".join(stderr_lines))
+                else:
+                    remaining = None
+
+                # Check idle timeout
+                if idle_timeout is not None:
+                    idle_time = now - last_output_time
+                    if idle_time > idle_timeout:
+                        process.kill()
+                        raise subprocess.TimeoutExpired(cmd, idle_timeout, "".join(stdout_lines), "".join(stderr_lines))  # Using idle_timeout as timeout value for exception
+
+                poll_interval = cls.STREAM_POLL_INTERVAL
+                if remaining is not None:
+                    poll_interval = min(poll_interval, remaining)
+
+                # Tick the progress footer spinner
+                try:
+                    get_progress_footer().tick()
+                except Exception:
+                    # Don't let footer errors crash the command execution
+                    pass
+
+                try:
+                    stream_name, chunk = output_queue.get(timeout=poll_interval)
+                    last_output_time = time.monotonic()  # Reset idle timer on output
+                    if chunk is None:
+                        streams_active.discard(stream_name)
+                    else:
+                        start = time.monotonic()  # Reset overall timeout timer on output
+                        if stream_name == "stdout":
+                            stdout_lines.append(chunk)
+                        else:
+                            stderr_lines.append(chunk)
+
+                        # Skip empty lines and don't log them
+                        stripped_chunk = chunk.rstrip("\n")
+                        if stripped_chunk:
+                            verbose_requested = os.environ.get(VERBOSE_ENV_FLAG, "").strip().lower() in {
+                                "1",
+                                "true",
+                                "yes",
+                            }
+                            if dot_format and not verbose_requested:
+                                # Print dot one line above to avoid hiding ProgressStage footer
+                                if sys.stderr.isatty():
+                                    # Use ANSI escape sequences for TTY
+                                    cols = shutil.get_terminal_size().columns
+                                    # Calculate position (1-based)
+                                    position = (dots_printed % cols) + 1
+                                    # Calculate cycle (0 for ., 1 for *)
+                                    cycle = (dots_printed // cols) % 2
+                                    char = "." if cycle == 0 else "*"
+
+                                    sys.stderr.write("\033[s")  # Save cursor position
+                                    sys.stderr.write("\033[1A")  # Move cursor up one line
+                                    sys.stderr.write(f"\033[{position}G")  # Move to correct column
+                                    sys.stderr.write(char)  # Print char
+                                    sys.stderr.write("\033[u")  # Restore cursor position
+                                    dots_printed += 1
+                                else:
+                                    # Fallback for non-TTY environments
+                                    print(".", end="", file=sys.stderr)
+                                sys.stderr.flush()
+                            elif log_output:
+                                # Also output stderr at INFO level
+                                # depth=2 to show the caller of _run_with_streaming
+                                # Redact sensitive information from output logs
+                                logger.opt(depth=2).info(redact_string(stripped_chunk))
+
+                        # Optional per-chunk callback for early aborts
+                        if on_stream is not None:
+                            try:
+                                on_stream(stream_name, chunk)
+                            except Exception:
+                                try:
+                                    process.kill()
+                                except Exception:
+                                    pass
+                                raise
+                except queue.Empty:
+                    pass
+
+                if process.poll() is not None and not streams_active and output_queue.empty():
+                    break
+
+            if input_writer is not None:
+                input_writer.join()
+
+            if input_error is None:
+                try:
+                    input_error = input_errors.get_nowait()
+                except queue.Empty:
+                    pass
+
+            return_code = process.returncode
+            stdout = "".join(stdout_lines)
+            stderr = "".join(stderr_lines)
+            if shutdown_interrupted:
+                stderr += "\nCommand interrupted: graceful shutdown is draining"
+            if input_error is not None:
+                diagnostic = input_error + "\n"
+                return -1, stdout, stderr + diagnostic
+            return return_code, stdout, stderr
+        except KeyboardInterrupt:
+            process.send_signal(signal.SIGINT)
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            raise
+        finally:
+            # Ensure process is terminated to unblock pipes
+            try:
+                if process.poll() is None:
+                    try:
+                        process.terminate()
+                    except Exception:
+                        pass
+                    try:
+                        process.wait(timeout=0.5)
+                    except Exception:
+                        try:
+                            process.kill()
+                        except Exception:
+                            pass
+                        try:
+                            process.wait(timeout=0.5)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            # Join reader threads (daemon) briefly; do not hard-block
+            for reader in readers:
+                try:
+                    reader.join(timeout=1)
+                except Exception:
+                    pass
+            if input_writer is not None:
+                try:
+                    input_writer.join(timeout=1)
+                except Exception:
+                    pass
+            if pty_master is not None:
+                try:
+                    os.close(pty_master)
+                except OSError:
+                    pass
+            # Avoid explicit close() on pipes to prevent rare blocking on some platforms
+
+    @classmethod
+    def run_command(
+        cls,
+        cmd: List[str],
+        timeout: Optional[int] = None,
+        cwd: Optional[str] = None,
+        stream_output: Optional[bool] = None,
+        env: Optional[Dict[str, str]] = None,
+        env_overrides: Optional[Dict[str, str]] = None,
+        on_stream: Optional[Callable[[str, str], None]] = None,
+        dot_format: bool = False,
+        idle_timeout: Optional[int] = None,
+        use_pty: bool = False,
+        stdin_text: Optional[str] = None,
+    ) -> CommandResult:
+        """Run a command with consistent error handling.
+
+        use_pty: attach the command to a pseudo terminal, for CLIs that refuse to
+        run without an interactive terminal.
+        stdin_text: finite text delivered as UTF-8 followed by EOF. ``None`` keeps
+        the existing inherited-stdin behavior.
+        """
+        if stdin_text is not None and use_pty:
+            return CommandResult(False, "", "stdin_text is incompatible with use_pty", -1)
+        try:
+            stdin_bytes = stdin_text.encode("utf-8") if stdin_text is not None else None
+        except UnicodeEncodeError as exc:
+            return CommandResult(False, "", f"stdin input preparation failed: {exc}", -1)
+        if cwd is None:
+            cwd = _COMMAND_EXECUTION_CWD.get()
+        if timeout is None:
+            # Auto-detect timeout based on command type
+            cmd_type = cmd[0] if cmd else "default"
+            timeout = cls.DEFAULT_TIMEOUTS.get(cmd_type, cls.DEFAULT_TIMEOUTS["default"])
+
+        command_display = shlex.join(cmd) if cmd else ""
+        # Redact potentially sensitive information from command display
+        command_display = redact_string(command_display)
+
+        should_stream = cls._should_stream_output(stream_output)
+        log_message = f"Executing command (timeout={timeout}s, stream={should_stream}): {command_display}"
+
+        verbose_requested = os.environ.get(VERBOSE_ENV_FLAG, "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+
+        if verbose_requested:
+            logger.info(log_message)
+        else:
+            logger.debug(log_message)
+
+        # Merge override-only environments with provided env (or os.environ when absent).
+        effective_env = env
+        if env_overrides:
+            base_env = env.copy() if env is not None else os.environ.copy()
+            base_env.update(env_overrides)
+            effective_env = base_env
+
+        supervised = _SUPERVISED_COMMAND.get()
+        if supervised is not None:
+            from .invocation_process_supervisor import InvocationLaunch, InvocationOutcome, PromptTransport
+            from .repository_readiness import RepositoryReadinessError, validate_codex_effective_directory, verify_worker_repository
+
+            boundary = supervised.boundary
+            binding = boundary.binding
+            launch_env = (effective_env or os.environ).copy()
+            # Ambient Git targeting can otherwise redirect an otherwise correctly
+            # selected cwd back into a caller or peer repository.
+            for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"):
+                launch_env.pop(name, None)
+            selected_cwd = Path(cwd or str(binding.workspace)).resolve()
+            if selected_cwd != binding.workspace.resolve():
+                return CommandResult(False, "", "supervised provider cwd does not match the bound private result root", -1)
+            owner = getattr(supervised.supervisor, "owner", None)
+            worker_uid = getattr(owner, "worker_uid", None)
+            worker_gid = getattr(owner, "worker_gid", None)
+            private_runtime: Optional[Path] = None
+            final_message_copy: Optional[tuple[Path, Path]] = None
+            try:
+                if worker_uid is not None and worker_gid is not None:
+                    # The private temporary parent is normally mode 0700. This is
+                    # invocation-owned state, so transfer it without touching the
+                    # caller or peer repositories.
+                    _chown_tree(binding.workspace.parent, worker_uid, worker_gid)
+                # Provider CLIs need startup/cache state even for read-only reviews.
+                # Keep it writable only within this invocation's private runtime.
+                private_runtime = _prepare_invocation_runtime(supervised, launch_env)
+                if boundary.backend_type.lower() == "codex" and Path(cmd[0]).name == "codex":
+                    validate_codex_effective_directory(cmd[1:], binding.workspace)
+                    if not boundary.editable:
+                        from .local_execution_boundary import get_current_local_execution_boundary
+                        from .worktree_utils import get_current_local_workspace
+
+                        if get_current_local_workspace() is not binding or get_current_local_execution_boundary() is not boundary:
+                            raise RepositoryReadinessError("Codex no-edit launch lacks the current invocation binding")
+                        # Selection happens only after routing into this supervisor.
+                        # Its mandatory child policy runs before provider exec;
+                        # installation/owner failure cannot fall back to Popen.
+                        if cmd[1:3] != ["--sandbox", "read-only"]:
+                            raise RepositoryReadinessError("Codex no-edit launch does not match the effective mode")
+                        cmd = [*cmd]
+                        cmd[2] = "danger-full-access"
+                        # Read-only Git commands must not opportunistically
+                        # refresh the protected repository's index.
+                        launch_env["GIT_OPTIONAL_LOCKS"] = "0"
+                    if not boundary.editable and private_runtime is not None and "--output-last-message" in cmd:
+                        option_index = cmd.index("--output-last-message")
+                        if option_index + 1 >= len(cmd):
+                            raise RepositoryReadinessError("Codex final-message option has no path")
+                        destination = Path(cmd[option_index + 1])
+                        if not destination.is_file() or destination.is_symlink() or binding.workspace.resolve() not in destination.resolve().parents:
+                            raise RepositoryReadinessError("Codex final-message destination must be a private repository file")
+                        provider_output = private_runtime / "tmp" / "final-message.txt"
+                        cmd = [*cmd]
+                        cmd[option_index + 1] = str(provider_output)
+                        final_message_copy = (provider_output, destination)
+                    readiness = verify_worker_repository(
+                        binding.workspace,
+                        worker_uid=worker_uid,
+                        worker_gid=worker_gid,
+                        environment=launch_env,
+                    )
+                    logger.info(
+                        "Codex repository readiness established under uid={}, gid={} at {} " "(git_dir={}, common_dir={}, head={}, tracked_files={}, tracked_contents_checksum={})",
+                        readiness.worker_uid,
+                        readiness.worker_gid,
+                        readiness.root,
+                        readiness.git_dir,
+                        readiness.common_dir,
+                        readiness.head,
+                        readiness.readable_regular_files,
+                        readiness.tracked_contents_checksum,
+                    )
+            except (OSError, RepositoryReadinessError) as exc:
+                if private_runtime is not None and boundary.backend_type.lower() != "opencode":
+                    shutil.rmtree(private_runtime, ignore_errors=True)
+                identity = f"uid={worker_uid}, gid={worker_gid}"
+                return CommandResult(
+                    False,
+                    "",
+                    f"private workspace repository preparation failed for {binding.workspace} ({identity}): {exc}",
+                    -1,
+                    False,
+                )
+            request = InvocationLaunch(
+                invocation_id=binding.invocation_id,
+                backend_type=boundary.backend_type,
+                effective_mode="editable" if boundary.editable else "no-edit",
+                result_root=binding.workspace,
+                runtime_paths=(private_runtime,) if private_runtime is not None else (),
+                executable=cmd[0],
+                arguments=tuple(cmd[1:]),
+                prompt_transport=PromptTransport.STDIN if stdin_text is not None else PromptTransport.INHERIT,
+                prompt=stdin_text,
+                timeout_seconds=float(idle_timeout or timeout) if (idle_timeout or timeout) is not None else None,
+                cwd=binding.workspace,
+                environment=launch_env,
+                protected_paths=(binding.caller_root, binding.caller_git_dir, binding.caller_common_dir),
+            )
+            result = supervised.supervisor.run(request, boundary=boundary)
+            if result.writer_complete:
+                # The controller owns result synchronization and disposal after
+                # all worker processes are positively stopped.
+                _chown_tree(binding.workspace.parent, os.geteuid(), os.getegid())
+            final_message_error: Optional[str] = None
+            if result.writer_complete and final_message_copy is not None:
+                provider_output, destination = final_message_copy
+                if provider_output.is_symlink() or (provider_output.exists() and not provider_output.is_file()):
+                    final_message_error = "Codex final-message transfer rejected an unsafe output path"
+                elif provider_output.is_file():
+                    try:
+                        shutil.copyfile(provider_output, destination)
+                    except OSError as exc:
+                        final_message_error = f"Codex final-message transfer failed: {exc}"
+            if result.writer_complete and private_runtime is not None and boundary.backend_type.lower() != "opencode":
+                shutil.rmtree(private_runtime, ignore_errors=True)
+            if on_stream is not None:
+                if result.stdout:
+                    on_stream("stdout", result.stdout)
+                if result.stderr:
+                    on_stream("stderr", result.stderr)
+            stderr = result.stderr
+            if final_message_error is not None:
+                stderr = f"{stderr}\n{final_message_error}".strip()
+            if result.detail:
+                stderr = f"{stderr}\n{result.detail}".strip()
+            if result.outcome is InvocationOutcome.TIMED_OUT:
+                stderr = f"{stderr}\ncommand timed out".strip()
+            return CommandResult(
+                result.outcome is InvocationOutcome.SUCCEEDED and result.writer_complete and final_message_error is None,
+                result.stdout,
+                stderr,
+                result.returncode if result.returncode is not None else -1,
+                result.writer_complete,
+            )
+
+        try:
+            if should_stream:
+                return_code, stdout, stderr = cls._run_with_streaming(
+                    cmd,
+                    timeout,
+                    cwd,
+                    effective_env,
+                    on_stream,
+                    dot_format,
+                    idle_timeout=idle_timeout,
+                    log_output=True,
+                    use_pty=use_pty,
+                    stdin_bytes=stdin_bytes,
+                )
+            else:
+                # Use _run_with_streaming even when not streaming to logger,
+                # to ensure progress footer spinner is ticked and timeouts/interruption are handled consistently.
+                return_code, stdout, stderr = cls._run_with_streaming(
+                    cmd,
+                    timeout,
+                    cwd,
+                    effective_env,
+                    on_stream,
+                    dot_format,
+                    idle_timeout=idle_timeout,
+                    log_output=False,
+                    use_pty=use_pty,
+                    stdin_bytes=stdin_bytes,
+                )
+
+            # Auto-resolve git dubious ownership in container / multi-user environments
+            if return_code != 0 and cmd and cmd[0] == "git" and "detected dubious ownership in repository" in stderr:
+                dubious_match = re.search(r"detected dubious ownership in repository at '([^']+)'", stderr)
+                dubious_path = dubious_match.group(1) if dubious_match else (cwd or os.getcwd())
+                logger.warning(f"Git detected dubious ownership for '{dubious_path}'. Adding to safe.directory and retrying.")
+                try:
+                    subprocess.run(
+                        ["git", "config", "--global", "--add", "safe.directory", dubious_path],
+                        check=False,
+                        timeout=10,
+                    )
+                    return_code, stdout, stderr = cls._run_with_streaming(
+                        cmd,
+                        timeout,
+                        cwd,
+                        effective_env,
+                        on_stream,
+                        dot_format,
+                        idle_timeout=idle_timeout,
+                        log_output=should_stream,
+                        use_pty=use_pty,
+                        stdin_bytes=stdin_bytes,
+                    )
+                except Exception as ex:
+                    logger.debug(f"Failed to auto-configure safe.directory: {ex}")
+
+            success = return_code == 0
+
+            return CommandResult(success=success, stdout=stdout, stderr=stderr, returncode=return_code)
+
+        except subprocess.TimeoutExpired:
+            logger.error(f"Command timed out after {timeout}s: {' '.join(cmd)}")
+            return CommandResult(
+                success=False,
+                stdout="",
+                stderr=f"Command timed out after {timeout}s",
+                returncode=-1,
+            )
+        except Exception as e:
+            logger.error(f"Command execution failed: {' '.join(cmd)}: {e}")
+            return CommandResult(success=False, stdout="", stderr=str(e), returncode=-1)
+
+
+def change_fraction(old: str, new: str) -> float:
+    """Return fraction of change between two strings (0.0..1.0).
+
+    For performance optimization, the comparison targets the smaller of either
+    the trailing "20 lines" or "1000 characters".
+    Implementation: Extract a trailing window from each string, then calculate
+    the similarity using difflib.SequenceMatcher and return change = 1 - ratio.
+    """
+    try:
+        import difflib
+
+        if old is None and new is None:
+            return 0.0
+
+        def tail_window(s: str) -> str:
+            if not s:
+                return ""
+            # Trailing 20 lines
+            lines = s.splitlines()
+            tail_by_lines = "\n".join(lines[-20:])
+            # Trailing 1000 characters
+            tail_by_chars = s[-1000:]
+            # Use the shorter one
+            return tail_by_lines if len(tail_by_lines) <= len(tail_by_chars) else tail_by_chars
+
+        old_s = old or ""
+        new_s = new or ""
+        if old_s == new_s:
+            return 0.0
+
+        old_win = tail_window(old_s)
+        new_win = tail_window(new_s)
+
+        ratio = difflib.SequenceMatcher(None, old_win, new_win).ratio()
+        return max(0.0, 1.0 - ratio)
+    except Exception:
+        # Conservative fallback: assume large change
+        return 1.0
+
+
+def log_action(action: str, success: bool = True, details: str = "") -> str:
+    """Standardized action logging."""
+    message = action
+    if details:
+        message += f": {details}"
+
+    if success:
+        logger.opt(depth=1).info(message)
+    else:
+        logger.opt(depth=1).error(message)
+    return message
