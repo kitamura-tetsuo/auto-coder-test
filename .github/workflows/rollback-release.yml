@@ -1,0 +1,53 @@
+name: Rollback Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Exact tag copied from an eligible GitHub Release (alternative to release_sha)
+        required: false
+        default: ""
+        type: string
+      release_sha:
+        description: Full commit SHA for pre-catalog release history (alternative to release_tag)
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: release-channel
+  cancel-in-progress: false
+
+jobs:
+  rollback-to-release-history:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.7.22"
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: uv sync --locked
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v4
+      - name: Roll back to immutable release history without rebuilding
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_SHA: ${{ inputs.release_sha }}
+        run: |
+          set -Eeuo pipefail
+          uv run auto-coder deployment restore-release \
+            --repository "${{ github.repository }}" \
+            --release-tag "$RELEASE_TAG" \
+            --release-sha "$RELEASE_SHA"
