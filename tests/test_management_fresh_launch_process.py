@@ -63,7 +63,15 @@ def alive(record):
 def test_cli_retains_all_fences_until_possible_fresh_child_exits(tmp_path, fault, interrupt):
     repository = Path(__file__).resolve().parents[1]
     log = (tmp_path / "driver.log").open("w")
-    process = subprocess.Popen([sys.executable, "-m", "tests.fixtures.fresh_launch_process", str(tmp_path), fault], cwd=repository, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    process = subprocess.Popen(
+        [sys.executable, "-m", "tests.fixtures.fresh_launch_process", str(tmp_path), fault],
+        cwd=repository,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        # Keep the source closure immutable while the child imports modules.
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+    )
     try:
         wait_for(lambda: (tmp_path / "host-exited").exists() or process.poll() is not None, "actual host grant did not complete")
         assert (tmp_path / "host-exited").exists(), (tmp_path / "driver.log").read_text()

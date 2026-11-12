@@ -10,7 +10,8 @@ from pathlib import Path
 
 from auto_coder.ci_shard_plan import ShardContext, ShardPlanError, read_plan
 
-REPOSITORY = "kitamura-tetsuo/auto-coder"
+# Bind the disposable source mirror to its own native Actions evidence.
+REPOSITORY = "kitamura-tetsuo/auto-coder-test"
 PROFILES = ("management-self-update", "fresh-host", "isolated-containers")
 
 OPERATOR_REQUIRED = (
