@@ -1,3 +1,5 @@
+# This disposable acceptance repository preserves production dependency checks
+# but must not generate recurring version-update pull requests.
 version: 2
 updates:
   - package-ecosystem: "uv"
@@ -9,6 +11,7 @@ updates:
       - "/utils/github-sub-issue"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 0
     groups:
       python-dependencies:
         applies-to: version-updates
@@ -22,6 +25,7 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 0
     groups:
       docker-dependencies:
         applies-to: version-updates
@@ -30,6 +34,7 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 0
     groups:
       github-actions-dependencies:
         applies-to: version-updates
