@@ -3,7 +3,7 @@
   "source_repository": "kitamura-tetsuo/auto-coder-test",
   "release_target": "release",
   "release_ref": "refs/tags/auto-coder-release-source-current",
-  "accepted_beta_instance_ids": ["dot-pr2835-full-20261113v8-beta"],
+  "accepted_beta_instance_ids": ["dot-pr2835-full-20261113v9-beta"],
   "accepted_profiles": [
     {
       "profile_id": "beta-runtime-smoke-v1",
