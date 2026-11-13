@@ -1,0 +1,130 @@
+name: PR2835 Dispatch Contract Diagnostic
+run-name: pr2835-dispatch-contract/${{ inputs.operation_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation_id:
+        description: Bounded, stable release promotion operation ID
+        required: true
+        type: string
+      source_repository:
+        description: Exact accepted source repository (checked against operator policy)
+        required: true
+        type: string
+      source_sha:
+        description: Full tested Git source commit SHA
+        required: true
+        type: string
+      ci_run_id:
+        description: Original successful tested-source Actions run ID
+        required: true
+        type: number
+      ci_run_attempt:
+        description: Original successful tested-source Actions attempt
+        required: true
+        type: number
+      tested_source_ref:
+        description: Exact immutable tested-source tag ref
+        required: true
+        type: string
+      tested_source_oid:
+        description: Exact annotated tested-source object OID
+        required: true
+        type: string
+      tested_source_record_sha256:
+        description: SHA-256 of canonical immutable tested-source record
+        required: true
+        type: string
+      acceptance_ref:
+        description: Exact published beta-runtime acceptance ref
+        required: true
+        type: string
+      acceptance_oid:
+        description: Exact annotated acceptance object OID
+        required: true
+        type: string
+      release_target:
+        description: Explicit operator-configured release target
+        required: true
+        type: choice
+        options: [release]
+
+
+# No repository, Actions, identity, or publication permission is granted.
+permissions: {}
+
+jobs:
+  validate-dispatch-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Validate the fixed eleven diagnostic inputs
+        shell: bash
+        env:
+          DIAGNOSTIC_INPUTS: ${{ toJSON(inputs) }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          'use strict';
+          // This validator has no network, subprocess, checkout, or credential access.
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const expected = {
+            "operation_id": "pr2835-dispatch-string-diagnostic-20261113-1",
+            "source_repository": "kitamura-tetsuo/auto-coder-test",
+            "source_sha": "196f89c59fc34f1033039afdb837847560b44c36",
+            "ci_run_id": 43321934554,
+            "ci_run_attempt": 1,
+            "tested_source_ref": "refs/tags/auto-coder-tested-196f89c59fc34f1033039afdb837847560b44c36",
+            "tested_source_oid": "22fd8c6c778dc02f1af08e7056c5b94d643281c9",
+            "tested_source_record_sha256": "b39e0bad67ac6aabc8779bc7617f0f7d4965215d8b1b73b3932b0a96643a79cf",
+            "acceptance_ref": "refs/tags/auto-coder-beta-acceptance-dbd2c062-1aad-4654-86c9-4ce3de44048f",
+            "acceptance_oid": "2aa075ff69e4ad45734fb61e5fa4da2bdd3231f1",
+            "release_target": "release"
+          };
+          const names = Object.keys(expected);
+          let actual = null;
+          let parsed = false;
+          try {
+            const encoded = process.env.DIAGNOSTIC_INPUTS || '';
+            if (encoded.length <= 65535) {
+              actual = JSON.parse(encoded);
+              parsed = actual !== null && typeof actual === 'object' && !Array.isArray(actual);
+            }
+          } catch (_) {
+            // Do not print the supplied input, parser exception, or environment.
+          }
+          const keys = parsed ? Object.keys(actual) : [];
+          const typeOf = value => value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value;
+          const fields = names.map(name => ({
+            name,
+            expected_type: typeof expected[name],
+            observed_type: parsed ? typeOf(actual[name]) : 'unavailable',
+            matches: parsed && Object.hasOwn(actual, name) &&
+              typeof actual[name] === typeof expected[name] && actual[name] === expected[name] &&
+              (typeof expected[name] !== 'number' || Number.isSafeInteger(actual[name])),
+          }));
+          const binding = {
+            repository_matches: process.env.GITHUB_REPOSITORY === 'kitamura-tetsuo/auto-coder-test',
+            event_matches: process.env.GITHUB_EVENT_NAME === 'workflow_dispatch',
+            ref_matches: process.env.GITHUB_REF === 'refs/heads/main',
+          };
+          const passed = parsed && keys.length === 11 && keys.every(name => names.includes(name)) &&
+            fields.every(field => field.matches) && Object.values(binding).every(Boolean);
+          const report = {
+            schema: 1,
+            verdict: passed ? 'INPUT_CONTRACT_MATCH' : 'INPUT_CONTRACT_MISMATCH',
+            expected_input_count: 11,
+            observed_input_count: keys.length,
+            unexpected_input_count: keys.filter(name => !names.includes(name)).length,
+            binding,
+            fields,
+          };
+          // The runner-local report and stdout contain types/counts/booleans, never values.
+          const reportPath = path.join(process.env.RUNNER_TEMP, 'pr2835-dispatch-contract-shape.json');
+          const encodedReport = JSON.stringify(report, null, 2) + '\n';
+          fs.writeFileSync(reportPath, encodedReport, {encoding: 'utf8', mode: 0o600, flag: 'wx'});
+          process.stdout.write(encodedReport);
+          process.exitCode = passed ? 0 : 1;
+          NODE
